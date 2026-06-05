@@ -1,0 +1,16 @@
+# NLTK data (downloaded on first use)
+models/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
