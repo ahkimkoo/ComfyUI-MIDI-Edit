@@ -1,6 +1,9 @@
 # NLTK data (downloaded on first use)
 models/
 
+# Publish artifacts
+node.zip
+
 # Python
 __pycache__/
 *.pyc
