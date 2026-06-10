@@ -142,28 +142,56 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str) -> str:
         original_text_tokens = track["text"].split(" ")
         original_phoneme_tokens = track["phoneme"].split(" ")
 
-        # Build new text and phoneme — replace by position, extras ignored, shortage keeps original
+        # Build slot list: group consecutive identical non-SP tokens into one slot.
+        # Each slot is (char_or_SP, repeat_count).
+        # SP tokens are always ("SP", 1).
+        # Consecutive identical non-SP tokens merge: e.g. "兄 兄" → ("兄", 2).
+        # A different char or <SP> breaks the group.
+        slots = []  # list of (char_or_SP, count, start_token_index)
+        i = 0
+        while i < len(original_text_tokens):
+            token = original_text_tokens[i]
+            if token == "<SP>":
+                slots.append(("SP", 1, i))
+                i += 1
+            else:
+                char = token
+                start = i
+                count = 0
+                while i < len(original_text_tokens) and original_text_tokens[i] == char:
+                    count += 1
+                    i += 1
+                slots.append((char, count, start))
+
+        # Walk slots and produce new text/phoneme tokens.
+        # Total output token count must equal original token count.
         new_text_tokens = []
         new_phoneme_tokens = []
         char_idx = 0
-        for i, token in enumerate(original_text_tokens):
-            if token == "<SP>":
+        for slot_char, slot_count, slot_start in slots:
+            if slot_char == "SP":
                 new_text_tokens.append("<SP>")
-                if i < len(original_phoneme_tokens):
-                    new_phoneme_tokens.append(original_phoneme_tokens[i])
+                if slot_start < len(original_phoneme_tokens):
+                    new_phoneme_tokens.append(original_phoneme_tokens[slot_start])
                 else:
                     new_phoneme_tokens.append("<SP>")
             elif char_idx < len(cleaned):
-                new_text_tokens.append(cleaned[char_idx])
-                new_phoneme_tokens.append(char_to_phoneme(cleaned[char_idx]))
+                # Replace this slot with the user's char repeated slot_count times
+                replacement_char = cleaned[char_idx]
+                phoneme = char_to_phoneme(replacement_char)
+                for _ in range(slot_count):
+                    new_text_tokens.append(replacement_char)
+                    new_phoneme_tokens.append(phoneme)
                 char_idx += 1
             else:
-                # User provided fewer chars than original — keep original text & phoneme
-                new_text_tokens.append(token)
-                if i < len(original_phoneme_tokens):
-                    new_phoneme_tokens.append(original_phoneme_tokens[i])
-                else:
-                    new_phoneme_tokens.append("<SP>")
+                # User provided fewer chars than slots — keep original tokens & phonemes
+                for j in range(slot_count):
+                    token_idx = slot_start + j
+                    new_text_tokens.append(original_text_tokens[token_idx])
+                    if token_idx < len(original_phoneme_tokens):
+                        new_phoneme_tokens.append(original_phoneme_tokens[token_idx])
+                    else:
+                        new_phoneme_tokens.append("<SP>")
 
         new_track = dict(track)
         new_track["text"] = " ".join(new_text_tokens)
