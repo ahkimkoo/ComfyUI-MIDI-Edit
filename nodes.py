@@ -113,7 +113,7 @@ def clean_lyrics(text: str) -> str:
 
 def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     force_tone4_high_pitch: bool = False,
-                    high_pitch_threshold: int = 72) -> str:
+                     high_pitch_threshold: int = 79) -> str:
     """Replace lyrics in MIDI JSON and regenerate phonemes.
 
     Parameters
@@ -128,7 +128,7 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
         Off by default for backward compat.
     high_pitch_threshold : int
         MIDI note value threshold for high-pitch detection (0–127).
-        Defaults to 72 (C5).  Only effective when *force_tone4_high_pitch*
+         Defaults to 79 (G5).  Only effective when *force_tone4_high_pitch*
         is True.
 
     Returns
@@ -195,7 +195,7 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                 replacement_char = cleaned[char_idx]
                 phoneme = char_to_phoneme(replacement_char)
 
-                # Check if this slot spans any note_pitch >= 72 (high pitch).
+                 # Check if this slot spans any note_pitch >= 79 (high pitch).
                 # Only applies to zh_ prefixed phonemes; skip en_ and <SP>.
                 if (force_tone4_high_pitch
                         and phoneme.startswith(ZH_FLAG)
@@ -290,7 +290,7 @@ class MIDIEditLyrics:
                 "midi_json": ("STRING", {"multiline": True, "dynamicPrompts": False}),
                 "new_lyrics": ("STRING", {"multiline": True, "dynamicPrompts": False}),
                 "force_tone4": ("BOOLEAN", {"default": False, "label_on": "ON", "label_off": "OFF"}),
-                "high_pitch_threshold": ("INT", {"default": 72, "min": 0, "max": 127, "step": 1}),
+                 "high_pitch_threshold": ("INT", {"default": 79, "min": 0, "max": 127, "step": 1}),
             }
         }
 
