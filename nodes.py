@@ -111,7 +111,9 @@ def clean_lyrics(text: str) -> str:
 # --- Core logic ---
 
 
-def replace_lyrics(midi_json_str: str, new_lyrics: str) -> str:
+def replace_lyrics(midi_json_str: str, new_lyrics: str,
+                    force_tone4_high_pitch: bool = False,
+                    high_pitch_threshold: int = 72) -> str:
     """Replace lyrics in MIDI JSON and regenerate phonemes.
 
     Parameters
@@ -120,6 +122,14 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str) -> str:
         JSON string of the MIDI data array.
     new_lyrics : str
         The new lyrics text to substitute.
+    force_tone4_high_pitch : bool
+        When True, force all Chinese phonemes in slots whose note_pitch
+        >= *high_pitch_threshold* to use tone 4 (去声).
+        Off by default for backward compat.
+    high_pitch_threshold : int
+        MIDI note value threshold for high-pitch detection (0–127).
+        Defaults to 72 (C5).  Only effective when *force_tone4_high_pitch*
+        is True.
 
     Returns
     -------
@@ -141,6 +151,11 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str) -> str:
 
         original_text_tokens = track["text"].split(" ")
         original_phoneme_tokens = track["phoneme"].split(" ")
+
+        # Parse note_pitch values (if available) for high-pitch detection.
+        note_pitch_tokens = []
+        if force_tone4_high_pitch and "note_pitch" in track:
+            note_pitch_tokens = track["note_pitch"].split(" ")
 
         # Build slot list: group consecutive identical non-SP tokens into one slot.
         # Each slot is (char_or_SP, repeat_count).
@@ -179,6 +194,25 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str) -> str:
                 # Replace this slot with the user's char repeated slot_count times
                 replacement_char = cleaned[char_idx]
                 phoneme = char_to_phoneme(replacement_char)
+
+                # Check if this slot spans any note_pitch >= 72 (high pitch).
+                # Only applies to zh_ prefixed phonemes; skip en_ and <SP>.
+                if (force_tone4_high_pitch
+                        and phoneme.startswith(ZH_FLAG)
+                        and note_pitch_tokens):
+                    is_high_pitch = False
+                    for pi in range(slot_start, slot_start + slot_count):
+                        if pi < len(note_pitch_tokens):
+                            try:
+                                pval = int(note_pitch_tokens[pi])
+                                if pval >= high_pitch_threshold:
+                                    is_high_pitch = True
+                                    break
+                            except ValueError:
+                                pass
+                    if is_high_pitch:
+                        phoneme = re.sub(r"(\d)$", "4", phoneme)
+
                 for _ in range(slot_count):
                     new_text_tokens.append(replacement_char)
                     new_phoneme_tokens.append(phoneme)
@@ -255,6 +289,8 @@ class MIDIEditLyrics:
             "required": {
                 "midi_json": ("STRING", {"multiline": True, "dynamicPrompts": False}),
                 "new_lyrics": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+                "force_tone4": ("BOOLEAN", {"default": False, "label_on": "ON", "label_off": "OFF"}),
+                "high_pitch_threshold": ("INT", {"default": 72, "min": 0, "max": 127, "step": 1}),
             }
         }
 
@@ -266,12 +302,16 @@ class MIDIEditLyrics:
         "Replace lyrics in MIDI JSON with new text and auto-generate phonemes. "
         "Chinese characters are converted to zh_ prefixed pinyin; "
         "English words to en_ prefixed phonemes. "
-        "<SP> markers and non-lyric fields are preserved."
+        "<SP> markers and non-lyric fields are preserved. "
+        "Force Tone 4 (Smart Pitch): when ON, forces Chinese phonemes at "
+        "pitch >= threshold to tone 4 (去声). Only effective when the toggle is ON."
     )
 
-    def edit_lyrics(self, midi_json: str, new_lyrics: str) -> tuple:
+    def edit_lyrics(self, midi_json: str, new_lyrics: str, force_tone4: bool, high_pitch_threshold: int) -> tuple:
         try:
-            return (replace_lyrics(midi_json, new_lyrics),)
+            return (replace_lyrics(midi_json, new_lyrics,
+                                    force_tone4_high_pitch=force_tone4,
+                                    high_pitch_threshold=high_pitch_threshold),)
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid MIDI JSON input: {e}") from e
         except ValueError as e:
