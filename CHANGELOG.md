@@ -2,7 +2,20 @@
 
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
-## [2026-06-10]
+## [2026-06-11]
+
+### Added
+
+- **Fallback sentence splitting**: when punctuation/newline split yields fewer sentences than original MIDI sections, lyrics are automatically redistributed to match the original section sizes (punctuation ignored, last sentence may be shorter)
+
+### Changed
+
+- **Empty token duration redistribution**: when a section has fewer new lyrics than original tokens, the freed duration is now evenly distributed among the filled tokens (remainder to last) instead of being absorbed into adjacent SPs
+
+### Fixed
+
+- **Consecutive SP merging**: empty tokens between SP markers no longer produce duplicate `<SP>` entries in the output
+- **Empty remaining tokens**: tokens beyond the new lyrics length are properly cleared (text/phoneme emptied) instead of retaining original lyrics
 
 ### Added
 
