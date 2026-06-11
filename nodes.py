@@ -410,7 +410,9 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     )
                     new_segments.append(("section", processed))
 
-        # Reconstruct track from processed segments
+        # Reconstruct track: emit tokens, removing empties, merging SPs.
+        # Empty tokens' duration is absorbed into the nearest <SP> so that
+        # the total section timing is preserved without leaving gaps.
         new_track = dict(track)
         all_text: list[str] = []
         all_phoneme: list[str] = []
@@ -418,21 +420,65 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
         all_pitch: list[int] = []
         all_type: list[int] = []
 
+        pending_sp: dict | None = None
+        pending_empty_dur: float = 0.0
+
         for seg_type, seg_data in new_segments:
             if seg_type == "sp":
-                sp = seg_data  # type: ignore[assignment]
-                all_text.append(sp["text"])
-                all_phoneme.append(sp["phoneme"])
-                all_duration.append(sp["duration"])
-                all_pitch.append(sp["note_pitch"])
-                all_type.append(sp["note_type"])
+                sp = dict(seg_data)
+                if pending_sp is not None:
+                    # Consecutive SPs (or SP after an empty/partial section) → merge
+                    pending_sp["duration"] += pending_empty_dur + sp["duration"]
+                    pending_empty_dur = 0.0
+                else:
+                    pending_sp = sp
+                    pending_sp["duration"] += pending_empty_dur
+                    pending_empty_dur = 0.0
             else:
-                for token in seg_data:  # type: ignore[union-attr]
+                # Separate filled and empty tokens
+                filled = [t for t in seg_data if t["text"]]
+                empty_dur = sum(t["duration"] for t in seg_data if not t["text"])
+
+                # Emit pending SP ONLY if we have filled tokens to follow.
+                # If the section is completely empty, the SP stays pending and
+                # will merge with the next SP or be emitted at the end.
+                if filled and pending_sp is not None:
+                    all_text.append(pending_sp["text"])
+                    all_phoneme.append(pending_sp["phoneme"])
+                    all_duration.append(pending_sp["duration"])
+                    all_pitch.append(pending_sp["note_pitch"])
+                    all_type.append(pending_sp["note_type"])
+                    pending_sp = None
+                elif pending_sp is None and filled:
+                    # No preceding SP — filled tokens at the start, just emit them
+                    pass  # will emit below
+
+                # Accumulate empty duration (goes to nearest future SP)
+                pending_empty_dur += empty_dur
+
+                # Emit filled tokens
+                for token in filled:
                     all_text.append(token["text"])
                     all_phoneme.append(token["phoneme"])
                     all_duration.append(token["duration"])
                     all_pitch.append(token["note_pitch"])
                     all_type.append(token["note_type"])
+
+        # Emit trailing SP (or new SP for trailing empty duration)
+        if pending_sp is not None:
+            pending_sp["duration"] += pending_empty_dur
+            all_text.append(pending_sp["text"])
+            all_phoneme.append(pending_sp["phoneme"])
+            all_duration.append(pending_sp["duration"])
+            all_pitch.append(pending_sp["note_pitch"])
+            all_type.append(pending_sp["note_type"])
+        elif pending_empty_dur > 0:
+            # Trailing empty duration with no SP — create one
+            all_text.append("<SP>")
+            all_phoneme.append("<SP>")
+            all_duration.append(pending_empty_dur)
+            all_pitch.append(0)
+            all_type.append(1)
 
         new_track["text"] = " ".join(all_text)
         new_track["phoneme"] = " ".join(all_phoneme)
