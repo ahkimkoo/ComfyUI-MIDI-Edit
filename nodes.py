@@ -474,8 +474,10 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     new_segments.append(("section", processed))
 
         # Reconstruct track: emit tokens, removing empties, merging SPs.
-        # Empty tokens' duration is absorbed into the nearest <SP> so that
-        # the total section timing is preserved without leaving gaps.
+        # Empty tokens' duration is either:
+        # (a) Redistributed to filled tokens in the same section (when the section
+        #     has at least one filled token), OR
+        # (b) Absorbed into the nearest <SP> (when the section is completely empty).
         new_track = dict(track)
         all_text: list[str] = []
         all_phoneme: list[str] = []
@@ -490,7 +492,7 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
             if seg_type == "sp":
                 sp = dict(seg_data)
                 if pending_sp is not None:
-                    # Consecutive SPs (or SP after an empty/partial section) → merge
+                    # Consecutive SPs (or SP after an empty section) → merge
                     pending_sp["duration"] += pending_empty_dur + sp["duration"]
                     pending_empty_dur = 0.0
                 else:
@@ -498,9 +500,21 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     pending_sp["duration"] += pending_empty_dur
                     pending_empty_dur = 0.0
             else:
-                # Separate filled and empty tokens
                 filled = [t for t in seg_data if t["text"]]
-                empty_dur = sum(t["duration"] for t in seg_data if not t["text"])
+                empty_tokens = [t for t in seg_data if not t["text"]]
+
+                if filled and empty_tokens:
+                    # Redistribute empty duration evenly to filled tokens.
+                    # base_per = total_empty / n_filled for each, remainder to last.
+                    total_empty = sum(t["duration"] for t in empty_tokens)
+                    n = len(filled)
+                    base_per = total_empty / n
+                    for i in range(n - 1):
+                        filled[i]["duration"] += base_per
+                    filled[-1]["duration"] += total_empty - base_per * (n - 1)
+                    empty_dur = 0.0  # already redistributed
+                else:
+                    empty_dur = sum(t["duration"] for t in seg_data if not t["text"])
 
                 # Emit pending SP ONLY if we have filled tokens to follow.
                 # If the section is completely empty, the SP stays pending and
@@ -513,13 +527,13 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     all_type.append(pending_sp["note_type"])
                     pending_sp = None
                 elif pending_sp is None and filled:
-                    # No preceding SP — filled tokens at the start, just emit them
-                    pass  # will emit below
+                    pass  # No preceding SP — filled tokens at the start
 
-                # Accumulate empty duration (goes to nearest future SP)
-                pending_empty_dur += empty_dur
+                # Completely empty section → absorb into SP
+                if not filled:
+                    pending_empty_dur += empty_dur
 
-                # Emit filled tokens
+                # Emit filled tokens (duration already adjusted if redistributed)
                 for token in filled:
                     all_text.append(token["text"])
                     all_phoneme.append(token["phoneme"])
