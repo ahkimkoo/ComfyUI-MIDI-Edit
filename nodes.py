@@ -123,6 +123,61 @@ def _split_lyrics_to_sentences(new_lyrics: str) -> list[str]:
     return [clean_lyrics(s) for s in raw if clean_lyrics(s)]
 
 
+def _count_total_sections(midi_data: list) -> int:
+    """Count total non-SP sections across all tracks."""
+    count = 0
+    for track in midi_data:
+        if "text" not in track:
+            continue
+        tokens = track["text"].split(" ")
+        i = 0
+        while i < len(tokens):
+            if tokens[i] != "<SP>":
+                count += 1
+                while i < len(tokens) and tokens[i] != "<SP>":
+                    i += 1
+            else:
+                i += 1
+    return count
+
+
+def _split_by_section_sizes(plain_text: str, section_sizes: list[int]) -> list[str]:
+    """Split plain text (no punctuation) into chunks matching original section sizes.
+
+    Walks through section_sizes, slicing plain_text at each boundary.
+    The last chunk gets whatever remains (may be shorter or empty).
+    """
+    result = []
+    pos = 0
+    for size in section_sizes:
+        if pos >= len(plain_text):
+            result.append("")
+        else:
+            end = min(pos + size, len(plain_text))
+            result.append(plain_text[pos:end])
+            pos = end
+    return result
+
+
+def _get_section_sizes(midi_data: list) -> list[int]:
+    """Get the token count of each non-SP section across all tracks."""
+    sizes = []
+    for track in midi_data:
+        if "text" not in track:
+            continue
+        tokens = track["text"].split(" ")
+        i = 0
+        while i < len(tokens):
+            if tokens[i] != "<SP>":
+                start = i
+                while i < len(tokens) and tokens[i] != "<SP>":
+                    i += 1
+                sizes.append(i - start)
+            else:
+                i += 1
+    return sizes
+
+
 # --- Segment / slot helpers ---
 
 
@@ -323,6 +378,14 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
         raise ValueError("MIDI JSON must be a list (array) of track objects")
 
     sentences = _split_lyrics_to_sentences(new_lyrics)
+
+    # Fallback: if punctuation/newline split yields fewer sentences than
+    # original sections, re-split by matching the original section sizes.
+    total_sections = _count_total_sections(midi_data)
+    if len(sentences) < total_sections:
+        section_sizes = _get_section_sizes(midi_data)
+        plain = clean_lyrics(new_lyrics)
+        sentences = _split_by_section_sizes(plain, section_sizes)
 
     # Global sentence counter — persists across tracks so that the second
     # track continues where the first track left off.
