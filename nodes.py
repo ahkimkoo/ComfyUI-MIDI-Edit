@@ -235,7 +235,7 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-def extract_lyrics(midi_json_str: str) -> str:
+def extract_lyrics(midi_json_str: str, merge_repeated: bool = False) -> str:
     """Extract and concatenate lyrics text from MIDI JSON.
 
     Iterates all tracks, collects the ``text`` field, strips spaces,
@@ -274,7 +274,10 @@ def extract_lyrics(midi_json_str: str) -> str:
     all_text = all_text.replace(" ", "")
     all_text = all_text.replace("<SP>", "\n")
 
-    return all_text.strip()
+    result = all_text.strip()
+    if merge_repeated:
+        result = merge_repeated_chars(result)
+    return result
 
 
 def merge_repeated_chars(text: str) -> str:
@@ -344,6 +347,7 @@ class MIDIExtractLyrics:
         return {
             "required": {
                 "midi_json": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+                "merge_repeated": ("BOOLEAN", {"default": False, "label_on": "ON", "label_off": "OFF"}),
             }
         }
 
@@ -353,12 +357,13 @@ class MIDIExtractLyrics:
     CATEGORY = "MIDI-Edit"
     DESCRIPTION = (
         "Extract lyrics from MIDI JSON. Concatenates text from all tracks, "
-        "removes spaces, and replaces <SP> markers with newlines."
+        "removes spaces, and replaces <SP> markers with newlines. "
+        "When Merge Repeated is ON, consecutive duplicate characters are collapsed into one."
     )
 
-    def extract(self, midi_json: str) -> tuple:
+    def extract(self, midi_json: str, merge_repeated: bool) -> tuple:
         try:
-            return (extract_lyrics(midi_json),)
+            return (extract_lyrics(midi_json, merge_repeated=merge_repeated),)
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid MIDI JSON input: {e}") from e
         except ValueError as e:
