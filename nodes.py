@@ -108,13 +108,181 @@ def clean_lyrics(text: str) -> str:
     return re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", text)
 
 
+# --- Lyrics sentence splitting ---
+
+
+_SENTENCE_DELIM_RE = re.compile(r"[\n，。！？；：、,.\!\?;:]+")
+
+
+def _split_lyrics_to_sentences(new_lyrics: str) -> list[str]:
+    """Split user lyrics into sentences by newlines and punctuation.
+
+    Returns a list of cleaned (non-empty) sentence strings.
+    """
+    raw = _SENTENCE_DELIM_RE.split(new_lyrics)
+    return [clean_lyrics(s) for s in raw if clean_lyrics(s)]
+
+
+# --- Segment / slot helpers ---
+
+
+def _split_into_segments(
+    text_tokens: list[str],
+    phoneme_tokens: list[str],
+    duration_tokens: list[str],
+    note_pitch_tokens: list[str],
+    note_type_tokens: list[str],
+    f0_tokens: list[str],
+) -> list[tuple[str, object]]:
+    """Split token arrays into segments: ('section', [token_dicts]) or ('sp', sp_dict).
+
+    Each non-SP token is represented as a dict with all MIDI fields.
+    SP tokens are kept as individual sp dicts.
+    """
+    segments: list[tuple[str, object]] = []
+    current: list[dict] = []
+
+    for i, text in enumerate(text_tokens):
+        token = {
+            "text": text,
+            "phoneme": phoneme_tokens[i] if i < len(phoneme_tokens) else "<SP>",
+            "duration": float(duration_tokens[i]) if i < len(duration_tokens) else 0.0,
+            "note_pitch": int(note_pitch_tokens[i]) if i < len(note_pitch_tokens) else 0,
+            "note_type": int(note_type_tokens[i]) if i < len(note_type_tokens) else 0,
+            "f0": float(f0_tokens[i]) if i < len(f0_tokens) else 0.0,
+        }
+
+        if text == "<SP>":
+            if current:
+                segments.append(("section", current))
+                current = []
+            segments.append(("sp", token))
+        else:
+            current.append(token)
+
+    if current:
+        segments.append(("section", current))
+    return segments
+
+
+def _build_collapsed_slots(tokens: list[dict]) -> list[tuple[str, int, list[int]]]:
+    """Group consecutive identical text tokens into slots.
+
+    Returns list of (char, count, [token_indices]).
+    """
+    if not tokens:
+        return []
+    slots: list[tuple[str, int, list[int]]] = []
+    cur_char = tokens[0]["text"]
+    cur_count = 1
+    cur_indices = [0]
+    for i in range(1, len(tokens)):
+        if tokens[i]["text"] == cur_char:
+            cur_count += 1
+            cur_indices.append(i)
+        else:
+            slots.append((cur_char, cur_count, cur_indices))
+            cur_char = tokens[i]["text"]
+            cur_count = 1
+            cur_indices = [i]
+    slots.append((cur_char, cur_count, cur_indices))
+    return slots
+
+
+def _split_token(tokens: list[dict], idx: int) -> None:
+    """Split token at *idx* into two halves with half duration. Pitch unchanged."""
+    token = tokens[idx]
+    half_dur = token["duration"] / 2.0
+    token["duration"] = half_dur
+    new_token = {
+        "text": token["text"],
+        "phoneme": token["phoneme"],
+        "duration": half_dur,
+        "note_pitch": token["note_pitch"],
+        "note_type": token["note_type"],
+        "f0": token["f0"],
+    }
+    # Preserve internal tags (e.g. _sec_id used by flat mode regrouping)
+    for key in token:
+        if key.startswith("_"):
+            new_token[key] = token[key]
+    tokens.insert(idx + 1, new_token)
+
+
+def _apply_char(tokens: list[dict], idx: int, char: str,
+                force_tone4: bool, threshold: int) -> None:
+    """Replace token text with *char*, regenerate phoneme, optional high-pitch adjustment."""
+    phoneme = char_to_phoneme(char)
+    if force_tone4 and phoneme.startswith(ZH_FLAG):
+        try:
+            if int(tokens[idx].get("note_pitch", 0)) >= threshold:
+                phoneme = re.sub(r"(\d)$", "4", phoneme)
+        except (ValueError, TypeError):
+            pass
+    tokens[idx]["text"] = char
+    tokens[idx]["phoneme"] = phoneme
+
+
+def _process_section(
+    tokens: list[dict], sentence: str,
+    force_tone4_high_pitch: bool, high_pitch_threshold: int,
+) -> list[dict]:
+    """Apply the 3-mode algorithm to a single section.
+
+    Modes:
+    - Collapse (N <= S): map chars to slots, expand by repeat count.
+    - Token (S < N <= M): 1:1 token mapping.
+    - Expand (N > M): split longest-duration tokens until count matches, then 1:1.
+    """
+    if not tokens or not sentence:
+        return tokens  # no sentence → keep original
+
+    N = len(sentence)
+    M = len(tokens)
+    slots = _build_collapsed_slots(tokens)
+    S = len(slots)
+
+    if N <= S:
+        # ===== Collapse mode =====
+        for slot_idx, (_orig_char, _count, token_indices) in enumerate(slots):
+            if slot_idx < N:
+                new_char = sentence[slot_idx]
+                for ti in token_indices:
+                    _apply_char(tokens, ti, new_char,
+                                force_tone4_high_pitch, high_pitch_threshold)
+            # else: keep original text (no-op)
+        return tokens
+
+    # ===== Token / Expand mode =====
+    # Split longest tokens if needed (only when N > M)
+    while len(tokens) < N:
+        longest_idx = max(range(len(tokens)), key=lambda i: tokens[i]["duration"])
+        _split_token(tokens, longest_idx)
+
+    # 1:1 mapping
+    for i in range(min(N, len(tokens))):
+        _apply_char(tokens, i, sentence[i],
+                    force_tone4_high_pitch, high_pitch_threshold)
+
+    return tokens
+
+
 # --- Core logic ---
 
 
 def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     force_tone4_high_pitch: bool = False,
                      high_pitch_threshold: int = 79) -> str:
-    """Replace lyrics in MIDI JSON and regenerate phonemes.
+    """Replace lyrics in MIDI JSON with smart 3-mode algorithm.
+
+    Splits user lyrics by newlines/punctuation into sentences, each mapped to
+    a MIDI section (SP-delimited).  Three modes per section:
+
+    - **Collapse** (N <= S): chars map to slots (deduplicated consecutive
+      chars), expanded by original repeat count.
+    - **Token** (S < N <= M): 1:1 token mapping.
+    - **Expand** (N > M): longest-duration tokens are split (duration halved,
+      pitch unchanged) until token count matches sentence length, then 1:1.
 
     Parameters
     ----------
@@ -123,13 +291,9 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
     new_lyrics : str
         The new lyrics text to substitute.
     force_tone4_high_pitch : bool
-        When True, force all Chinese phonemes in slots whose note_pitch
-        >= *high_pitch_threshold* to use tone 4 (去声).
-        Off by default for backward compat.
+        When True, force Chinese phonemes at note_pitch >= threshold to tone 4.
     high_pitch_threshold : int
-        MIDI note value threshold for high-pitch detection (0–127).
-         Defaults to 79 (G5).  Only effective when *force_tone4_high_pitch*
-        is True.
+        MIDI note value threshold (0-127). Defaults to 79 (G5).
 
     Returns
     -------
@@ -141,13 +305,7 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
     if not isinstance(midi_data, list):
         raise ValueError("MIDI JSON must be a list (array) of track objects")
 
-    # Split new lyrics by lines, clean each line independently.
-    # This preserves section boundaries: each line maps to one <SP>-delimited
-    # section in the original MIDI text.  Backward compatible: a single-line input
-    # (no newlines) behaves identically to the old flat-mapping approach.
-    lyrics_lines = [clean_lyrics(line) for line in new_lyrics.split("\n")]
-    while lyrics_lines and not lyrics_lines[-1]:
-        lyrics_lines.pop()
+    sentences = _split_lyrics_to_sentences(new_lyrics)
 
     result = []
     for track in midi_data:
@@ -155,131 +313,116 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
             result.append(track)
             continue
 
-        original_text_tokens = track["text"].split(" ")
-        original_phoneme_tokens = track["phoneme"].split(" ")
+        # Parse all token arrays from the track
+        text_tokens = track["text"].split(" ")
+        phoneme_tokens = track["phoneme"].split(" ")
+        duration_raw = track.get("duration", "")
+        duration_tokens = duration_raw.split(" ") if duration_raw else []
+        pitch_raw = track.get("note_pitch", "")
+        note_pitch_tokens = pitch_raw.split(" ") if pitch_raw else []
+        type_raw = track.get("note_type", "")
+        note_type_tokens = type_raw.split(" ") if type_raw else []
+        f0_raw = track.get("f0", "")
+        f0_tokens = f0_raw.split(" ") if f0_raw else []
 
-        # Parse note_pitch values (if available) for high-pitch detection.
-        note_pitch_tokens = []
-        if force_tone4_high_pitch and "note_pitch" in track:
-            note_pitch_tokens = track["note_pitch"].split(" ")
+        # Split into segments (sections + SP markers)
+        segments = _split_into_segments(
+            text_tokens, phoneme_tokens, duration_tokens,
+            note_pitch_tokens, note_type_tokens, f0_tokens,
+        )
 
-        # --- Slot-merging dedup-expand algorithm ---
-        #
-        # 1. Group consecutive identical non-SP tokens into "slots".
-        # 2. Each slot maps to exactly one character from the lyrics.
-        # 3. Expand the replacement char by the slot's repeat count so the
-        #    total output token count equals the original.
-        #
-        # Multi-line input: each <SP>-delimited section independently maps
-        #   chars from its matching lyrics line (section 0 → line 0, etc.).
-        # Single-line input: all sections share one global slot position (flat
-        #   mapping), backward-compatible.
-        new_text_tokens = []
-        new_phoneme_tokens = []
+        # Flat mode: single sentence without punctuation maps across ALL sections
+        # by treating all non-SP tokens as one combined section, processing, then
+        # re-inserting SP markers at their original positions.
+        # Multi-sentence mode: each section maps to its own sentence independently.
+        flat_mode = len(sentences) <= 1
 
-        # Slot-building state
-        current_slot_char = None
-        current_slot_count = 0
-        current_slot_indices = []
+        if flat_mode:
+            # Collect all non-SP tokens, tagging each with its section index
+            # so we can regroup after processing (which may add tokens via expand).
+            all_tokens: list[dict] = []
+            sp_markers: list[tuple[int, dict]] = []  # (position_in_all_tokens, sp_dict)
+            sec_counter = 0
 
-        # Lyrics mapping state
-        section_idx = -1
-        sec_slot_pos = 0
-        global_slot_pos = 0
-        single_line = len(lyrics_lines) == 1
-
-        def _emit_slot():
-            """Flush the current slot: map a lyrics char to it and expand."""
-            nonlocal current_slot_char, current_slot_count, current_slot_indices
-            nonlocal section_idx, sec_slot_pos, global_slot_pos
-
-            if current_slot_char is None:
-                return
-
-            # Determine which lyrics line and slot position to use.
-            if single_line:
-                line = lyrics_lines[0]
-                pos = global_slot_pos
-            elif section_idx >= 0 and section_idx < len(lyrics_lines):
-                line = lyrics_lines[section_idx]
-                pos = sec_slot_pos
-            else:
-                line = ""
-                pos = sec_slot_pos
-
-            if pos < len(line):
-                replacement_char = line[pos]
-                for token_i in current_slot_indices:
-                    phoneme = char_to_phoneme(replacement_char)
-
-                    # High-pitch detection on each expanded token independently.
-                    if (force_tone4_high_pitch
-                            and phoneme.startswith(ZH_FLAG)
-                            and note_pitch_tokens):
-                        is_high_pitch = False
-                        if token_i < len(note_pitch_tokens):
-                            try:
-                                pval = int(note_pitch_tokens[token_i])
-                                if pval >= high_pitch_threshold:
-                                    is_high_pitch = True
-                            except ValueError:
-                                pass
-                        if is_high_pitch:
-                            phoneme = re.sub(r"(\d)$", "4", phoneme)
-
-                    new_text_tokens.append(replacement_char)
-                    new_phoneme_tokens.append(phoneme)
-            else:
-                # Not enough chars — keep original text and phoneme.
-                for token_i in current_slot_indices:
-                    new_text_tokens.append(current_slot_char)
-                    if token_i < len(original_phoneme_tokens):
-                        new_phoneme_tokens.append(original_phoneme_tokens[token_i])
-                    else:
-                        new_phoneme_tokens.append("<SP>")
-
-            # Advance slot position counter.
-            if single_line:
-                global_slot_pos += 1
-            else:
-                sec_slot_pos += 1
-
-            current_slot_char = None
-            current_slot_count = 0
-            current_slot_indices = []
-
-        for i, token in enumerate(original_text_tokens):
-            if token == "<SP>":
-                # Flush current slot before SP boundary.
-                _emit_slot()
-                # Emit SP preserving original phoneme.
-                new_text_tokens.append("<SP>")
-                if i < len(original_phoneme_tokens):
-                    new_phoneme_tokens.append(original_phoneme_tokens[i])
+            for seg_type, seg_data in segments:
+                if seg_type == "sp":
+                    sp_markers.append((len(all_tokens), seg_data))
                 else:
-                    new_phoneme_tokens.append("<SP>")
-                # Advance to next section (multi-line mode).
-                if not single_line:
-                    section_idx += 1
-                    sec_slot_pos = 0
-            else:
-                if token == current_slot_char:
-                    # Same char → extend current slot.
-                    current_slot_count += 1
-                    current_slot_indices.append(i)
+                    for tok in seg_data:  # type: ignore[iteration]
+                        tok["_sec_id"] = sec_counter
+                        all_tokens.append(tok)
+                    sec_counter += 1
+
+            sentence = sentences[0] if sentences else ""
+            _process_section(
+                all_tokens, sentence, force_tone4_high_pitch, high_pitch_threshold,
+            )
+
+            # Regroup tokens by _sec_id (new tokens from split inherit from parent)
+            section_groups: dict[int, list[dict]] = {}
+            for tok in all_tokens:
+                sid = tok.get("_sec_id", 0)
+                section_groups.setdefault(sid, []).append(tok)
+                # Clean up internal tag before output
+                tok.pop("_sec_id", None)
+
+            new_segments: list[tuple[str, object]] = []
+            seg_id_counter = 0
+            marker_idx = 0
+            for orig_seg_type, _orig_seg_data in segments:
+                if orig_seg_type == "sp":
+                    new_segments.append(("sp", sp_markers[marker_idx][1]))
+                    marker_idx += 1
                 else:
-                    # Different char → flush previous slot, start new one.
-                    _emit_slot()
-                    current_slot_char = token
-                    current_slot_count = 1
-                    current_slot_indices = [i]
+                    new_segments.append(("section", section_groups.get(seg_id_counter, [])))
+                    seg_id_counter += 1
+        else:
+            sec_idx = 0
+            new_segments: list[tuple[str, object]] = []
+            for seg_type, seg_data in segments:
+                if seg_type == "sp":
+                    new_segments.append(("sp", seg_data))
+                else:
+                    sentence = sentences[sec_idx] if sec_idx < len(sentences) else ""
+                    sec_idx += 1
+                    processed = _process_section(
+                        seg_data, sentence, force_tone4_high_pitch, high_pitch_threshold,
+                    )
+                    new_segments.append(("section", processed))
 
-        # Flush the final slot after the loop.
-        _emit_slot()
-
+        # Reconstruct track from processed segments
         new_track = dict(track)
-        new_track["text"] = " ".join(new_text_tokens)
-        new_track["phoneme"] = " ".join(new_phoneme_tokens)
+        all_text: list[str] = []
+        all_phoneme: list[str] = []
+        all_duration: list[float] = []
+        all_pitch: list[int] = []
+        all_type: list[int] = []
+        all_f0: list[float] = []
+
+        for seg_type, seg_data in new_segments:
+            if seg_type == "sp":
+                sp = seg_data  # type: ignore[assignment]
+                all_text.append(sp["text"])
+                all_phoneme.append(sp["phoneme"])
+                all_duration.append(sp["duration"])
+                all_pitch.append(sp["note_pitch"])
+                all_type.append(sp["note_type"])
+                all_f0.append(sp["f0"])
+            else:
+                for token in seg_data:  # type: ignore[union-attr]
+                    all_text.append(token["text"])
+                    all_phoneme.append(token["phoneme"])
+                    all_duration.append(token["duration"])
+                    all_pitch.append(token["note_pitch"])
+                    all_type.append(token["note_type"])
+                    all_f0.append(token["f0"])
+
+        new_track["text"] = " ".join(all_text)
+        new_track["phoneme"] = " ".join(all_phoneme)
+        new_track["duration"] = " ".join(str(d) for d in all_duration)
+        new_track["note_pitch"] = " ".join(str(p) for p in all_pitch)
+        new_track["note_type"] = " ".join(str(t) for t in all_type)
+        new_track["f0"] = " ".join(str(f) for f in all_f0)
         result.append(new_track)
 
     return json.dumps(result, ensure_ascii=False, indent=2)
@@ -371,11 +514,14 @@ class MIDIEditLyrics:
     CATEGORY = "MIDI-Edit"
     DESCRIPTION = (
         "Replace lyrics in MIDI JSON with new text and auto-generate phonemes. "
-        "Chinese characters are converted to zh_ prefixed pinyin; "
-        "English words to en_ prefixed phonemes. "
-        "<SP> markers and non-lyric fields are preserved. "
-        "Force Tone 4 (Smart Pitch): when ON, forces Chinese phonemes at "
-        "pitch >= threshold to tone 4 (去声). Only effective when the toggle is ON."
+        "Smart matching: splits lyrics by newlines/punctuation into sentences, "
+        "each mapped to a MIDI section. If new sentence is shorter than original, "
+        "extra characters keep original text. If longer, automatically splits "
+        "the longest-duration note (pitch unchanged, duration halved) to create "
+        "more positions. Consecutive repeated characters in original are grouped "
+        "(e.g. '向向' → slot with count 2) and expanded accordingly. "
+        "Chinese chars → zh_ pinyin; English → en_ phonemes. "
+        "Force Tone 4: forces Chinese phonemes at pitch >= threshold to tone 4."
     )
 
     def edit_lyrics(self, midi_json: str, new_lyrics: str, force_tone4: bool, high_pitch_threshold: int) -> tuple:
