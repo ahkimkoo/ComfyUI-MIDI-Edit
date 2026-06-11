@@ -277,6 +277,24 @@ def extract_lyrics(midi_json_str: str) -> str:
     return all_text.strip()
 
 
+def merge_repeated_chars(text: str) -> str:
+    """Remove consecutive duplicate characters from *text*, keeping one.
+
+    Example::
+
+        "向向往"  → "向往"
+        "天天马"  → "天马"
+        "好世界好" → "好世界好"  (not consecutive)
+    """
+    if not text:
+        return text
+    result = [text[0]]
+    for ch in text[1:]:
+        if ch != result[-1]:
+            result.append(ch)
+    return "".join(result)
+
+
 # --- ComfyUI Node ---
 
 
@@ -347,14 +365,40 @@ class MIDIExtractLyrics:
             raise ValueError(f"Lyrics extraction error: {e}") from e
 
 
+class MIDIMergeRepeatedChars:
+    """ComfyUI node that merges consecutive repeated characters, keeping one."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "merge"
+    CATEGORY = "MIDI-Edit"
+    DESCRIPTION = (
+        "Merge consecutive repeated characters in text, keeping only one. "
+        'E.g. "向向往" → "向往". Useful for cleaning duplicated lyrics characters.'
+    )
+
+    def merge(self, text: str) -> tuple:
+        return (merge_repeated_chars(text),)
+
+
 # --- Mappings ---
 
 NODE_CLASS_MAPPINGS = {
     "MIDIEditLyrics": MIDIEditLyrics,
     "MIDIExtractLyrics": MIDIExtractLyrics,
+    "MIDIMergeRepeatedChars": MIDIMergeRepeatedChars,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MIDIEditLyrics": "MIDI Edit Lyrics",
     "MIDIExtractLyrics": "MIDI Extract Lyrics",
+    "MIDIMergeRepeatedChars": "MIDI Merge Repeated Chars",
 }
