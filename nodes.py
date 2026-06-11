@@ -132,11 +132,12 @@ def _split_into_segments(
     duration_tokens: list[str],
     note_pitch_tokens: list[str],
     note_type_tokens: list[str],
-    f0_tokens: list[str],
+        f0_tokens: list[str],
 ) -> list[tuple[str, object]]:
     """Split token arrays into segments: ('section', [token_dicts]) or ('sp', sp_dict).
 
-    Each non-SP token is represented as a dict with all MIDI fields.
+    Each non-SP token is represented as a dict with token-level MIDI fields.
+    **f0 is NOT included** because it is frame-level data (not 1:1 with tokens).
     SP tokens are kept as individual sp dicts.
     """
     segments: list[tuple[str, object]] = []
@@ -149,7 +150,6 @@ def _split_into_segments(
             "duration": float(duration_tokens[i]) if i < len(duration_tokens) else 0.0,
             "note_pitch": int(note_pitch_tokens[i]) if i < len(note_pitch_tokens) else 0,
             "note_type": int(note_type_tokens[i]) if i < len(note_type_tokens) else 0,
-            "f0": float(f0_tokens[i]) if i < len(f0_tokens) else 0.0,
         }
 
         if text == "<SP>":
@@ -200,7 +200,6 @@ def _split_token(tokens: list[dict], idx: int) -> None:
         "duration": half_dur,
         "note_pitch": token["note_pitch"],
         "note_type": token["note_type"],
-        "f0": token["f0"],
     }
     # Preserve internal tags (e.g. _sec_id used by flat mode regrouping)
     for key in token:
@@ -307,6 +306,10 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
 
     sentences = _split_lyrics_to_sentences(new_lyrics)
 
+    # Global sentence counter — persists across tracks so that the second
+    # track continues where the first track left off.
+    global_sec_idx = 0
+
     result = []
     for track in midi_data:
         if "text" not in track or "phoneme" not in track:
@@ -377,14 +380,13 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     new_segments.append(("section", section_groups.get(seg_id_counter, [])))
                     seg_id_counter += 1
         else:
-            sec_idx = 0
             new_segments: list[tuple[str, object]] = []
             for seg_type, seg_data in segments:
                 if seg_type == "sp":
                     new_segments.append(("sp", seg_data))
                 else:
-                    sentence = sentences[sec_idx] if sec_idx < len(sentences) else ""
-                    sec_idx += 1
+                    sentence = sentences[global_sec_idx] if global_sec_idx < len(sentences) else ""
+                    global_sec_idx += 1
                     processed = _process_section(
                         seg_data, sentence, force_tone4_high_pitch, high_pitch_threshold,
                     )
@@ -397,7 +399,6 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
         all_duration: list[float] = []
         all_pitch: list[int] = []
         all_type: list[int] = []
-        all_f0: list[float] = []
 
         for seg_type, seg_data in new_segments:
             if seg_type == "sp":
@@ -407,7 +408,6 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                 all_duration.append(sp["duration"])
                 all_pitch.append(sp["note_pitch"])
                 all_type.append(sp["note_type"])
-                all_f0.append(sp["f0"])
             else:
                 for token in seg_data:  # type: ignore[union-attr]
                     all_text.append(token["text"])
@@ -415,14 +415,14 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     all_duration.append(token["duration"])
                     all_pitch.append(token["note_pitch"])
                     all_type.append(token["note_type"])
-                    all_f0.append(token["f0"])
 
         new_track["text"] = " ".join(all_text)
         new_track["phoneme"] = " ".join(all_phoneme)
         new_track["duration"] = " ".join(str(d) for d in all_duration)
         new_track["note_pitch"] = " ".join(str(p) for p in all_pitch)
         new_track["note_type"] = " ".join(str(t) for t in all_type)
-        new_track["f0"] = " ".join(str(f) for f in all_f0)
+        # f0 is NOT rebuilt — it is frame-level data, not token-level.
+        # dict(track) already preserves the original f0 from the input.
         result.append(new_track)
 
     return json.dumps(result, ensure_ascii=False, indent=2)
