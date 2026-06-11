@@ -233,8 +233,16 @@ def _process_section(
     - Token (S < N <= M): 1:1 token mapping.
     - Expand (N > M): split longest-duration tokens until count matches, then 1:1.
     """
-    if not tokens or not sentence:
-        return tokens  # no sentence → keep original
+    if not tokens:
+        return tokens
+
+    if not sentence:
+        # No sentence available for this section — empty all text/phoneme
+        # (keep token count for timing/alignment).
+        for tok in tokens:
+            tok["text"] = ""
+            tok["phoneme"] = ""
+        return tokens
 
     N = len(sentence)
     M = len(tokens)
@@ -249,7 +257,12 @@ def _process_section(
                 for ti in token_indices:
                     _apply_char(tokens, ti, new_char,
                                 force_tone4_high_pitch, high_pitch_threshold)
-            # else: keep original text (no-op)
+            else:
+                # Remaining slots: empty text/phoneme (don't keep original lyrics),
+                # but keep token count to preserve timing and section alignment.
+                for ti in token_indices:
+                    tokens[ti]["text"] = ""
+                    tokens[ti]["phoneme"] = ""
         return tokens
 
     # ===== Token / Expand mode =====
@@ -262,6 +275,11 @@ def _process_section(
     for i in range(min(N, len(tokens))):
         _apply_char(tokens, i, sentence[i],
                     force_tone4_high_pitch, high_pitch_threshold)
+
+    # Empty remaining tokens (don't keep original lyrics)
+    for i in range(N, len(tokens)):
+        tokens[i]["text"] = ""
+        tokens[i]["phoneme"] = ""
 
     return tokens
 
