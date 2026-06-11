@@ -141,7 +141,13 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
     if not isinstance(midi_data, list):
         raise ValueError("MIDI JSON must be a list (array) of track objects")
 
-    cleaned = clean_lyrics(new_lyrics)
+    # Split new lyrics by lines, clean each line independently.
+    # This preserves section boundaries: each line maps to one <SP>-delimited
+    # section in the original MIDI text.  Backward compatible: a single-line input
+    # (no newlines) behaves identically to the old flat-mapping approach.
+    lyrics_lines = [clean_lyrics(line) for line in new_lyrics.split("\n")]
+    while lyrics_lines and not lyrics_lines[-1]:
+        lyrics_lines.pop()
 
     result = []
     for track in midi_data:
@@ -158,16 +164,19 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
             note_pitch_tokens = track["note_pitch"].split(" ")
 
         # Build slot list: group consecutive identical non-SP tokens into one slot.
-        # Each slot is (char_or_SP, repeat_count).
-        # SP tokens are always ("SP", 1).
+        # Each slot is (char_or_SP, repeat_count, start_token_index, section_idx).
+        # SP tokens are always ("SP", 1, i, -1).
         # Consecutive identical non-SP tokens merge: e.g. "兄 兄" → ("兄", 2).
         # A different char or <SP> breaks the group.
-        slots = []  # list of (char_or_SP, count, start_token_index)
+        # section_idx tracks which <SP>-delimited section each slot belongs to.
+        slots = []
+        section_idx = -1
         i = 0
         while i < len(original_text_tokens):
             token = original_text_tokens[i]
             if token == "<SP>":
-                slots.append(("SP", 1, i))
+                slots.append(("SP", 1, i, -1))
+                section_idx += 1
                 i += 1
             else:
                 char = token
@@ -176,56 +185,74 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                 while i < len(original_text_tokens) and original_text_tokens[i] == char:
                     count += 1
                     i += 1
-                slots.append((char, count, start))
+                slots.append((char, count, start, section_idx))
 
         # Walk slots and produce new text/phoneme tokens.
         # Total output token count must equal original token count.
+        # Characters are allocated per-section: each section gets chars from its
+        # corresponding lyrics line independently.
         new_text_tokens = []
         new_phoneme_tokens = []
-        char_idx = 0
-        for slot_char, slot_count, slot_start in slots:
+        section_char_pos = {}  # section_idx -> char position in that section's lyrics line
+
+        # Backward compat: single-line input shares one char pool across all sections.
+        single_line = len(lyrics_lines) == 1
+
+        for slot_char, slot_count, slot_start, slot_section in slots:
             if slot_char == "SP":
                 new_text_tokens.append("<SP>")
                 if slot_start < len(original_phoneme_tokens):
                     new_phoneme_tokens.append(original_phoneme_tokens[slot_start])
                 else:
                     new_phoneme_tokens.append("<SP>")
-            elif char_idx < len(cleaned):
-                # Replace this slot with the user's char repeated slot_count times
-                replacement_char = cleaned[char_idx]
-                phoneme = char_to_phoneme(replacement_char)
-
-                 # Check if this slot spans any note_pitch >= 79 (high pitch).
-                # Only applies to zh_ prefixed phonemes; skip en_ and <SP>.
-                if (force_tone4_high_pitch
-                        and phoneme.startswith(ZH_FLAG)
-                        and note_pitch_tokens):
-                    is_high_pitch = False
-                    for pi in range(slot_start, slot_start + slot_count):
-                        if pi < len(note_pitch_tokens):
-                            try:
-                                pval = int(note_pitch_tokens[pi])
-                                if pval >= high_pitch_threshold:
-                                    is_high_pitch = True
-                                    break
-                            except ValueError:
-                                pass
-                    if is_high_pitch:
-                        phoneme = re.sub(r"(\d)$", "4", phoneme)
-
-                for _ in range(slot_count):
-                    new_text_tokens.append(replacement_char)
-                    new_phoneme_tokens.append(phoneme)
-                char_idx += 1
             else:
-                # User provided fewer chars than slots — keep original tokens & phonemes
-                for j in range(slot_count):
-                    token_idx = slot_start + j
-                    new_text_tokens.append(original_text_tokens[token_idx])
-                    if token_idx < len(original_phoneme_tokens):
-                        new_phoneme_tokens.append(original_phoneme_tokens[token_idx])
-                    else:
-                        new_phoneme_tokens.append("<SP>")
+                # Get the lyrics line for this section.
+                # Single-line input: all sections share the same line (flat mapping).
+                if single_line:
+                    line = lyrics_lines[0]
+                    pos = section_char_pos.get(0, 0)
+                elif slot_section < len(lyrics_lines):
+                    line = lyrics_lines[slot_section]
+                    pos = section_char_pos.get(slot_section, 0)
+                else:
+                    line = ""
+                    pos = section_char_pos.get(slot_section, 0)
+
+                if pos < len(line):
+                    replacement_char = line[pos]
+                    phoneme = char_to_phoneme(replacement_char)
+
+                    # Check if this slot spans any note_pitch >= high_pitch_threshold.
+                    # Only applies to zh_ prefixed phonemes; skip en_ and <SP>.
+                    if (force_tone4_high_pitch
+                            and phoneme.startswith(ZH_FLAG)
+                            and note_pitch_tokens):
+                        is_high_pitch = False
+                        for pi in range(slot_start, slot_start + slot_count):
+                            if pi < len(note_pitch_tokens):
+                                try:
+                                    pval = int(note_pitch_tokens[pi])
+                                    if pval >= high_pitch_threshold:
+                                        is_high_pitch = True
+                                        break
+                                except ValueError:
+                                    pass
+                        if is_high_pitch:
+                            phoneme = re.sub(r"(\d)$", "4", phoneme)
+
+                    for _ in range(slot_count):
+                        new_text_tokens.append(replacement_char)
+                        new_phoneme_tokens.append(phoneme)
+                    section_char_pos[0 if single_line else slot_section] = pos + 1
+                else:
+                    # Not enough chars in this section's line — keep original
+                    for j in range(slot_count):
+                        token_idx = slot_start + j
+                        new_text_tokens.append(original_text_tokens[token_idx])
+                        if token_idx < len(original_phoneme_tokens):
+                            new_phoneme_tokens.append(original_phoneme_tokens[token_idx])
+                        else:
+                            new_phoneme_tokens.append("<SP>")
 
         new_track = dict(track)
         new_track["text"] = " ".join(new_text_tokens)
