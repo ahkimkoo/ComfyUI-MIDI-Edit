@@ -535,7 +535,6 @@ def _smart_split_sentences(
     section_sizes = _get_section_sizes(midi_data)
     num_sections = len(section_sizes)
     total_chars = len(plain_lyrics)
-    expected = _compute_expected_char_counts(section_sizes, total_chars)
 
     sentences = []
     remaining = plain_lyrics
@@ -545,13 +544,22 @@ def _smart_split_sentences(
             sentences.append("")
             continue
 
-        # Last section gets everything left
-        if i == num_sections - 1:
+        # Remaining sections to fill
+        remaining_sections = num_sections - i
+        if remaining_sections == 1:
+            # Last section gets everything left
             sentences.append(remaining)
             break
 
-        exp = expected[i]
-        tolerance = math.ceil(exp * 0.3)
+        # Re-compute expected for this section based on remaining chars
+        # and remaining section sizes (keeps proportions balanced)
+        remaining_sizes = section_sizes[i:]
+        remaining_total = sum(remaining_sizes)
+        exp = round(remaining_sizes[0] * len(remaining) / remaining_total)
+        # Clamp: must leave at least 1 char per remaining section
+        max_exp = len(remaining) - (remaining_sections - 1)
+        exp = max(1, min(exp, max_exp))
+        tolerance = math.ceil(exp * 0.15)
 
         # Try AI punctuation cut
         try:
