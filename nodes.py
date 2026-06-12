@@ -520,11 +520,6 @@ def _smart_split_sentences(
             parts = [sentences[idx]]
 
         if len(parts) > 1:
-            # Only take as many parts as needed to reach target_count
-            needed = target_count - len(sentences) + 1  # +1 because we're replacing 1 sentence
-            if len(parts) > needed:
-                # Merge excess parts into the last one
-                parts = parts[:needed - 1] + ["".join(parts[needed - 1:])]
             sentences = sentences[:idx] + parts + sentences[idx + 1:]
             unsplitable = set()  # reset since indices changed
         else:
