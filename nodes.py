@@ -891,28 +891,30 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                 # Clean up internal tag before output
                 tok.pop("_sec_id", None)
 
-            new_segments: list[tuple[str, object]] = []
+            new_segments: list[tuple[str, object, int]] = []
             seg_id_counter = 0
             marker_idx = 0
             for orig_seg_type, _orig_seg_data in segments:
                 if orig_seg_type == "sp":
-                    new_segments.append(("sp", sp_markers[marker_idx][1]))
+                    new_segments.append(("sp", sp_markers[marker_idx][1], 0))
                     marker_idx += 1
                 else:
-                    new_segments.append(("section", section_groups.get(seg_id_counter, [])))
+                    orig_count = len(_orig_seg_data)
+                    new_segments.append(("section", section_groups.get(seg_id_counter, []), orig_count))
                     seg_id_counter += 1
         else:
-            new_segments: list[tuple[str, object]] = []
+            new_segments: list[tuple[str, object, int]] = []
             for seg_type, seg_data in segments:
                 if seg_type == "sp":
-                    new_segments.append(("sp", seg_data))
+                    new_segments.append(("sp", seg_data, 0))
                 else:
+                    orig_token_count = len(seg_data)
                     sentence = sentences[global_sec_idx] if global_sec_idx < len(sentences) else ""
                     global_sec_idx += 1
                     processed = _process_section(
                         seg_data, sentence, force_tone4_high_pitch, high_pitch_threshold,
                     )
-                    new_segments.append(("section", processed))
+                    new_segments.append(("section", processed, orig_token_count))
 
         # Reconstruct track: emit tokens, removing empties, merging SPs.
         # Empty tokens' duration is either:
@@ -929,7 +931,7 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
         pending_sp: dict | None = None
         pending_empty_dur: float = 0.0
 
-        for seg_type, seg_data in new_segments:
+        for seg_type, seg_data, orig_token_count in new_segments:
             if seg_type == "sp":
                 sp = dict(seg_data)
                 if pending_sp is not None:
@@ -943,6 +945,13 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
             else:
                 filled = [t for t in seg_data if t["text"]]
                 empty_tokens = [t for t in seg_data if not t["text"]]
+                new_count = len(filled)
+
+                # When section token count changed (expanded or collapsed),
+                # scale the preceding SP duration proportionally to preserve
+                # relative rhythm. Words faster → pauses shorter too.
+                if pending_sp is not None and orig_token_count > 0 and new_count != orig_token_count:
+                    pending_sp["duration"] *= orig_token_count / new_count
 
                 if filled and empty_tokens:
                     # Redistribute empty duration evenly to filled tokens.
