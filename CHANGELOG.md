@@ -2,6 +2,17 @@
 
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
+## [2026-06-12] v1.5.0
+
+### Added
+
+- **固定停顿模式开关**（`fixed_pause` 参数，默认开启 Fixed）
+  - **Fixed（默认）**：SP 时长保持不变，现有行为
+  - **Flexible（关闭时）**：当检测到 token 拥挤或 SP 漫长时，自动将 SP 时间按节奏比例匀给句内 token
+  - 触发条件（任一满足即可）：SP 时长 ≥ 2 倍 token 平均时长，或 token 平均时长 < 0.30s
+  - 匀出后 SP 降至与一个普通 token 等长，释放的时间按现有 duration 比例分配给所有 filled token
+  - 每个 section 独立判断，总 group 时长严格守恒
+
 ## [2026-06-12] v1.4.0
 
 ### Changed

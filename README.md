@@ -30,6 +30,9 @@
 - **长音自动展开**：MIDI 中连续重复字（如 `天 天` 表示同一字两个不同音高）会自动将用户输入的字按相同次数展开
 - **高音强制第四声**（可选）：当 `force_tone4` 开启时，高音区（默认 ≥ G5）的中文拼音强制转为第四声
 - **最小 duration 保障**：所有非 SP token 的 duration 不低于 0.30s，从同 section 最长 token 借时间
+- **固定/灵活停顿模式**（`fixed_pause` 开关，默认固定）：
+  - 固定模式：SP 时长保持原样
+  - 灵活模式：当 SP 时长 ≥ 2 倍 token 平均时长或 token 平均时长 < 0.30s 时，自动将 SP 时间按节奏比例匀给句内 token，总时长守恒
 
 ---
 
@@ -80,6 +83,7 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 | `new_lyrics` | STRING, multiline | 新歌词文本 |
 | `force_tone4` | BOOLEAN | 高音强制第四声（默认 OFF） |
 | `high_pitch_threshold` | INT | 高音阈值 0-127（默认 79 = G5） |
+| `fixed_pause` | BOOLEAN | 固定停顿模式（默认 Fixed=ON，Flexible=OFF 时 SP 时间可匀给 token） |
 
 **输出：**
 
@@ -104,6 +108,7 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 6. 为每个替换的字自动生成音素（中文 → `zh_` 拼音，英文 → `en_` 音素）
 7. 空 token 的 duration 重分配给同 section 的已填 token
 8. 所有非 SP token 的 duration 不低于 0.30s
+9. 灵活停顿模式下（`fixed_pause=Flexible`）：当 SP ≥ 2 倍 token 平均时长或 token 平均时长 < 0.30s 时，SP 降至 token 平均时长，释放时间按比例分给 token（总时长守恒）
 
 **分类：** `MIDI-Edit`
 
