@@ -774,3 +774,159 @@ class TestCTTransformerPunc:
         # Unknown token should map to unk_id
         assert ids[2] == conv.unk_id
 
+
+# ===================================================================
+# Flexible pause mode tests
+# ===================================================================
+
+
+class TestFlexiblePause:
+    """Tests for fixed_pause=False (flexible pause) mode."""
+
+    def test_fixed_pause_default_unchanged(self):
+        """With fixed_pause=True (default), SP duration should not change."""
+        orig = json.dumps([_make_track(
+            "<SP> A B <SP>",
+            "<SP> en_a en_b <SP>",
+            "2.0 0.3 0.3 2.0",
+            "0 60 62 0",
+            "1 2 2 1",
+        )])
+        result = json.loads(replace_lyrics(orig, "XY", fixed_pause=True))
+        durations = [float(x) for x in result[0]["duration"].split(" ")]
+        text = result[0]["text"].split(" ")
+        # SP durations should remain unchanged
+        assert durations[0] == pytest.approx(2.0)
+        assert durations[-1] == pytest.approx(2.0)
+
+    def test_flexible_pause_redistributes_long_sp(self):
+        """When SP >= 2x avg token dur, flexible mode should redistribute."""
+        # SP=2.0, tokens=0.3+0.3=0.6, avg=0.3, sp_ratio=2.0/0.3=6.67 > 2
+        orig = json.dumps([_make_track(
+            "<SP> A B <SP>",
+            "<SP> en_a en_b <SP>",
+            "2.0 0.3 0.3 2.0",
+            "0 60 62 0",
+            "1 2 2 1",
+        )])
+        result = json.loads(replace_lyrics(orig, "XY", fixed_pause=False))
+        durations = [float(x) for x in result[0]["duration"].split(" ")]
+        text = result[0]["text"].split(" ")
+        # Total must be preserved
+        assert sum(durations) == pytest.approx(2.0 + 0.3 + 0.3 + 2.0)
+        # First SP should be reduced
+        assert durations[0] < 2.0
+        # Tokens should be longer than original
+        tok_durs = [d for t, d in zip(text, durations) if t != "<SP>"]
+        assert all(d > 0.3 for d in tok_durs)
+
+    def test_flexible_pause_triggered_by_short_tokens(self):
+        """When avg token < 0.30s, flexible mode should trigger regardless of SP ratio."""
+        # SP=0.4, tokens=0.15+0.15=0.3, avg=0.15 < 0.30
+        # sp_ratio=0.4/0.15=2.67 > 2 actually, but the avg_tok < 0.30 should also trigger
+        orig = json.dumps([_make_track(
+            "<SP> A B C D E F G <SP>",
+            "<SP> en_a en_b en_c en_d en_e en_f en_g <SP>",
+            "0.5 0.20 0.20 0.20 0.20 0.20 0.20 0.20 0.50",
+            "0 52 53 46 53 53 54 53 0",
+            "1 2 3 2 2 2 2 2 1",
+        )])
+        result = json.loads(replace_lyrics(orig, "ABCDEFG", fixed_pause=False))
+        durations = [float(x) for x in result[0]["duration"].split(" ")]
+        text = result[0]["text"].split(" ")
+        tok_durs = [d for t, d in zip(text, durations) if t != "<SP>"]
+        # Tokens should be boosted above original 0.20
+        assert all(d > 0.20 for d in tok_durs)
+        # Total preserved
+        orig_total = 0.5 + 7 * 0.20 + 0.5
+        assert sum(durations) == pytest.approx(orig_total)
+
+    def test_flexible_pause_no_trigger_when_balanced(self):
+        """When SP ≈ avg token duration, no redistribution should happen."""
+        # SP=0.5, tokens=0.5+0.5=1.0, avg=0.5, sp_ratio=1.0 < 2, avg>=0.30
+        orig = json.dumps([_make_track(
+            "<SP> A B <SP>",
+            "<SP> en_a en_b <SP>",
+            "0.5 0.5 0.5 0.5",
+            "0 60 62 0",
+            "1 2 2 1",
+        )])
+        result = json.loads(replace_lyrics(orig, "XY", fixed_pause=False))
+        durations = [float(x) for x in result[0]["duration"].split(" ")]
+        # Should remain unchanged — no trigger condition met
+        assert durations == [pytest.approx(0.5)] * 4
+
+    def test_flexible_pause_proportional_distribution(self):
+        """Redistributed time should be proportional to existing durations.
+        
+        Note: min-duration enforcement (0.30s) runs BEFORE flexible pause,
+        so tokens below 0.30s get boosted first. We use tokens above 0.30s
+        to test pure proportional distribution.
+        """
+        # SP=3.0, tokens=0.6+1.2=1.8, avg=0.9, sp_ratio=3.0/0.9=3.33 > 2
+        # freed = 3.0 - 0.9 = 2.1
+        # Token A gets: 0.6 + 2.1*(0.6/1.8) = 0.6 + 0.7 = 1.3
+        # Token B gets: 1.2 + 2.1*(1.2/1.8) = 1.2 + 1.4 = 2.6
+        # Ratio should stay: B/A = 2:1
+        orig = json.dumps([_make_track(
+            "<SP> A B <SP>",
+            "<SP> en_a en_b <SP>",
+            "3.0 0.6 1.2 2.0",
+            "0 60 62 0",
+            "1 2 2 1",
+        )])
+        result = json.loads(replace_lyrics(orig, "XY", fixed_pause=False))
+        durations = [float(x) for x in result[0]["duration"].split(" ")]
+        text = result[0]["text"].split(" ")
+        tok_durs = [d for t, d in zip(text, durations) if t != "<SP>"]
+        # B should still be ~2x A
+        assert tok_durs[1] / tok_durs[0] == pytest.approx(2.0, abs=0.05)
+        # Total preserved
+        assert sum(durations) == pytest.approx(3.0 + 0.6 + 1.2 + 2.0)
+
+    def test_flexible_pause_total_group_preserved(self):
+        """Group (section + trailing SP) total duration must be preserved."""
+        # Section tokens + trailing SP total = 0.3+0.3+2.0 = 2.6
+        orig = json.dumps([_make_track(
+            "<SP> A B <SP> C D <SP>",
+            "<SP> en_a en_b <SP> en_c en_d <SP>",
+            "0.5 0.3 0.3 2.0 0.4 0.4 1.5",
+            "0 60 62 0 64 65 0",
+            "1 2 2 1 2 2 1",
+        )])
+        result = json.loads(replace_lyrics(orig, "XY\nCD", fixed_pause=False))
+        durations = [float(x) for x in result[0]["duration"].split(" ")]
+        # Group 1: SP + A + B + SP = 0.5+0.3+0.3+2.0 = 3.1
+        # Group 2: SP + C + D + SP — but first SP of group2 is actually emitted
+        #   as the trailing SP of group 1
+        # Total should be preserved
+        orig_total = 0.5 + 0.3 + 0.3 + 2.0 + 0.4 + 0.4 + 1.5
+        assert sum(durations) == pytest.approx(orig_total)
+
+    def test_flexible_pause_multi_section(self):
+        """Each section's SP should be independently evaluated."""
+        # Section 1: SP=2.0, tokens avg=0.3 → triggers
+        # Section 2: SP=0.5, tokens avg=0.5 → no trigger
+        orig = json.dumps([_make_track(
+            "<SP> A B <SP> C D <SP>",
+            "<SP> en_a en_b <SP> en_c en_d <SP>",
+            "2.0 0.3 0.3 0.5 0.5 0.5 0.5",
+            "0 60 62 0 64 65 0",
+            "1 2 2 1 2 2 1",
+        )])
+        result = json.loads(replace_lyrics(orig, "XY\nCD", fixed_pause=False))
+        durations = [float(x) for x in result[0]["duration"].split(" ")]
+        text = result[0]["text"].split(" ")
+        non_sp = [(t, d) for t, d in zip(text, durations) if t != "<SP>"]
+        sp_durs = [d for t, d in zip(text, durations) if t == "<SP>"]
+        # First SP should be reduced (was 2.0)
+        assert sp_durs[0] < 2.0
+        # Section 1 tokens should be longer than original 0.3
+        assert non_sp[0][1] > 0.3
+        assert non_sp[1][1] > 0.3
+        # Second SP should remain 0.5 (no trigger: ratio=1.0 < 2, avg=0.5 >= 0.30)
+        assert sp_durs[1] == pytest.approx(0.5)
+        # Total preserved
+        orig_total = 2.0 + 0.3 + 0.3 + 0.5 + 0.5 + 0.5 + 0.5
+        assert sum(durations) == pytest.approx(orig_total)
+

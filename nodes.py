@@ -777,7 +777,8 @@ def _process_section(
 
 def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     force_tone4_high_pitch: bool = False,
-                     high_pitch_threshold: int = 79) -> str:
+                     high_pitch_threshold: int = 79,
+                     fixed_pause: bool = True) -> str:
     """Replace lyrics in MIDI JSON with smart 3-mode algorithm.
 
     Splits user lyrics by newlines/punctuation into sentences, each mapped to
@@ -977,6 +978,26 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                                 filled[i]["duration"] = MIN_DUR
                                 filled[longest_idx]["duration"] -= deficit
 
+                # --- Non-fixed pause mode: redistribute SP time to tokens ---
+                if (not fixed_pause and filled and pending_sp is not None):
+                    sec_dur = sum(t["duration"] for t in filled)
+                    n_tok = len(filled)
+                    avg_tok = sec_dur / n_tok if n_tok > 0 else 0
+                    sp_dur = pending_sp["duration"]
+                    sp_ratio = sp_dur / avg_tok if avg_tok > 0 else 0
+                    # Trigger if SP is >= 2x avg token duration
+                    #   OR any token is below minimum duration
+                    if sp_ratio >= 2 or avg_tok < 0.30:
+                        # Target SP = one average token's duration
+                        target_sp = avg_tok
+                        if target_sp < sp_dur:
+                            freed = sp_dur - target_sp
+                            # Distribute freed time proportionally by duration
+                            for t in filled:
+                                if sec_dur > 0:
+                                    t["duration"] += freed * (t["duration"] / sec_dur)
+                            pending_sp["duration"] = target_sp
+
                 # Emit pending SP
                 if filled and pending_sp is not None:
                     all_text.append(pending_sp["text"])
@@ -1105,6 +1126,7 @@ class MIDIEditLyrics:
                 "new_lyrics": ("STRING", {"multiline": True, "dynamicPrompts": False}),
                 "force_tone4": ("BOOLEAN", {"default": False, "label_on": "ON", "label_off": "OFF"}),
                  "high_pitch_threshold": ("INT", {"default": 79, "min": 0, "max": 127, "step": 1}),
+                "fixed_pause": ("BOOLEAN", {"default": True, "label_on": "Fixed", "label_off": "Flexible"}),
             }
         }
 
@@ -1121,14 +1143,20 @@ class MIDIEditLyrics:
         "more positions. Consecutive repeated characters in original are grouped "
         "(e.g. '向向' → slot with count 2) and expanded accordingly. "
         "Chinese chars → zh_ pinyin; English → en_ phonemes. "
-        "Force Tone 4: forces Chinese phonemes at pitch >= threshold to tone 4."
+        "Force Tone 4: forces Chinese phonemes at pitch >= threshold to tone 4. "
+        "Fixed Pause (default ON): keep SP durations unchanged. "
+        "Flexible Pause: when tokens are crowded or SP is overly long, "
+        "redistribute SP time proportionally to tokens."
     )
 
-    def edit_lyrics(self, midi_json: str, new_lyrics: str, force_tone4: bool, high_pitch_threshold: int) -> tuple:
+    def edit_lyrics(self, midi_json: str, new_lyrics: str,
+                    force_tone4: bool, high_pitch_threshold: int,
+                    fixed_pause: bool) -> tuple:
         try:
             return (replace_lyrics(midi_json, new_lyrics,
                                     force_tone4_high_pitch=force_tone4,
-                                    high_pitch_threshold=high_pitch_threshold),)
+                                    high_pitch_threshold=high_pitch_threshold,
+                                    fixed_pause=fixed_pause),)
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid MIDI JSON input: {e}") from e
         except ValueError as e:
