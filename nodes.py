@@ -930,10 +930,18 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
 
         pending_sp: dict | None = None
         pending_empty_dur: float = 0.0
+        # Scale factor from the most recently processed section.
+        # Applied to the SP that FOLLOWS the section (trailing SP).
+        # Group = section tokens + trailing SP; all durations scaled together.
+        pending_trailing_scale: float | None = None
 
         for seg_type, seg_data, orig_token_count in new_segments:
             if seg_type == "sp":
                 sp = dict(seg_data)
+                # Apply trailing scale from previous section to this SP
+                if pending_trailing_scale is not None:
+                    sp["duration"] *= pending_trailing_scale
+                    pending_trailing_scale = None
                 if pending_sp is not None:
                     # Consecutive SPs (or SP after an empty section) → merge
                     pending_sp["duration"] += pending_empty_dur + sp["duration"]
@@ -947,30 +955,20 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                 empty_tokens = [t for t in seg_data if not t["text"]]
                 new_count = len(filled)
 
-                # When section token count changed (expanded or collapsed),
-                # scale the preceding SP duration proportionally to preserve
-                # relative rhythm. Words faster → pauses shorter too.
-                if pending_sp is not None and orig_token_count > 0 and new_count != orig_token_count:
-                    pending_sp["duration"] *= orig_token_count / new_count
-
                 if filled and empty_tokens:
                     # Redistribute empty duration evenly to filled tokens.
-                    # base_per = total_empty / n_filled for each, remainder to last.
                     total_empty = sum(t["duration"] for t in empty_tokens)
                     n = len(filled)
                     base_per = total_empty / n
                     for i in range(n - 1):
                         filled[i]["duration"] += base_per
                     filled[-1]["duration"] += total_empty - base_per * (n - 1)
-                    empty_dur = 0.0  # already redistributed
+                    empty_dur = 0.0
                 else:
                     empty_dur = sum(t["duration"] for t in seg_data if not t["text"])
 
                 # Enforce minimum duration: boost tokens below 0.30s by borrowing
                 # from the longest token in the same section.
-                # Applies to ALL sections with filled tokens (not just when empty
-                # tokens were redistributed), since Token/Expand mode can also
-                # produce very short durations from splitting.
                 MIN_DUR = 0.30
                 if filled:
                     needs_boost = [
@@ -988,9 +986,18 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                                 filled[i]["duration"] = MIN_DUR
                                 filled[longest_idx]["duration"] -= deficit
 
-                # Emit pending SP ONLY if we have filled tokens to follow.
-                # If the section is completely empty, the SP stays pending and
-                # will merge with the next SP or be emitted at the end.
+                # Calculate scale factor: group = section + trailing SP (1 unit).
+                # When token count changes, scale all group durations proportionally.
+                scale = None
+                if orig_token_count > 0 and new_count != orig_token_count:
+                    orig_units = orig_token_count + 1
+                    new_units = new_count + 1
+                    scale = orig_units / new_units
+                    pending_trailing_scale = scale
+
+                # Emit pending SP (leading SP for this section, NOT scaled by
+                # this section's scale — it was already scaled by the previous
+                # section's trailing scale when the SP segment was processed).
                 if filled and pending_sp is not None:
                     all_text.append(pending_sp["text"])
                     all_phoneme.append(pending_sp["phoneme"])
@@ -999,14 +1006,16 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     all_type.append(pending_sp["note_type"])
                     pending_sp = None
                 elif pending_sp is None and filled:
-                    pass  # No preceding SP — filled tokens at the start
+                    pass
 
                 # Completely empty section → absorb into SP
                 if not filled:
                     pending_empty_dur += empty_dur
 
-                # Emit filled tokens (duration already adjusted if redistributed)
+                # Emit filled tokens with scale applied
                 for token in filled:
+                    if scale is not None:
+                        token["duration"] *= scale
                     all_text.append(token["text"])
                     all_phoneme.append(token["phoneme"])
                     all_duration.append(token["duration"])
@@ -1016,6 +1025,8 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
         # Emit trailing SP (or new SP for trailing empty duration)
         if pending_sp is not None:
             pending_sp["duration"] += pending_empty_dur
+            if pending_trailing_scale is not None:
+                pending_sp["duration"] *= pending_trailing_scale
             all_text.append(pending_sp["text"])
             all_phoneme.append(pending_sp["phoneme"])
             all_duration.append(pending_sp["duration"])
