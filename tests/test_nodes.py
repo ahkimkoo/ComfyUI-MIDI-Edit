@@ -43,7 +43,6 @@ from nodes import (
     _smart_split_sentences,
     _split_at_punctuation,
     _first_punct_cut,
-    _get_section_slot_counts,
     _compute_expected_char_counts,
     _code_mix_split_words,
     _split_to_mini_sentence,
@@ -604,18 +603,7 @@ class TestSmartSplitSentences:
         import nodes
         nodes._restore_punctuation = original
 
-    # --- Unit tests for new helpers ---
-
-    def test_section_slot_counts_no_repeats(self):
-        """No repeated chars → slot count == token count."""
-        midi = self._make_midi_data([["A", "B", "C"], ["D", "E"]])
-        assert _get_section_slot_counts(midi) == [3, 2]
-
-    def test_section_slot_counts_with_repeats(self):
-        """Repeated chars collapse to 1 slot each."""
-        midi = self._make_midi_data([["A", "A", "B"], ["C", "C", "C"]])
-        # A×2→1 slot, B→1 slot = 2 slots; C×3→1 slot = 1 slot
-        assert _get_section_slot_counts(midi) == [2, 1]
+    # --- Unit tests for helpers ---
 
     def test_compute_expected_simple(self):
         """Proportional allocation with last-section remainder."""

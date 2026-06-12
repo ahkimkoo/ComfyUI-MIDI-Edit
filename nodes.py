@@ -463,49 +463,22 @@ def _split_at_punctuation(text: str) -> list[str]:
     return [clean] if clean else [text]
 
 
-def _get_section_slot_counts(midi_data: list) -> list[int]:
-    """Get the collapsed slot count (unique chars, repeated chars count as 1) per section.
-
-    SP sections are excluded. Repeated consecutive identical tokens collapse to 1 slot.
-    """
-    counts = []
-    for track in midi_data:
-        if "text" not in track:
-            continue
-        tokens = track["text"].split(" ")
-        i = 0
-        while i < len(tokens):
-            if tokens[i] != "<SP>":
-                # Count unique consecutive chars in this section
-                slot_count = 0
-                prev = None
-                while i < len(tokens) and tokens[i] != "<SP>":
-                    if tokens[i] != prev:
-                        slot_count += 1
-                        prev = tokens[i]
-                    i += 1
-                counts.append(slot_count)
-            else:
-                i += 1
-    return counts
-
-
 def _compute_expected_char_counts(
-    slot_counts: list[int], total_new_chars: int
+    section_sizes: list[int], total_new_chars: int
 ) -> list[int]:
-    """Compute expected char count per section, proportional to original slot counts.
+    """Compute expected char count per section, proportional to original token counts.
 
     Uses round-half-up for each section except the last, which gets the remainder
     to ensure the total equals total_new_chars exactly.
     """
-    total_slots = sum(slot_counts)
-    if total_slots == 0:
-        return [0] * len(slot_counts)
+    total_tokens = sum(section_sizes)
+    if total_tokens == 0:
+        return [0] * len(section_sizes)
 
     expected = []
-    for i, sc in enumerate(slot_counts):
-        if i < len(slot_counts) - 1:
-            expected.append(round(sc * total_new_chars / total_slots))
+    for i, sc in enumerate(section_sizes):
+        if i < len(section_sizes) - 1:
+            expected.append(round(sc * total_new_chars / total_tokens))
         else:
             # Last section gets the remainder
             expected.append(total_new_chars - sum(expected))
@@ -541,7 +514,7 @@ def _smart_split_sentences(
     Algorithm (triggered when initial punctuation/newline split yields a
     different sentence count than original MIDI sections):
 
-    1. Compute original section slot counts (collapsed, repeated chars = 1)
+    1. Compute original section token counts (each token counts as 1)
     2. Compute expected char count per section (proportional, rounded)
     3. For each section, from left to right:
        a. Run CT-Transformer on remaining lyrics to add punctuation
@@ -559,10 +532,10 @@ def _smart_split_sentences(
     Returns:
         List of sentence strings, one per original section.
     """
-    slot_counts = _get_section_slot_counts(midi_data)
-    num_sections = len(slot_counts)
+    section_sizes = _get_section_sizes(midi_data)
+    num_sections = len(section_sizes)
     total_chars = len(plain_lyrics)
-    expected = _compute_expected_char_counts(slot_counts, total_chars)
+    expected = _compute_expected_char_counts(section_sizes, total_chars)
 
     sentences = []
     remaining = plain_lyrics
