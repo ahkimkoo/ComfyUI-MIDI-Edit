@@ -2,6 +2,17 @@
 
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
+## [2026-06-12] v1.4.0
+
+### Changed
+
+- **智能拆句算法重写为比例分配模式**：当用户歌词句子数 ≠ 原曲 section 数时触发
+  - 按原曲每个 section 的 token 数（每个 token 算 1 个字，重复字不合并）占总 token 数的比例，计算每个 section 的预期字数（四舍五入 + 最后 section 兜底）
+  - 从第一个 section 开始，剩余歌词送 CT-Transformer 加标点，取第一个标点位置切分
+  - 切点处字数与预期偏差 ≤ 30%（向上取整）→ 使用 AI 切点；否则按预期字数硬切
+  - 切完后去掉所有标点，剩余歌词继续处理下一个 section；最后 section 收所有剩余
+  - 句子数 = 原 section 数时不触发此逻辑，走原来的 collapse/expand 匹配
+
 ## [2026-06-12] v1.3.0
 
 ### Changed
