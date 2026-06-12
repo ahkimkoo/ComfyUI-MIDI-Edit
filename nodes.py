@@ -412,51 +412,53 @@ _PUNC_SPLIT_RE = re.compile(r'[，。？！；、]')
 
 
 def _restore_punctuation(text: str) -> str:
-    """Run CT-Transformer to add punctuation to a sentence.
-
-    Strips trailing sentence-ending punctuation before returning
-    (used for splitting, not for display).
-    """
+    """Run CT-Transformer to add punctuation to a sentence."""
     model = _get_ct_transformer()
-    result = model.add_punctuation(text)
-    # Remove trailing punctuation for splitting purposes
-    result = result.rstrip("。.？?！！！")
-    return result
+    return model.add_punctuation(text)
+
+
+# Punctuation priority for splitting: period > question > exclamation > comma > enumeration
+_PERIOD_RE = re.compile(r'[。.？?！!]')
+_COMMA_RE = re.compile(r'[，,、；;：:]')
 
 
 def _split_at_punctuation(text: str) -> list[str]:
-    """Split text at ALL punctuation marks, removing punctuation from output.
+    """Split punctuated text into exactly 2 clean pieces at the best cut point.
 
-    Each returned piece is a clean text string with no punctuation.
-    Returns a list of non-empty strings, or [original_text] if no split possible.
+    Cut point selection (priority order):
+    1. Period/question/exclamation mark closest to the middle
+    2. Comma/enumeration mark closest to the middle
+
+    Punctuation marks are stripped from the output.
+    Returns [left, right] if a cut is found, otherwise [original_text_no_punc].
     """
     text = text.strip()
     if len(text) <= 1:
         return [text]
 
-    # Find all punctuation positions
-    positions = [m.start() for m in _PUNC_SPLIT_RE.finditer(text)]
-    if not positions:
-        return [text]
+    mid = len(text) / 2.0
 
-    # Split at all punctuation marks, extracting clean text between them
-    parts = []
-    prev = 0
-    for pos in positions:
-        segment = text[prev:pos].strip()
-        if segment:
-            parts.append(segment)
-        prev = pos + 1
-    # Don't forget the last segment after the final punctuation
-    last = text[prev:].strip()
-    if last:
-        parts.append(last)
+    # Try period-family first, then comma-family
+    for punc_re in (_PERIOD_RE, _COMMA_RE):
+        best_pos = None
+        best_dist = float('inf')
+        for m in punc_re.finditer(text):
+            dist = abs(m.start() - mid)
+            if dist < best_dist:
+                best_dist = dist
+                best_pos = m.start()
+        if best_pos is not None:
+            left = text[:best_pos].strip()
+            right = text[best_pos + 1:].strip()
+            if left and right:
+                # Strip ALL remaining punctuation from both halves
+                left = re.sub(r'[，。！？；：、,.!?;:]', '', left).strip()
+                right = re.sub(r'[，。！？；：、,.!?;:]', '', right).strip()
+                if left and right:
+                    return [left, right]
 
-    # Return at least 2 parts if possible; if only 1 non-empty part, can't split
-    if len(parts) >= 2:
-        return parts
-    # All punctuation was at the edges — treat as unsplitable
-    clean = re.sub(_PUNC_SPLIT_RE.pattern, '', text).strip()
+    # No usable punctuation found — return cleaned text as single piece
+    clean = re.sub(r'[，。！？；：、,.!?;:]', '', text).strip()
     return [clean] if clean else [text]
 
 
