@@ -466,7 +466,7 @@ class TestExtractLyrics:
         )])
         result = extract_lyrics(midi, merge_repeated=True)
         assert "AA" not in result
-        assert "A" in result
+         assert "A" in result
 
 
 # ===================================================================
@@ -731,3 +731,4 @@ class TestCTTransformerPunc:
         assert isinstance(ids[1], int)
         # Unknown token should map to unk_id
         assert ids[2] == conv.unk_id
+
