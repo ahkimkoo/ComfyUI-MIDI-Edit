@@ -284,8 +284,9 @@ def _process_section(
     """Apply the 3-mode algorithm to a single section.
 
     Modes:
-    - Collapse (N <= S): map chars to slots, expand by repeat count.
-    - Token (S < N <= M): 1:1 token mapping.
+    - Collapse (N <= S): map chars to slots (right-aligned), expand by repeat count.
+    - Collapse+Distribute (S < N <= M): assign chars to collapsed slots;
+      multi-count slots can accept multiple chars (one per token in the slot).
     - Expand (N > M): split longest-duration tokens until count matches, then 1:1.
     """
     if not tokens:
@@ -305,28 +306,55 @@ def _process_section(
     S = len(slots)
 
     if N <= S:
-        # ===== Collapse mode =====
+        # ===== Collapse mode (right-aligned) =====
+        # Skip the first (S-N) slots so that the last char maps to the
+        # last slot, preserving sustained endings (e.g. long final notes).
+        skip_count = S - N
         for slot_idx, (_orig_char, _count, token_indices) in enumerate(slots):
-            if slot_idx < N:
-                new_char = sentence[slot_idx]
-                for ti in token_indices:
-                    _apply_char(tokens, ti, new_char,
-                                force_tone4_high_pitch, high_pitch_threshold)
-            else:
-                # Remaining slots: empty text/phoneme (don't keep original lyrics),
-                # but keep token count to preserve timing and section alignment.
+            if slot_idx < skip_count:
+                # Skip: empty these slots
                 for ti in token_indices:
                     tokens[ti]["text"] = ""
                     tokens[ti]["phoneme"] = ""
+            else:
+                char_idx = slot_idx - skip_count
+                new_char = sentence[char_idx]
+                for ti in token_indices:
+                    _apply_char(tokens, ti, new_char,
+                                force_tone4_high_pitch, high_pitch_threshold)
         return tokens
 
-    # ===== Token / Expand mode =====
-    # Split longest tokens if needed (only when N > M)
+    if N <= M:
+        # ===== Collapse + Distribute mode (S < N <= M) =====
+        # Assign chars to collapsed slots. Multi-count slots distribute
+        # up to `count` different chars (one per token in the slot).
+        remaining = list(sentence)
+        for _orig_char, count, token_indices in slots:
+            if not remaining:
+                for ti in token_indices:
+                    tokens[ti]["text"] = ""
+                    tokens[ti]["phoneme"] = ""
+            elif count == 1:
+                char = remaining.pop(0)
+                _apply_char(tokens, token_indices[0], char,
+                            force_tone4_high_pitch, high_pitch_threshold)
+            else:
+                n_assign = min(count, len(remaining))
+                for j in range(n_assign):
+                    char = remaining.pop(0)
+                    _apply_char(tokens, token_indices[j], char,
+                                force_tone4_high_pitch, high_pitch_threshold)
+                for j in range(n_assign, count):
+                    tokens[token_indices[j]]["text"] = ""
+                    tokens[token_indices[j]]["phoneme"] = ""
+        return tokens
+
+    # ===== Expand mode (N > M) =====
+    # Split longest tokens until count matches, then 1:1 mapping.
     while len(tokens) < N:
         longest_idx = max(range(len(tokens)), key=lambda i: tokens[i]["duration"])
         _split_token(tokens, longest_idx)
 
-    # 1:1 mapping
     for i in range(min(N, len(tokens))):
         _apply_char(tokens, i, sentence[i],
                     force_tone4_high_pitch, high_pitch_threshold)
@@ -351,8 +379,9 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
     a MIDI section (SP-delimited).  Three modes per section:
 
     - **Collapse** (N <= S): chars map to slots (deduplicated consecutive
-      chars), expanded by original repeat count.
-    - **Token** (S < N <= M): 1:1 token mapping.
+      chars), right-aligned so the last char maps to the last slot.
+    - **Collapse+Distribute** (S < N <= M): chars assigned to collapsed slots;
+      multi-count slots accept multiple chars (one per token in the slot).
     - **Expand** (N > M): longest-duration tokens are split (duration halved,
       pitch unchanged) until token count matches sentence length, then 1:1.
 
@@ -515,6 +544,28 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     empty_dur = 0.0  # already redistributed
                 else:
                     empty_dur = sum(t["duration"] for t in seg_data if not t["text"])
+
+                # Enforce minimum duration: boost tokens below 0.30s by borrowing
+                # from the longest token in the same section.
+                # Applies to ALL sections with filled tokens (not just when empty
+                # tokens were redistributed), since Token/Expand mode can also
+                # produce very short durations from splitting.
+                MIN_DUR = 0.30
+                if filled:
+                    needs_boost = [
+                        (i, MIN_DUR - t["duration"])
+                        for i, t in enumerate(filled)
+                        if t["duration"] < MIN_DUR
+                    ]
+                    if needs_boost:
+                        longest_idx = max(range(len(filled)),
+                                          key=lambda i: filled[i]["duration"])
+                        for i, deficit in needs_boost:
+                            if (longest_idx != i
+                                    and filled[longest_idx]["duration"]
+                                    > deficit + MIN_DUR):
+                                filled[i]["duration"] = MIN_DUR
+                                filled[longest_idx]["duration"] -= deficit
 
                 # Emit pending SP ONLY if we have filled tokens to follow.
                 # If the section is completely empty, the SP stays pending and
