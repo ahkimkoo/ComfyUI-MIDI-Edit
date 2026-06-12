@@ -552,9 +552,9 @@ class TestSplitAtPunctuation:
         assert result == [""]
 
     def test_trailing_punctuation_stripped(self):
-        # _split_at_punctuation doesn't strip trailing — it finds first split point
+        # Trailing punctuation with no text after it: punctuation is removed
         result = _split_at_punctuation("你好。")
-        assert result == ["你好。"]  # no second part after period
+        assert result == ["你好"]
 
 
 # ===================================================================

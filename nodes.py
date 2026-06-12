@@ -425,33 +425,39 @@ def _restore_punctuation(text: str) -> str:
 
 
 def _split_at_punctuation(text: str) -> list[str]:
-    """Split text at the first punctuation mark found.
+    """Split text at ALL punctuation marks, removing punctuation from output.
 
-    Returns a list of 2 non-empty strings if split possible,
-    otherwise returns [text].
+    Each returned piece is a clean text string with no punctuation.
+    Returns a list of non-empty strings, or [original_text] if no split possible.
     """
     text = text.strip()
     if len(text) <= 1:
         return [text]
 
-    match = _PUNC_SPLIT_RE.search(text)
-    if match:
-        pos = match.start()
-        left = text[:pos].strip()
-        right = text[pos + 1:].strip()
-        if left and right:
-            return [left, right]
-        # Try to find another split point
-        next_match = _PUNC_SPLIT_RE.search(text, pos + 1)
-        if next_match:
-            pos2 = next_match.start()
-            left2 = text[:pos2].strip()
-            right2 = text[pos2 + 1:].strip()
-            if left2 and right2:
-                return [left2, right2]
-        # Only one non-empty side — can't split
+    # Find all punctuation positions
+    positions = [m.start() for m in _PUNC_SPLIT_RE.finditer(text)]
+    if not positions:
         return [text]
-    return [text]
+
+    # Split at all punctuation marks, extracting clean text between them
+    parts = []
+    prev = 0
+    for pos in positions:
+        segment = text[prev:pos].strip()
+        if segment:
+            parts.append(segment)
+        prev = pos + 1
+    # Don't forget the last segment after the final punctuation
+    last = text[prev:].strip()
+    if last:
+        parts.append(last)
+
+    # Return at least 2 parts if possible; if only 1 non-empty part, can't split
+    if len(parts) >= 2:
+        return parts
+    # All punctuation was at the edges — treat as unsplitable
+    clean = re.sub(_PUNC_SPLIT_RE.pattern, '', text).strip()
+    return [clean] if clean else [text]
 
 
 def _smart_split_sentences(
@@ -514,7 +520,11 @@ def _smart_split_sentences(
             parts = [sentences[idx]]
 
         if len(parts) > 1:
-            # Successfully split
+            # Only take as many parts as needed to reach target_count
+            needed = target_count - len(sentences) + 1  # +1 because we're replacing 1 sentence
+            if len(parts) > needed:
+                # Merge excess parts into the last one
+                parts = parts[:needed - 1] + ["".join(parts[needed - 1:])]
             sentences = sentences[:idx] + parts + sentences[idx + 1:]
             unsplitable = set()  # reset since indices changed
         else:
