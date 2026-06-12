@@ -24,9 +24,12 @@
 - **CT-Transformer 智能拆句**：当用户歌词按标点/换行切分后句子数不等于原曲 section 数时触发
   - 按原曲每个 section 的 token 数比例计算预期字数（四舍五入 + 最后兜底）
   - 从第一句开始，CT-Transformer 加标点后取第一个标点切分
-  - 如果切点处字数与预期相差不超过 ±30%（向上取整），使用 AI 切点；否则按预期字数硬切
+  - 如果切点处字数与预期相差不超过 ±15%（向上取整），使用 AI 切点；否则按预期字数硬切
   - 切完后去掉所有标点，剩余歌词继续处理下一个 section
   - 句子数与原曲 section 数一致时不触发此逻辑，走原来的 collapse/expand 匹配
+- **字数分配模式**（`split_mode` 选项）：
+  - `token`（默认）：按原曲每个 section 的 token 数比例分配字数
+  - `duration`：按原曲每个 section 的时长比例分配字数（时长长的句子分到更多字）
 - **长音自动展开**：MIDI 中连续重复字（如 `天 天` 表示同一字两个不同音高）会自动将用户输入的字按相同次数展开
 - **高音强制第四声**（可选）：当 `force_tone4` 开启时，高音区（默认 ≥ G5）的中文拼音强制转为第四声
 - **最小 duration 保障**：所有非 SP token 的 duration 不低于 0.30s，从同 section 最长 token 借时间
@@ -84,6 +87,7 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 | `force_tone4` | BOOLEAN | 高音强制第四声（默认 OFF） |
 | `high_pitch_threshold` | INT | 高音阈值 0-127（默认 79 = G5） |
 | `fixed_pause` | BOOLEAN | 固定停顿模式（默认 Fixed=ON，Flexible=OFF 时 SP 时间可匀给 token） |
+| `split_mode` | COMBO [`token`, `duration`] | 字数分配模式：token 按原曲 token 数比例，duration 按原曲时长比例（默认 token） |
 
 **输出：**
 
@@ -96,9 +100,9 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 1. 新歌词按换行和标点（，。！？；：等）切分为句子
 2. 每个句子映射到原曲的一个 MIDI section（`<SP>` 分隔的段落）
 3. 如果句子数 ≠ 原 section 数，使用 **比例分配 + AI 切分**算法：
-   - 按原曲每个 section 的 token 数比例计算预期字数
+   - 按原曲每个 section 的 token 数（或时长，取决于 `split_mode`）比例计算预期字数
    - 逐 section 处理：CT-Transformer 加标点，取第一个标点切分
-   - 切点字数在预期 ±30% 内 → 用 AI 切点；否则按预期硬切
+   - 切点字数在预期 ±15% 内 → 用 AI 切点；否则按预期硬切
    - 句子数 = 原 section 数时不触发，走下方的 collapse/expand 逻辑
 4. 每个 section 内使用 3 种模式匹配：
    - **Collapse**（新字数 ≤ 去重 slot 数）：右对齐映射到 slot，保护结尾长音

@@ -44,6 +44,7 @@ from nodes import (
     _split_at_punctuation,
     _first_punct_cut,
     _compute_expected_char_counts,
+    _get_section_durations,
     _code_mix_split_words,
     _split_to_mini_sentence,
     _TokenIDConverter,
@@ -929,4 +930,107 @@ class TestFlexiblePause:
         # Total preserved
         orig_total = 2.0 + 0.3 + 0.3 + 0.5 + 0.5 + 0.5 + 0.5
         assert sum(durations) == pytest.approx(orig_total)
+
+
+# ===================================================================
+# Duration-based split mode tests
+# ===================================================================
+
+
+class TestGetSectionDurations:
+    """Tests for _get_section_durations helper."""
+
+    def test_single_section(self):
+        midi = [{"text": "<SP> A B <SP>", "duration": "0.5 0.3 0.4 0.5"}]
+        durs = _get_section_durations(midi)
+        assert durs == [pytest.approx(0.7)]
+
+    def test_multiple_sections(self):
+        midi = [{"text": "<SP> A B <SP> C D E <SP>",
+                 "duration": "0.5 0.3 0.4 0.5 0.6 0.2 0.3 0.5"}]
+        durs = _get_section_durations(midi)
+        assert durs == [pytest.approx(0.7), pytest.approx(1.1)]
+
+    def test_multi_track(self):
+        midi = [
+            {"text": "<SP> A <SP>", "duration": "0.5 0.3 0.5"},
+            {"text": "<SP> B C <SP>", "duration": "0.5 0.2 0.4 0.5"},
+        ]
+        durs = _get_section_durations(midi)
+        assert durs == [pytest.approx(0.3), pytest.approx(0.6)]
+
+    def test_no_track_text(self):
+        midi = [{"other": "data"}]
+        durs = _get_section_durations(midi)
+        assert durs == []
+
+
+class TestDurationBasedSplit:
+    """Tests for split_mode='duration' in replace_lyrics."""
+
+    def test_duration_split_more_chars_for_longer_sections(self):
+        """Duration mode should give more chars to longer-timed sections."""
+        # Section 1: 2 tokens, dur=0.3+0.3=0.6
+        # Section 2: 3 tokens, dur=1.0+1.0+1.0=3.0
+        # Total dur = 3.6, section 2 is ~83% of total
+        # With 10 chars, duration mode: sec1≈2, sec2≈8
+        # Token mode: sec1=2/5*10=4, sec2=3/5*10=6
+        orig = json.dumps([_make_track(
+            "<SP> A B <SP> C D E <SP>",
+            "<SP> en_a en_b <SP> en_c en_d en_e <SP>",
+            "0.5 0.3 0.3 0.5 1.0 1.0 1.0 0.5",
+            "0 60 62 0 64 65 67 0",
+            "1 2 2 1 2 2 2 1",
+        )])
+        result_tok = json.loads(replace_lyrics(orig, "一二三四五六七八九十",
+                                                split_mode="token"))
+        result_dur = json.loads(replace_lyrics(orig, "一二三四五六七八九十",
+                                                split_mode="duration"))
+        tok_text = result_tok[0]["text"].split(" ")
+        dur_text = result_dur[0]["text"].split(" ")
+
+        # Count non-SP tokens in first section (between 1st and 2nd SP)
+        tok_sps = [i for i, t in enumerate(tok_text) if t == "<SP>"]
+        dur_sps = [i for i, t in enumerate(dur_text) if t == "<SP>"]
+
+        sec1_tok = [t for t in tok_text[tok_sps[0]+1:tok_sps[1]]
+                     if t and t != "<SP>"]
+        sec1_dur = [t for t in dur_text[dur_sps[0]+1:dur_sps[1]]
+                     if t and t != "<SP>"]
+
+        # Duration mode should allocate fewer chars to section 1
+        # (which has short duration) compared to token mode
+        assert len(sec1_dur) < len(sec1_tok)
+        assert len(sec1_dur) == 2  # 0.6/3.6 * 10 ≈ 2
+        assert len(sec1_tok) == 4  # 2/5 * 10 = 4
+
+    def test_duration_split_total_preserved(self):
+        """Total duration must be preserved with duration split mode."""
+        orig_dur = "0.5 0.3 0.3 0.5 1.0 1.0 1.0 0.5"
+        orig = json.dumps([_make_track(
+            "<SP> A B <SP> C D E <SP>",
+            "<SP> en_a en_b <SP> en_c en_d en_e <SP>",
+            orig_dur,
+            "0 60 62 0 64 65 67 0",
+            "1 2 2 1 2 2 2 1",
+        )])
+        result = json.loads(replace_lyrics(orig, "一二三四五六七八九十",
+                                            split_mode="duration"))
+        result_dur = sum(float(x) for x in result[0]["duration"].split(" "))
+        orig_total = sum(float(x) for x in orig_dur.split(" "))
+        assert result_dur == pytest.approx(orig_total)
+
+    def test_token_mode_unchanged(self):
+        """Token mode (default) should produce same results as before."""
+        orig = json.dumps([_make_track(
+            "<SP> A B <SP> C D E <SP>",
+            "<SP> en_a en_b <SP> en_c en_d en_e <SP>",
+            "0.5 0.3 0.3 0.5 0.3 0.3 0.3 0.5",
+            "0 60 62 0 64 65 67 0",
+            "1 2 2 1 2 2 2 1",
+        )])
+        result_default = json.loads(replace_lyrics(orig, "XY\nCDE"))
+        result_token = json.loads(replace_lyrics(orig, "XY\nCDE",
+                                                  split_mode="token"))
+        assert result_default[0]["text"] == result_token[0]["text"]
 

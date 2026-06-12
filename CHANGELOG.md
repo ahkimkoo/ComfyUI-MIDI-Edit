@@ -2,6 +2,16 @@
 
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
+## [2026-06-12] v1.6.0
+
+### Added
+
+- **字数分配模式选项**（`split_mode` 参数，默认 `token`）
+  - `token`（默认）：按原曲每个 section 的 token 数比例分配字数（原有方式）
+  - `duration`：按原曲每个 section 的时长比例分配字数（新方式，时长长的 section 分到更多字）
+  - 仅在智能拆句触发时（句子数 ≠ 原 section 数）生效
+  - 例如：总时长 20 秒，第一句 5 秒占 1/4 → 分配 1/4 的字数
+
 ## [2026-06-12] v1.5.0
 
 ### Added

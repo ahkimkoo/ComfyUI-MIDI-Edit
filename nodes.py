@@ -179,6 +179,27 @@ def _get_section_sizes(midi_data: list) -> list[int]:
     return sizes
 
 
+def _get_section_durations(midi_data: list) -> list[float]:
+    """Get the total duration of each non-SP section across all tracks."""
+    durations = []
+    for track in midi_data:
+        if "text" not in track or "duration" not in track:
+            continue
+        tokens = track["text"].split(" ")
+        dur_tokens = track["duration"].split(" ")
+        i = 0
+        while i < len(tokens):
+            if tokens[i] != "<SP>":
+                sec_dur = 0.0
+                while i < len(tokens) and tokens[i] != "<SP>":
+                    sec_dur += float(dur_tokens[i])
+                    i += 1
+                durations.append(sec_dur)
+            else:
+                i += 1
+    return durations
+
+
 # --- CT-Transformer Punctuation Model (for smart sentence splitting) ---
 
 _MODELSCOPE_MODEL_ID = "iic/punc_ct-transformer_zh-cn-common-vocab272727-onnx"
@@ -508,18 +529,19 @@ def _first_punct_cut(text: str, target_len: int) -> list[str] | None:
 def _smart_split_sentences(
     plain_lyrics: str,
     midi_data: list,
+    split_mode: str = "token",
 ) -> list[str]:
     """Split plain lyrics into sentences matching original MIDI section structure.
 
     Algorithm (triggered when initial punctuation/newline split yields a
     different sentence count than original MIDI sections):
 
-    1. Compute original section token counts (each token counts as 1)
+    1. Compute section weights (token counts or durations depending on split_mode)
     2. Compute expected char count per section (proportional, rounded)
     3. For each section, from left to right:
        a. Run CT-Transformer on remaining lyrics to add punctuation
        b. Find first punctuation mark, check if left part's char count is
-          within ±30% (rounded up) of expected
+          within ±15% (rounded up) of expected
        c. If within tolerance → use AI cut point
        d. If not → hard-cut at expected char count
        e. Remaining lyrics continue to next section
@@ -528,12 +550,18 @@ def _smart_split_sentences(
     Args:
         plain_lyrics: Clean lyrics string (no punctuation, no spaces).
         midi_data: Original MIDI data list.
+        split_mode: "token" = proportional to token count (default),
+                    "duration" = proportional to section duration.
 
     Returns:
         List of sentence strings, one per original section.
     """
-    section_sizes = _get_section_sizes(midi_data)
-    num_sections = len(section_sizes)
+    if split_mode == "duration":
+        section_weights = _get_section_durations(midi_data)
+    else:
+        section_weights = _get_section_sizes(midi_data)
+
+    num_sections = len(section_weights)
     total_chars = len(plain_lyrics)
 
     sentences = []
@@ -552,10 +580,10 @@ def _smart_split_sentences(
             break
 
         # Re-compute expected for this section based on remaining chars
-        # and remaining section sizes (keeps proportions balanced)
-        remaining_sizes = section_sizes[i:]
-        remaining_total = sum(remaining_sizes)
-        exp = round(remaining_sizes[0] * len(remaining) / remaining_total)
+        # and remaining weights (keeps proportions balanced)
+        remaining_weights = section_weights[i:]
+        remaining_total = sum(remaining_weights)
+        exp = round(remaining_weights[0] * len(remaining) / remaining_total)
         # Clamp: must leave at least 1 char per remaining section
         max_exp = len(remaining) - (remaining_sections - 1)
         exp = max(1, min(exp, max_exp))
@@ -778,7 +806,8 @@ def _process_section(
 def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     force_tone4_high_pitch: bool = False,
                      high_pitch_threshold: int = 79,
-                     fixed_pause: bool = True) -> str:
+                     fixed_pause: bool = True,
+                     split_mode: str = "token") -> str:
     """Replace lyrics in MIDI JSON with smart 3-mode algorithm.
 
     Splits user lyrics by newlines/punctuation into sentences, each mapped to
@@ -820,7 +849,8 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
     if len(sentences) != total_sections:
         try:
             plain = clean_lyrics(new_lyrics)
-            sentences = _smart_split_sentences(plain, midi_data)
+            sentences = _smart_split_sentences(plain, midi_data,
+                                               split_mode=split_mode)
         except Exception as e:
             # If smart split fails (model download error, etc.),
             # fall back to crude positional split.
@@ -1127,6 +1157,7 @@ class MIDIEditLyrics:
                 "force_tone4": ("BOOLEAN", {"default": False, "label_on": "ON", "label_off": "OFF"}),
                  "high_pitch_threshold": ("INT", {"default": 79, "min": 0, "max": 127, "step": 1}),
                 "fixed_pause": ("BOOLEAN", {"default": True, "label_on": "Fixed", "label_off": "Flexible"}),
+                "split_mode": (["token", "duration"], {"default": "token"}),
             }
         }
 
@@ -1146,17 +1177,20 @@ class MIDIEditLyrics:
         "Force Tone 4: forces Chinese phonemes at pitch >= threshold to tone 4. "
         "Fixed Pause (default ON): keep SP durations unchanged. "
         "Flexible Pause: when tokens are crowded or SP is overly long, "
-        "redistribute SP time proportionally to tokens."
+        "redistribute SP time proportionally to tokens. "
+        "Split Mode: 'token' = allocate chars by original token count proportion; "
+        "'duration' = allocate chars by original section duration proportion."
     )
 
     def edit_lyrics(self, midi_json: str, new_lyrics: str,
                     force_tone4: bool, high_pitch_threshold: int,
-                    fixed_pause: bool) -> tuple:
+                    fixed_pause: bool, split_mode: str) -> tuple:
         try:
             return (replace_lyrics(midi_json, new_lyrics,
                                     force_tone4_high_pitch=force_tone4,
                                     high_pitch_threshold=high_pitch_threshold,
-                                    fixed_pause=fixed_pause),)
+                                    fixed_pause=fixed_pause,
+                                    split_mode=split_mode),)
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid MIDI JSON input: {e}") from e
         except ValueError as e:
