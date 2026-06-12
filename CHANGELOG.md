@@ -2,6 +2,30 @@
 
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
+## [2026-06-12]
+
+### Added
+
+- **CT-Transformer 智能拆句**：当用户歌词按标点/换行切分后少于原曲句子数时，使用 CT-Transformer 标点恢复模型（基于 FunASR）自动在自然语言边界处插入标点，将长句拆分为多个短句以匹配原曲结构
+  - 模型自动从 ModelScope 下载到 ComfyUI `models/ct-transformer-punc/` 目录（~270MB，首次运行时下载）
+  - 迭代拆句策略：优先拆分字数差异最大的句子，AI 无法断句时尝试下一个，全部无法拆分时从中间硬拆
+  - 新增依赖：`modelscope`、`onnxruntime>=1.17.0`
+- **Collapse+Distribute 模式**：替换了旧的 Token 模式。当新歌词字数多于 collapse slot 数但不超过原始 token 数时，多 count 的 slot 内会分配不同的字（如原曲 `天天` → 新歌词 `把它`），尊重原曲的去重结构
+- **Right-align Collapse**：Collapse 模式改为右对齐映射，确保最后一个字映射到最后一个 slot（通常是结尾长音），避免结尾长音被均分导致歌曲戛然而止
+
+### Changed
+
+- **3 模式算法升级为 4 分支**：
+  - Collapse（N ≤ S）：slot 映射，右对齐
+  - Collapse+Distribute（S < N ≤ M）：slot 映射 + 多字 slot 内分配不同字
+  - Expand（N > M）：拆分最长 token
+- **最小 duration 下限**：重建阶段所有非 SP token 的 duration 不低于 0.30s，从同 section 最长 token 借时间
+
+### Fixed
+
+- **"飞"戛然而止**：Collapse 模式右对齐后，最后一个字（如"飞"）正确继承原曲结尾长音 slot 的 duration（~1.08s），不再被均匀分配
+- **"它"没唱出来**：Collapse+Distribute 模式正确处理 `天天` 等重复字 slot，每个 token 分配独立的字而非使用旧的 1:1 Token 模式
+
 ## [2026-06-11]
 
 ### Added

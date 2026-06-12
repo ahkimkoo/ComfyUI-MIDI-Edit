@@ -2,10 +2,11 @@
 
 [ComfyUI](https://github.com/comfyanonymous/ComfyUI) 自定义节点插件，搭配 [ComfyUI_RH_SoulX-Singer](https://github.com/HM-RunningHub/ComfyUI_RH_SoulX-Singer) 实现魔改歌词——替换 MIDI JSON 中的歌词文本并自动生成拼音/音素，也可从 MIDI JSON 中提取歌词。适用于 MIDI 歌曲生成工作流，支持中文和英文。
 
-提供两个节点：
+提供三个节点：
 
 - **MIDI Edit Lyrics** — 替换歌词并自动生成音素
 - **MIDI Extract Lyrics** — 提取歌词文本（去空格，`<SP>` 转换行）
+- **MIDI Merge Repeated Chars** — 合并连续重复字符
 
 ---
 
@@ -13,10 +14,17 @@
 
 - 歌词替换 + 自动音素生成
 - 歌词提取
+- 连续重复字符合并
 - 支持中文（`zh_` 前缀拼音）和英文（`en_` 前缀音素）
 - `<SP>` 标记自动保留，不影响音素对齐
-- 按位置替换：不要求新旧歌词长度一致，多给忽略，少给保留原文
-- **长音自动展开**：MIDI 中连续重复字（如 `兄 兄` 表示长音 2 拍）会自动将用户输入的字按相同次数展开
+- **智能匹配算法**：3 种模式自动适配新旧歌词长度差异
+  - **Collapse**（新词 ≤ 去重 slot 数）：右对齐映射，保护结尾长音
+  - **Collapse+Distribute**（slot 数 < 新词 ≤ token 数）：多字 slot 内分配不同字，尊重原曲重复结构
+  - **Expand**（新词 > token 数）：自动拆分最长 token（duration 减半，pitch 不变）
+- **CT-Transformer 智能拆句**：当用户歌词句子数少于原曲时，使用 AI 标点恢复模型在自然语言边界处智能拆分，而非粗暴按字数切割
+- **长音自动展开**：MIDI 中连续重复字（如 `天 天` 表示同一字两个不同音高）会自动将用户输入的字按相同次数展开
+- **高音强制第四声**（可选）：当 `force_tone4` 开启时，高音区（默认 ≥ G5）的中文拼音强制转为第四声
+- **最小 duration 保障**：所有非 SP token 的 duration 不低于 0.30s，从同 section 最长 token 借时间
 
 ---
 
@@ -28,7 +36,10 @@
 - Python conda 环境 `comfyui`
 - `g2pM>=0.1.2.5`
 - `g2p_en>=2.1.0`
+- `modelscope`（CT-Transformer 模型下载）
+- `onnxruntime>=1.17.0`（CT-Transformer 推理）
 - NLTK 数据（插件首次运行自动下载到本地 `models/nltk/`）
+- CT-Transformer 标点恢复模型（首次使用智能拆句时自动下载到 ComfyUI `models/ct-transformer-punc/`，~270MB）
 
 ### 安装步骤
 
@@ -39,12 +50,14 @@ ln -s /path/to/ComfyUI-MIDI-Edit ComfyUI-MIDI-Edit
 
 # 2. 安装 Python 依赖
 conda activate comfyui
-pip install g2pM g2p_en
+pip install g2pM g2p_en modelscope onnxruntime
 
 # 3. 重启 ComfyUI
 ```
 
 NLTK 数据会自动下载到项目内的 `models/nltk/` 目录，无需手动操作。
+
+CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 ModelScope 下载到 ComfyUI 的 `models/ct-transformer-punc/` 目录（~270MB），无需手动操作。
 
 ---
 
@@ -60,6 +73,8 @@ NLTK 数据会自动下载到项目内的 `models/nltk/` 目录，无需手动�
 |------|------|------|
 | `midi_json` | STRING, multiline | MIDI JSON 字符串 |
 | `new_lyrics` | STRING, multiline | 新歌词文本 |
+| `force_tone4` | BOOLEAN | 高音强制第四声（默认 OFF） |
+| `high_pitch_threshold` | INT | 高音阈值 0-127（默认 79 = G5） |
 
 **输出：**
 
@@ -69,13 +84,17 @@ NLTK 数据会自动下载到项目内的 `models/nltk/` 目录，无需手动�
 
 **处理逻辑：**
 
-1. 清洗新歌词（去除标点、空格、换行，只保留中英文）
-2. 将原始 text 中**连续相同的非 `<SP>` token** 合并为一个 slot（例如 `兄 兄` → 1 个 slot，重复数 2）
-3. 用户输入的字数按 slot 数对齐（非 token 数），每个 slot 消耗 1 个用户字
-4. 替换时，用户字按 slot 的重复数自动展开（例如 slot 重复 3 次，则输出 3 个相同的替换字）
-5. 如果用户字比 slot 少，剩余 slot 保留原文
-6. 如果用户字比 slot 多，多余忽略
-7. 为每个替换的字自动生成音素
+1. 新歌词按换行和标点（，。！？；：等）切分为句子
+2. 每个句子映射到原曲的一个 MIDI section（`<SP>` 分隔的段落）
+3. 如果句子数少于原曲 section 数，使用 **CT-Transformer AI 标点恢复模型**智能拆分长句，优先拆分字数差异最大的句子
+4. 每个 section 内使用 3 种模式匹配：
+   - **Collapse**（新字数 ≤ 去重 slot 数）：右对齐映射到 slot，保护结尾长音
+   - **Collapse+Distribute**（slot 数 < 新字数 ≤ token 数）：slot 内多个 token 分配不同的字（如原曲 `天天` → 新歌词 `把它`）
+   - **Expand**（新字数 > token 数）：拆分最长 duration 的 token（减半，pitch 不变）
+5. 原曲连续重复字（如 `天 天`）collapse 为 1 个 slot 后展开，新字自动按重复数复制
+6. 为每个替换的字自动生成音素（中文 → `zh_` 拼音，英文 → `en_` 音素）
+7. 空 token 的 duration 重分配给同 section 的已填 token
+8. 所有非 SP token 的 duration 不低于 0.30s
 
 **分类：** `MIDI-Edit`
 
@@ -146,7 +165,19 @@ MIDI JSON 为一个 track 对象数组，每个 track 包含以下字段：
 
 > 前 4 个 slot 替换，多余 2 字忽略，原文后段保留。
 
-### 示例 2：长音自动展开
+### 示例 2：智能拆句
+
+当新歌词句子数少于原曲 section 数时，AI 标点恢复模型自动在自然语言边界处拆分：
+
+原曲 4 个 section：`春 天 花 开 满 园 香` / `夏 日 蝉 鸣 绿 荫 长` / `秋 风 落 叶 金 满 地` / `冬 雪 纷 飞 白 茫 茫`
+
+新歌词（仅 2 句）：`明月几时有把酒问青天` / `不知天上宫阙今夕是何年`
+
+AI 自动拆分 → `明月几时有把酒问青天` → `明月几时有，把酒问青天` → 2 句
+
+总计仍不够 → 继续拆 `不知天上宫阙今夕是何年` → `不知天上宫阙，今夕是何年` → 最终 4 句，匹配 4 个 section
+
+### 示例 3：Collapse+Distribute 模式
 
 MIDI 中连续重复字表示长音（占多个音节）。用户输入不需要手动写重复字，插件会自动展开匹配。
 
@@ -160,7 +191,7 @@ MIDI 中连续重复字表示长音（占多个音节）。用户输入不需要
 
 > "敌敌"（长音 2 拍）→ 用户写"一"自动展开为"一一"；"近近近"（长音 3 拍）→ 用户写"六"自动展开为"六六六"。
 
-### 示例 3：提取歌词
+### 示例 4：提取歌词
 
 输入 MIDI JSON 的 text：`<SP> 我 有 一 只 小 <SP> 毛 驴 我 从 来 都 不 <SP> 骑 有 一 天 <SP>`
 
@@ -216,8 +247,9 @@ curl -s http://127.0.0.1:8188/prompt \
 
 - `g2pM` 首次使用时会自动下载模型（与 NLTK 数据分开）
 - NLTK 数据存储在项目 `models/nltk/` 目录下，不影响系统环境
-- 歌词替换是**按位置**而非按字数匹配，不要求新旧歌词长度一致
-- `<SP>` 标记始终保留，不影响音素对齐
+- CT-Transformer 标点恢复模型首次使用时自动从 ModelScope 下载到 ComfyUI `models/ct-transformer-punc/`（~270MB）
+- 歌词替换支持**任意长度差异**的新旧歌词（Collapse / Collapse+Distribute / Expand 三种模式自动选择）
+- `<SP>` 标记始终保留，f0（帧级数据）完全不做修改
 
 ---
 
@@ -228,13 +260,13 @@ ComfyUI-MIDI-Edit/
 ├── __init__.py          # ComfyUI 插件入口，导出节点映射
 ├── nodes.py             # 核心逻辑与节点定义
 ├── requirements.txt     # Python 依赖
+├── pyproject.toml       # Comfy Registry 发布配置
+├── CHANGELOG.md         # 更新日志
 ├── docs/
 │   ├── REQUIREMENT.md   # 原始需求文档
 │   ├── midi-edit-lyrics.json       # ComfyUI 工作流文件
 │   └── midi-edit-lyrics.json.png   # 工作流截图
 ├── models/
 │   └── nltk/            # NLTK 数据（自动下载）
-│       ├── taggers/
-│       └── tokenizers/
 └── README.md
 ```
