@@ -1,2 +1,4 @@
 g2pM>=0.1.2.5
 g2p_en>=2.1.0
+modelscope
+onnxruntime>=1.17.0

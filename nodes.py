@@ -178,6 +178,352 @@ def _get_section_sizes(midi_data: list) -> list[int]:
     return sizes
 
 
+# --- CT-Transformer Punctuation Model (for smart sentence splitting) ---
+
+_MODELSCOPE_MODEL_ID = "iic/punc_ct-transformer_zh-cn-common-vocab272727-onnx"
+_PUNC_MODEL_FILES = {"model_quant.onnx", "tokens.json"}
+_PUNC_LIST = ["<unk>", "_", ",", "。", "?", "、"]
+_PUNC_LIST_NORMALIZED = ["<unk>", "_", "，", "。", "？", "、"]
+_SPLIT_SIZE = 20
+
+_ct_transformer = None  # module-level singleton
+
+
+def _get_models_base_dir():
+    """Return the base models directory (ComfyUI models_dir or local fallback)."""
+    try:
+        import folder_paths
+        return folder_paths.models_dir
+    except ImportError:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+
+
+def _ensure_punc_model():
+    """Download CT-Transformer model from ModelScope if not present.
+
+    Stores model files under {models_base}/ct-transformer-punc/.
+    """
+    model_dir = os.path.join(_get_models_base_dir(), "ct-transformer-punc")
+    if all(os.path.exists(os.path.join(model_dir, f)) for f in _PUNC_MODEL_FILES):
+        return model_dir
+
+    os.makedirs(model_dir, exist_ok=True)
+    print(f"[MIDI-Edit] Downloading CT-Transformer punctuation model from ModelScope...")
+
+    from modelscope import snapshot_download
+    downloaded = snapshot_download(
+        _MODELSCOPE_MODEL_ID,
+        cache_dir=model_dir,
+    )
+
+    # snapshot_download may create a subdirectory; copy needed files to model_dir
+    if downloaded != model_dir:
+        for fname in _PUNC_MODEL_FILES:
+            src = os.path.join(downloaded, fname)
+            dst = os.path.join(model_dir, fname)
+            if os.path.exists(src) and not os.path.exists(dst):
+                import shutil
+                shutil.copy2(src, dst)
+
+    # Verify files exist after download
+    missing = [f for f in _PUNC_MODEL_FILES
+               if not os.path.exists(os.path.join(model_dir, f))]
+    if missing:
+        raise FileNotFoundError(
+            f"[MIDI-Edit] Failed to download CT-Transformer model. "
+            f"Missing files: {missing}"
+        )
+
+    print(f"[MIDI-Edit] CT-Transformer punctuation model ready at {model_dir}")
+    return model_dir
+
+
+def _load_token_list(tokens_path: str) -> list[str]:
+    """Load the token list from a JSON file."""
+    with open(tokens_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# --- Copied utility functions from cttPunctuator (adapted, no typeguard dep) ---
+
+
+def _code_mix_split_words(text: str) -> list[str]:
+    """Split text into words: each Chinese char is a word, consecutive ASCII is one word."""
+    words = []
+    segs = text.split()
+    for seg in segs:
+        current_word = ""
+        for c in seg:
+            if len(c.encode()) == 1:
+                current_word += c
+            else:
+                if len(current_word) > 0:
+                    words.append(current_word)
+                    current_word = ""
+                words.append(c)
+        if len(current_word) > 0:
+            words.append(current_word)
+    return words
+
+
+def _split_to_mini_sentence(words: list, word_limit: int = _SPLIT_SIZE) -> list[list]:
+    """Split word list into chunks of at most word_limit."""
+    if len(words) <= word_limit:
+        return [words]
+    sentences = []
+    length = len(words)
+    sentence_len = length // word_limit
+    for i in range(sentence_len):
+        sentences.append(words[i * word_limit: (i + 1) * word_limit])
+    if length % word_limit > 0:
+        sentences.append(words[sentence_len * word_limit:])
+    return sentences
+
+
+class _TokenIDConverter:
+    """Bidirectional converter between token strings and integer IDs."""
+
+    def __init__(self, token_list: list[str]):
+        self.token_list = token_list
+        self.unk_symbol = token_list[-1]
+        self.token2id = {v: i for i, v in enumerate(self.token_list)}
+        self.unk_id = self.token2id[self.unk_symbol]
+
+    def tokens2ids(self, tokens: list[str]) -> list[int]:
+        return [self.token2id.get(t, self.unk_id) for t in tokens]
+
+
+class _CTTransformerPunc:
+    """Lightweight CT-Transformer punctuation restorer.
+
+    Directly loads the ModelScope ONNX model and runs inference,
+    without the lovemefan/cttPunctuator dependency.
+    """
+
+    def __init__(self, model_dir: str):
+        import numpy as np
+        import onnxruntime
+
+        tokens_path = os.path.join(model_dir, "tokens.json")
+        model_path = os.path.join(model_dir, "model_quant.onnx")
+
+        token_list = _load_token_list(tokens_path)
+        self.converter = _TokenIDConverter(token_list)
+
+        opts = onnxruntime.SessionOptions()
+        opts.intra_op_num_threads = 4
+        opts.log_severity_level = 3  # suppress warnings
+        self.session = onnxruntime.InferenceSession(model_path, sess_options=opts)
+
+        # Determine period index in punc list
+        self.punc_list = list(_PUNC_LIST_NORMALIZED)
+        self.period_idx = _PUNC_LIST_NORMALIZED.index("。")
+
+    def add_punctuation(self, text: str) -> str:
+        """Run CT-Transformer inference to add punctuation to text.
+
+        Returns the text with punctuation inserted.
+        """
+        import numpy as np
+
+        split_text = _code_mix_split_words(text)
+        if not split_text:
+            return text
+
+        split_text_id = self.converter.tokens2ids(split_text)
+        mini_sentences = _split_to_mini_sentence(split_text)
+        mini_sentences_id = _split_to_mini_sentence(split_text_id)
+
+        cache_sent = []
+        cache_sent_id = []
+        result_parts = []
+
+        for mini_i in range(len(mini_sentences)):
+            mini_sentence = cache_sent + mini_sentences[mini_i]
+            mini_sentence_id = cache_sent_id + mini_sentences_id[mini_i]
+            # ModelScope quantized model uses int32 input named "inputs"
+            mini_sentence_id = np.array(mini_sentence_id, dtype="int32")
+            text_lengths = np.array([len(mini_sentence)], dtype="int32")
+
+            mapped_feed = {
+                "inputs": mini_sentence_id[None, :],
+                "text_lengths": text_lengths,
+            }
+
+            outputs = self.session.run(None, mapped_feed)
+            punctuations = np.argmax(outputs[0], axis=-1)[0]
+
+            # Search for last period/question mark as cache boundary
+            if mini_i < len(mini_sentences) - 1:
+                sentence_end = -1
+                last_comma_idx = -1
+                for i in range(len(punctuations) - 2, 1, -1):
+                    p = self.punc_list[punctuations[i]]
+                    if p == "。" or p == "？":
+                        sentence_end = i
+                        break
+                    if last_comma_idx < 0 and p == "，":
+                        last_comma_idx = i
+
+                if sentence_end < 0 and len(mini_sentence) > 200 and last_comma_idx >= 0:
+                    sentence_end = last_comma_idx
+                    punctuations[sentence_end] = self.period_idx
+
+                cache_sent = mini_sentence[sentence_end + 1:]
+                cache_sent_id = mini_sentence_id[sentence_end + 1:].tolist()
+                mini_sentence = mini_sentence[:sentence_end + 1]
+                punctuations = punctuations[:sentence_end + 1]
+
+            # Build words with punctuation
+            for i in range(len(mini_sentence)):
+                if i > 0:
+                    # Add space between two consecutive ASCII words
+                    if (len(mini_sentence[i][0].encode()) == 1
+                            and len(mini_sentence[i - 1][0].encode()) == 1):
+                        result_parts.append(" ")
+                result_parts.append(mini_sentence[i])
+                p = self.punc_list[punctuations[i]]
+                if p != "_":
+                    result_parts.append(p)
+
+        # Force sentence to end with period
+        result = "".join(result_parts)
+        if result and result[-1] in ("，", "、"):
+            result = result[:-1] + "。"
+        elif result and result[-1] not in ("。", "？"):
+            result = result + "。"
+
+        return result
+
+
+def _get_ct_transformer() -> _CTTransformerPunc:
+    """Lazy-initialise the CT-Transformer punctuation model (downloads on first use)."""
+    global _ct_transformer
+    if _ct_transformer is None:
+        model_dir = _ensure_punc_model()
+        _ct_transformer = _CTTransformerPunc(model_dir)
+    return _ct_transformer
+
+
+# --- Smart sentence splitting ---
+
+
+_PUNC_SPLIT_RE = re.compile(r'[，。？！；、]')
+
+
+def _restore_punctuation(text: str) -> str:
+    """Run CT-Transformer to add punctuation to a sentence.
+
+    Strips trailing sentence-ending punctuation before returning
+    (used for splitting, not for display).
+    """
+    model = _get_ct_transformer()
+    result = model.add_punctuation(text)
+    # Remove trailing punctuation for splitting purposes
+    result = result.rstrip("。.？?！！！")
+    return result
+
+
+def _split_at_punctuation(text: str) -> list[str]:
+    """Split text at the first punctuation mark found.
+
+    Returns a list of 2 non-empty strings if split possible,
+    otherwise returns [text].
+    """
+    text = text.strip()
+    if len(text) <= 1:
+        return [text]
+
+    match = _PUNC_SPLIT_RE.search(text)
+    if match:
+        pos = match.start()
+        left = text[:pos].strip()
+        right = text[pos + 1:].strip()
+        if left and right:
+            return [left, right]
+        # Try to find another split point
+        next_match = _PUNC_SPLIT_RE.search(text, pos + 1)
+        if next_match:
+            pos2 = next_match.start()
+            left2 = text[:pos2].strip()
+            right2 = text[pos2 + 1:].strip()
+            if left2 and right2:
+                return [left2, right2]
+        # Only one non-empty side — can't split
+        return [text]
+    return [text]
+
+
+def _smart_split_sentences(
+    sentences: list[str],
+    target_count: int,
+) -> list[str]:
+    """Split sentences using AI punctuation to match target section count.
+
+    Algorithm:
+    1. While len(sentences) < target_count:
+       a. Find the longest sentence that hasn't been marked unsplitable
+       b. Run CT-Transformer to add punctuation
+       c. If punctuation found, split at the first punctuation mark
+       d. If no punctuation found, mark as unsplitable and try next
+       e. If ALL sentences are unsplitable, hard-split the longest one in half
+    2. Return the new list of sentences
+
+    Args:
+        sentences: Current list of lyrics sentences (after basic punctuation/newline split).
+        target_count: Number of original MIDI sections to match.
+
+    Returns:
+        New list of sentences with length == target_count.
+    """
+    if len(sentences) >= target_count:
+        return sentences
+
+    unsplitable = set()  # indices of sentences that the model couldn't punctuate
+
+    while len(sentences) < target_count:
+        # Find sentence with largest character count not yet marked unsplitable
+        candidates = [
+            (i, len(s)) for i, s in enumerate(sentences)
+            if i not in unsplitable and len(s) > 1
+        ]
+
+        if not candidates:
+            # All remaining sentences are single chars or unsplitable
+            # Find the longest sentence overall and hard-split it
+            idx = max(range(len(sentences)), key=lambda i: len(sentences[i]))
+            sent = sentences[idx]
+            if len(sent) <= 1:
+                # Can't split single chars — just pad with empty strings
+                sentences.insert(idx + 1, "")
+                unsplitable = set()  # reset since indices changed
+                continue
+            mid = len(sent) // 2
+            sentences = sentences[:idx] + [sent[:mid], sent[mid:]] + sentences[idx + 1:]
+            unsplitable = set()  # reset since indices changed
+            continue
+
+        # Pick the longest candidate
+        idx = max(candidates, key=lambda x: x[1])[0]
+
+        # Try AI punctuation
+        try:
+            punctuated = _restore_punctuation(sentences[idx])
+            parts = _split_at_punctuation(punctuated)
+        except Exception:
+            parts = [sentences[idx]]
+
+        if len(parts) > 1:
+            # Successfully split
+            sentences = sentences[:idx] + parts + sentences[idx + 1:]
+            unsplitable = set()  # reset since indices changed
+        else:
+            # Model couldn't find a punctuation split point — mark as unsplitable
+            unsplitable.add(idx)
+
+    return sentences
+
+
 # --- Segment / slot helpers ---
 
 
@@ -379,13 +725,20 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
 
     sentences = _split_lyrics_to_sentences(new_lyrics)
 
-    # Fallback: if punctuation/newline split yields fewer sentences than
-    # original sections, re-split by matching the original section sizes.
+    # Smart split: if punctuation/newline split yields fewer sentences than
+    # original sections, use CT-Transformer punctuation model to intelligently
+    # split long sentences at natural language boundaries.
     total_sections = _count_total_sections(midi_data)
     if len(sentences) < total_sections:
-        section_sizes = _get_section_sizes(midi_data)
-        plain = clean_lyrics(new_lyrics)
-        sentences = _split_by_section_sizes(plain, section_sizes)
+        try:
+            sentences = _smart_split_sentences(sentences, total_sections)
+        except Exception as e:
+            # If smart split fails (model download error, etc.),
+            # fall back to crude positional split.
+            print(f"[MIDI-Edit] Smart split failed ({e}), falling back to positional split")
+            section_sizes = _get_section_sizes(midi_data)
+            plain = clean_lyrics(new_lyrics)
+            sentences = _split_by_section_sizes(plain, section_sizes)
 
     # Global sentence counter — persists across tracks so that the second
     # track continues where the first track left off.
