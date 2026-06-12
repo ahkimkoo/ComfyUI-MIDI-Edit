@@ -4,6 +4,7 @@ and auto-generating corresponding phonemes.
 """
 
 import json
+import math
 import os
 import re
 import warnings
@@ -462,71 +463,141 @@ def _split_at_punctuation(text: str) -> list[str]:
     return [clean] if clean else [text]
 
 
-def _smart_split_sentences(
-    sentences: list[str],
-    target_count: int,
-) -> list[str]:
-    """Split sentences using AI punctuation to match target section count.
+def _get_section_slot_counts(midi_data: list) -> list[int]:
+    """Get the collapsed slot count (unique chars, repeated chars count as 1) per section.
 
-    Algorithm:
-    1. While len(sentences) < target_count:
-       a. Find the longest sentence that hasn't been marked unsplitable
-       b. Run CT-Transformer to add punctuation
-       c. If punctuation found, split at the first punctuation mark
-       d. If no punctuation found, mark as unsplitable and try next
-       e. If ALL sentences are unsplitable, hard-split the longest one in half
-    2. Return the new list of sentences
+    SP sections are excluded. Repeated consecutive identical tokens collapse to 1 slot.
+    """
+    counts = []
+    for track in midi_data:
+        if "text" not in track:
+            continue
+        tokens = track["text"].split(" ")
+        i = 0
+        while i < len(tokens):
+            if tokens[i] != "<SP>":
+                # Count unique consecutive chars in this section
+                slot_count = 0
+                prev = None
+                while i < len(tokens) and tokens[i] != "<SP>":
+                    if tokens[i] != prev:
+                        slot_count += 1
+                        prev = tokens[i]
+                    i += 1
+                counts.append(slot_count)
+            else:
+                i += 1
+    return counts
+
+
+def _compute_expected_char_counts(
+    slot_counts: list[int], total_new_chars: int
+) -> list[int]:
+    """Compute expected char count per section, proportional to original slot counts.
+
+    Uses round-half-up for each section except the last, which gets the remainder
+    to ensure the total equals total_new_chars exactly.
+    """
+    total_slots = sum(slot_counts)
+    if total_slots == 0:
+        return [0] * len(slot_counts)
+
+    expected = []
+    for i, sc in enumerate(slot_counts):
+        if i < len(slot_counts) - 1:
+            expected.append(round(sc * total_new_chars / total_slots))
+        else:
+            # Last section gets the remainder
+            expected.append(total_new_chars - sum(expected))
+    return expected
+
+
+def _first_punct_cut(text: str, target_len: int) -> list[str] | None:
+    """Find the first punctuation mark in AI-punctuated text and split there.
+
+    Returns [left, right] (cleaned of all punctuation) if a suitable cut is found,
+    or None if no usable punctuation exists.
+    """
+    # Find the first punctuation mark position
+    for m in re.finditer(r'[，。！？；：、,.!?;:]', text):
+        pos = m.start()
+        left = text[:pos].strip()
+        right = text[pos + 1:].strip()
+        if left and right:
+            # Strip ALL remaining punctuation from both halves
+            left = re.sub(r'[，。！？；：、,.!?;:]', '', left).strip()
+            right = re.sub(r'[，。！？；：、,.!?;:]', '', right).strip()
+            if left and right:
+                return [left, right]
+    return None
+
+
+def _smart_split_sentences(
+    plain_lyrics: str,
+    midi_data: list,
+) -> list[str]:
+    """Split plain lyrics into sentences matching original MIDI section structure.
+
+    Algorithm (triggered when initial punctuation/newline split yields a
+    different sentence count than original MIDI sections):
+
+    1. Compute original section slot counts (collapsed, repeated chars = 1)
+    2. Compute expected char count per section (proportional, rounded)
+    3. For each section, from left to right:
+       a. Run CT-Transformer on remaining lyrics to add punctuation
+       b. Find first punctuation mark, check if left part's char count is
+          within ±30% (rounded up) of expected
+       c. If within tolerance → use AI cut point
+       d. If not → hard-cut at expected char count
+       e. Remaining lyrics continue to next section
+    4. Return list of sentences (one per section)
 
     Args:
-        sentences: Current list of lyrics sentences (after basic punctuation/newline split).
-        target_count: Number of original MIDI sections to match.
+        plain_lyrics: Clean lyrics string (no punctuation, no spaces).
+        midi_data: Original MIDI data list.
 
     Returns:
-        New list of sentences with length == target_count.
+        List of sentence strings, one per original section.
     """
-    if len(sentences) >= target_count:
-        return sentences
+    slot_counts = _get_section_slot_counts(midi_data)
+    num_sections = len(slot_counts)
+    total_chars = len(plain_lyrics)
+    expected = _compute_expected_char_counts(slot_counts, total_chars)
 
-    unsplitable = set()  # indices of sentences that the model couldn't punctuate
+    sentences = []
+    remaining = plain_lyrics
 
-    while len(sentences) < target_count:
-        # Find sentence with largest character count not yet marked unsplitable
-        candidates = [
-            (i, len(s)) for i, s in enumerate(sentences)
-            if i not in unsplitable and len(s) > 1
-        ]
-
-        if not candidates:
-            # All remaining sentences are single chars or unsplitable
-            # Find the longest sentence overall and hard-split it
-            idx = max(range(len(sentences)), key=lambda i: len(sentences[i]))
-            sent = sentences[idx]
-            if len(sent) <= 1:
-                # Can't split single chars — just pad with empty strings
-                sentences.insert(idx + 1, "")
-                unsplitable = set()  # reset since indices changed
-                continue
-            mid = len(sent) // 2
-            sentences = sentences[:idx] + [sent[:mid], sent[mid:]] + sentences[idx + 1:]
-            unsplitable = set()  # reset since indices changed
+    for i in range(num_sections):
+        if not remaining:
+            sentences.append("")
             continue
 
-        # Pick the longest candidate
-        idx = max(candidates, key=lambda x: x[1])[0]
+        # Last section gets everything left
+        if i == num_sections - 1:
+            sentences.append(remaining)
+            break
 
-        # Try AI punctuation
+        exp = expected[i]
+        tolerance = math.ceil(exp * 0.3)
+
+        # Try AI punctuation cut
         try:
-            punctuated = _restore_punctuation(sentences[idx])
-            parts = _split_at_punctuation(punctuated)
+            punctuated = _restore_punctuation(remaining)
+            cut = _first_punct_cut(punctuated, exp)
         except Exception:
-            parts = [sentences[idx]]
+            cut = None
 
-        if len(parts) > 1:
-            sentences = sentences[:idx] + parts + sentences[idx + 1:]
-            unsplitable = set()  # reset since indices changed
-        else:
-            # Model couldn't find a punctuation split point — mark as unsplitable
-            unsplitable.add(idx)
+        if cut is not None:
+            left_len = len(cut[0])
+            if abs(left_len - exp) <= tolerance:
+                # AI cut is within tolerance — use it
+                sentences.append(cut[0])
+                remaining = cut[1]
+                continue
+
+        # Hard-cut at expected char count
+        sentences.append(remaining[:exp])
+        remaining = remaining[exp:]
 
     return sentences
 
@@ -761,13 +832,13 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
 
     sentences = _split_lyrics_to_sentences(new_lyrics)
 
-    # Smart split: if punctuation/newline split yields fewer sentences than
-    # original sections, use CT-Transformer punctuation model to intelligently
-    # split long sentences at natural language boundaries.
+    # Smart split: when sentence count != original section count, use
+    # proportional expected-char-count algorithm with CT-Transformer AI cuts.
     total_sections = _count_total_sections(midi_data)
-    if len(sentences) < total_sections:
+    if len(sentences) != total_sections:
         try:
-            sentences = _smart_split_sentences(sentences, total_sections)
+            plain = clean_lyrics(new_lyrics)
+            sentences = _smart_split_sentences(plain, midi_data)
         except Exception as e:
             # If smart split fails (model download error, etc.),
             # fall back to crude positional split.

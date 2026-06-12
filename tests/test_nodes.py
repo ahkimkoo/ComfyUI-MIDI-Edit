@@ -42,6 +42,9 @@ from nodes import (
     _split_into_segments,
     _smart_split_sentences,
     _split_at_punctuation,
+    _first_punct_cut,
+    _get_section_slot_counts,
+    _compute_expected_char_counts,
     _code_mix_split_words,
     _split_to_mini_sentence,
     _TokenIDConverter,
@@ -565,11 +568,29 @@ class TestSplitAtPunctuation:
 class TestSmartSplitSentences:
     """Test the smart split algorithm with mocked punctuation restoration."""
 
-    def _patch_restore(self, sentences_map):
-        """Monkey-patch _restore_punctuation to return predetermined results.
+    @staticmethod
+    def _make_midi_data(section_token_lists):
+        """Build midi_data from a list of section token lists.
 
-        sentences_map: dict mapping sentence text -> punctuated text.
+        Each section becomes a consecutive run of tokens; sections are
+        separated by <SP>. All sections go into a single track.
         """
+        parts = []
+        for tokens in section_token_lists:
+            parts.append("<SP>")
+            parts.extend(tokens)
+        parts.append("<SP>")
+        text = " ".join(parts)
+        n = len(parts)
+        phoneme = " ".join("zh_x" for _ in range(n))
+        duration = " ".join("0.3" for _ in range(n))
+        pitch = " ".join("60" for _ in range(n))
+        ntype = " ".join("1" for _ in range(n))
+        return [{"text": text, "phoneme": phoneme,
+                 "duration": duration, "note_pitch": pitch, "note_type": ntype}]
+
+    def _patch_restore(self, sentences_map):
+        """Monkey-patch _restore_punctuation to return predetermined results."""
         import nodes
         original_restore = nodes._restore_punctuation
 
@@ -583,85 +604,118 @@ class TestSmartSplitSentences:
         import nodes
         nodes._restore_punctuation = original
 
-    def test_exact_match_no_split(self):
-        """When sentence count matches target, return as-is."""
-        result = _smart_split_sentences(["ABC", "DEF"], 2)
-        assert result == ["ABC", "DEF"]
+    # --- Unit tests for new helpers ---
 
-    def test_more_than_target_no_split(self):
-        """When sentence count exceeds target, return as-is."""
-        result = _smart_split_sentences(["ABC", "DEF", "GHI"], 2)
-        assert result == ["ABC", "DEF", "GHI"]
+    def test_section_slot_counts_no_repeats(self):
+        """No repeated chars → slot count == token count."""
+        midi = self._make_midi_data([["A", "B", "C"], ["D", "E"]])
+        assert _get_section_slot_counts(midi) == [3, 2]
 
-    def test_split_one_sentence_to_two(self):
-        """One sentence needs to become two via AI punctuation."""
+    def test_section_slot_counts_with_repeats(self):
+        """Repeated chars collapse to 1 slot each."""
+        midi = self._make_midi_data([["A", "A", "B"], ["C", "C", "C"]])
+        # A×2→1 slot, B→1 slot = 2 slots; C×3→1 slot = 1 slot
+        assert _get_section_slot_counts(midi) == [2, 1]
+
+    def test_compute_expected_simple(self):
+        """Proportional allocation with last-section remainder."""
+        # 2 sections, slot counts [3, 1], total 12 chars → 9 + 3
+        result = _compute_expected_char_counts([3, 1], 12)
+        assert result == [9, 3]
+        assert sum(result) == 12
+
+    def test_compute_expected_rounding(self):
+        """Rounding with remainder goes to last section."""
+        # 3 sections, slot counts [2, 2, 2], total 10 chars → 3 + 3 + 4
+        result = _compute_expected_char_counts([2, 2, 2], 10)
+        assert sum(result) == 10
+
+    def test_compute_expected_single_section(self):
+        """Single section gets all chars."""
+        result = _compute_expected_char_counts([5], 20)
+        assert result == [20]
+
+    # --- Integration tests for _smart_split_sentences ---
+
+    def test_split_proportional_hard_cut(self):
+        """When AI can't punctuate, hard-cut at expected positions."""
         orig = self._patch_restore({
-            "如果你觉得有点儿累": "如果你觉得，有点儿累",
+            "ABCDEFGHIJ": "ABCDEFGHIJ",  # no punctuation
         })
         try:
-            result = _smart_split_sentences(["如果你觉得有点儿累", "短句"], 3)
-            assert len(result) == 3
-            assert "如果你觉得" in result
-            assert "有点儿累" in result
-            assert "短句" in result
+            # 2 sections: slot counts [3, 2] → 10 chars → expected [6, 4]
+            # No AI punctuation → hard-cut at 6
+            midi = self._make_midi_data([["A", "B", "C"], ["D", "E"]])
+            result = _smart_split_sentences("ABCDEFGHIJ", midi)
+            assert len(result) == 2
+            assert result[0] == "ABCDEF"
+            assert result[1] == "GHIJ"
         finally:
             self._restore(orig)
 
-    def test_iterative_split_longest_first(self):
-        """Should iteratively split the longest sentence until count matches."""
+    def test_split_ai_cut_within_tolerance(self):
+        """AI cut within ±30% tolerance → use AI result."""
         orig = self._patch_restore({
-            "一二三四五六七八": "一二三四，五六七八",
-            "一二三四": "一二，三四",
-            "五六七八": "五六，七八",
+            # 36 chars, section slot counts [6,5,5,5] → expected [10,9,9,8]
+            # First cut: AI puts comma at char 11 → within 30% of 10 (tolerance=3)
+            "如果你觉得有点累送你个小炸弹把它扔给你的烦恼把烦恼都炸飞拉上你的老闺蜜呀":
+                "如果你觉得有点累送你个小炸弹，把它扔给你的烦恼把烦恼都炸飞拉上你的老闺蜜呀",
+            # Remaining 25 chars for 3 sections, expected [9,9,8]
+            "把它扔给你的烦恼把烦恼都炸飞拉上你的老闺蜜呀":
+                "把它扔给你的烦恼把烦恼都炸飞，拉上你的老闺蜜呀",
+            # Remaining 12 chars for 2 sections, expected [9,8] → 12 chars, AI cut
+            "把烦恼都炸飞拉上你的老闺蜜呀":
+                "把烦恼都炸飞，拉上你的老闺蜜呀",
         })
         try:
+            # slot counts: 没有什么能够阻挡=6 unique, 你对自由的向向往=6 unique(向×2→1),
+            # 天天马行空的生涯=6 unique(天×2→1), 你的心了无牵挂=6 unique
+            midi = self._make_midi_data([
+                ["没", "有", "什", "么", "能", "够", "阻", "挡"],
+                ["你", "对", "自", "由", "的", "向", "向", "往"],
+                ["天", "天", "马", "行", "空", "的", "生", "涯"],
+                ["你", "的", "心", "了", "无", "牵", "挂"],
+            ])
             result = _smart_split_sentences(
-                ["一二三四五六七八", "短"], 4
+                "如果你觉得有点累送你个小炸弹把它扔给你的烦恼把烦恼都炸飞拉上你的老闺蜜呀",
+                midi,
             )
             assert len(result) == 4
+            assert sum(len(s) for s in result) == 36
         finally:
             self._restore(orig)
 
-    def test_unsplitable_fallback_to_next(self):
-        """If a sentence can't be split, try the next longest."""
+    def test_last_section_gets_remainder(self):
+        """Last section gets all remaining chars."""
         orig = self._patch_restore({
-            "AB": "AB",  # model returns no punctuation
-            "CDEFGHIJKL": "CDEFG，HIJKL",
+            "ABCDEFGH": "ABCD，EFGH",
         })
         try:
-            result = _smart_split_sentences(["AB", "CDEFGHIJKL"], 3)
-            assert len(result) == 3
-            # AB should remain unsplit, CDEFGHIJKL should be split
-            assert "AB" in result
+            # 2 sections, slot counts [1, 1] → 8 chars → expected [4, 4]
+            # AI cut at 4 → within tolerance
+            midi = self._make_midi_data([["A"], ["B"]])
+            result = _smart_split_sentences("ABCDEFGH", midi)
+            assert len(result) == 2
+            assert result[0] == "ABCD"
+            assert result[1] == "EFGH"
         finally:
             self._restore(orig)
 
-    def test_all_unsplitable_hard_split(self):
-        """If all sentences are unsplitable by AI, hard-split the longest."""
-        orig = self._patch_restore({
-            "ABCDEF": "ABCDEF",  # no punctuation
-            "GH": "GH",
-        })
-        try:
-            result = _smart_split_sentences(["ABCDEF", "GH"], 3)
-            assert len(result) == 3
-            # ABCDEF should be hard-split into two parts
-            abc_parts = [s for s in result if any(c in s for c in "ABCDEF")]
-            assert len(abc_parts) == 2
-        finally:
-            self._restore(orig)
+    def test_empty_input(self):
+        """Empty lyrics → all sections get empty strings."""
+        midi = self._make_midi_data([["A", "B"], ["C"]])
+        result = _smart_split_sentences("", midi)
+        assert result == ["", ""]
 
-    def test_single_char_padding(self):
-        """Single-char sentences that can't be split → pad with empty strings."""
-        orig = self._patch_restore({
-            "A": "A",  # can't split single char
-        })
-        try:
-            result = _smart_split_sentences(["A"], 3)
-            assert len(result) == 3
-            assert result.count("") >= 1  # padded with empties
-        finally:
-            self._restore(orig)
+    def test_first_punct_cut(self):
+        """_first_punct_cut splits at first punctuation mark."""
+        result = _first_punct_cut("如果你觉得，有点儿累", 5)
+        assert result == ["如果你觉得", "有点儿累"]
+
+    def test_first_punct_cut_no_punct(self):
+        """_first_punct_cut returns None when no punctuation."""
+        result = _first_punct_cut("你好世界", 3)
+        assert result is None
 
 
 # ===================================================================
