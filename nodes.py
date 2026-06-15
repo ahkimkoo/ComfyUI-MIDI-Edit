@@ -34,9 +34,9 @@ _g2p_zh = None
 _g2p_en = None
 
 _NLTK_PACKAGES = [
-    "averaged_perceptron_tagger_eng",
-    "averaged_perceptron_tagger",
-    "punkt_tab",
+    "taggers/averaged_perceptron_tagger_eng",
+    "taggers/averaged_perceptron_tagger",
+    "tokenizers/punkt_tab",
 ]
 
 
@@ -84,8 +84,7 @@ def char_to_phoneme(char: str, lang: str = "Mandarin") -> str:
     """Convert a single character to its phoneme representation.
 
     Chinese chars  -> zh_<pinyin_with_tone>
-    English letters -> en_<lowercase_letter>  (single letter passthrough)
-    English words  -> en_<phonemes_joined_by_dash>
+    English letters -> en_<ARPAbet_phonemes_joined_by_dash>  (via g2p_en)
     Unknown / SP   -> <SP>
     """
     if char == "<SP>":
@@ -94,9 +93,6 @@ def char_to_phoneme(char: str, lang: str = "Mandarin") -> str:
         g2p = _get_g2p_zh()
         result = g2p(char, tone=True, char_split=False)
         return ZH_FLAG + result[0]
-    if len(char) == 1 and char.isascii() and char.isalpha():
-        # Single English letter — use directly as phoneme
-        return EN_FLAG + char.lower()
     if is_english_word(char):
         g2p = _get_g2p_en()
         result = g2p(char.lower())

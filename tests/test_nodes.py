@@ -73,8 +73,9 @@ class TestCharToPhoneme:
         assert result != "zh_"  # should have actual pinyin
 
     def test_single_english_letter(self):
-        assert char_to_phoneme("A") == "en_a"
-        assert char_to_phoneme("b") == "en_b"
+        # Single letters go through g2p_en → ARPAbet phonemes
+        assert char_to_phoneme("A") == "en_AH0"
+        assert char_to_phoneme("b") == "en_B-IY1"
 
     def test_unknown_char(self):
         assert char_to_phoneme("123") == "<SP>"
@@ -193,8 +194,8 @@ class TestSectionHelpers:
 class TestBuildCollapsedSlots:
     def test_no_duplicates(self):
         tokens = [
-            {"text": "A", "phoneme": "en_a", "duration": 0.3, "note_pitch": 60, "note_type": 2},
-            {"text": "B", "phoneme": "en_b", "duration": 0.3, "note_pitch": 62, "note_type": 2},
+            {"text": "A", "phoneme": "en_AH0", "duration": 0.3, "note_pitch": 60, "note_type": 2},
+            {"text": "B", "phoneme": "en_B-IY1", "duration": 0.3, "note_pitch": 62, "note_type": 2},
         ]
         slots = _build_collapsed_slots(tokens)
         assert len(slots) == 2
@@ -203,9 +204,9 @@ class TestBuildCollapsedSlots:
 
     def test_with_duplicates(self):
         tokens = [
-            {"text": "A", "phoneme": "en_a", "duration": 0.3, "note_pitch": 60, "note_type": 2},
-            {"text": "A", "phoneme": "en_a", "duration": 0.3, "note_pitch": 60, "note_type": 2},
-            {"text": "B", "phoneme": "en_b", "duration": 0.3, "note_pitch": 62, "note_type": 2},
+            {"text": "A", "phoneme": "en_AH0", "duration": 0.3, "note_pitch": 60, "note_type": 2},
+            {"text": "A", "phoneme": "en_AH0", "duration": 0.3, "note_pitch": 60, "note_type": 2},
+            {"text": "B", "phoneme": "en_B-IY1", "duration": 0.3, "note_pitch": 62, "note_type": 2},
         ]
         slots = _build_collapsed_slots(tokens)
         assert len(slots) == 2
@@ -224,7 +225,7 @@ class TestBuildCollapsedSlots:
 class TestSplitToken:
     def test_split_halves_duration(self):
         tokens = [
-            {"text": "A", "phoneme": "en_a", "duration": 1.0, "note_pitch": 60, "note_type": 2},
+            {"text": "A", "phoneme": "en_AH0", "duration": 1.0, "note_pitch": 60, "note_type": 2},
         ]
         _split_token(tokens, 0)
         assert len(tokens) == 2
@@ -234,7 +235,7 @@ class TestSplitToken:
 
     def test_split_preserves_internal_tags(self):
         tokens = [
-            {"text": "A", "phoneme": "en_a", "duration": 1.0,
+            {"text": "A", "phoneme": "en_AH0", "duration": 1.0,
              "note_pitch": 60, "note_type": 2, "_sec_id": 5},
         ]
         _split_token(tokens, 0)
