@@ -36,6 +36,7 @@
 - **固定/灵活停顿模式**（`fixed_pause` 开关，默认固定）：
   - 固定模式：SP 时长保持原样
   - 灵活模式：当 SP 时长 ≥ 2 倍 token 平均时长或 token 平均时长 < 0.30s 时，自动将 SP 时间按节奏比例匀给句内 token，总时长守恒
+- **变速功能**（`speed` 参数，默认 1.0）：duration 按比例缩放，f0 同步线性插值重采样（帧数随速度等比变化，音高轮廓不变）
 
 ---
 
@@ -88,6 +89,7 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 | `high_pitch_threshold` | INT | 高音阈值 0-127（默认 79 = G5） |
 | `fixed_pause` | BOOLEAN | 固定停顿模式（默认 Fixed=ON，Flexible=OFF 时 SP 时间可匀给 token） |
 | `split_mode` | COMBO [`token`, `duration`] | 字数分配模式：token 按原曲 token 数比例，duration 按原曲时长比例（默认 token） |
+| `speed` | FLOAT | 变速倍率（0.1~3.0，默认 1.0），duration 和 f0 同步缩放 |
 
 **输出：**
 
@@ -113,6 +115,7 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 7. 空 token 的 duration 重分配给同 section 的已填 token
 8. 所有非 SP token 的 duration 不低于 0.30s
 9. 灵活停顿模式下（`fixed_pause=Flexible`）：当 SP ≥ 2 倍 token 平均时长或 token 平均时长 < 0.30s 时，SP 降至 token 平均时长，释放时间按比例分给 token（总时长守恒）
+10. 变速模式下（`speed ≠ 1.0`）：所有 duration 乘以速度倍率，f0 同步线性插值重采样（帧数等比变化）
 
 **分类：** `MIDI-Edit`
 

@@ -807,7 +807,8 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     force_tone4_high_pitch: bool = False,
                      high_pitch_threshold: int = 79,
                      fixed_pause: bool = True,
-                     split_mode: str = "token") -> str:
+                     split_mode: str = "token",
+                     speed: float = 1.0) -> str:
     """Replace lyrics in MIDI JSON with smart 3-mode algorithm.
 
     Splits user lyrics by newlines/punctuation into sentences, each mapped to
@@ -1076,7 +1077,70 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
         # dict(track) already preserves the original f0 from the input.
         result.append(new_track)
 
+    # --- Speed adjustment ---
+    if speed != 1.0:
+        result = _apply_speed(result, speed)
+
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _apply_speed(midi_data: list, speed: float) -> list:
+    """Apply speed change to all tracks: scale durations and resample f0.
+
+    Args:
+        midi_data: List of track dicts (already processed by replace_lyrics).
+        speed: Speed multiplier (e.g. 1.2 = 20% faster, 0.8 = 20% slower).
+
+    Returns:
+        Modified midi_data with scaled durations and resampled f0.
+    """
+    import numpy as _np
+
+    for track in midi_data:
+        # Scale durations
+        if "duration" in track:
+            dur_vals = [float(x) * speed for x in track["duration"].split(" ")]
+            track["duration"] = " ".join(_fmt_dur(d) for d in dur_vals)
+
+        # Resample f0 (frame-level data at ~50fps)
+        if "f0" in track and track["f0"].strip():
+            f0_vals = [float(x) for x in track["f0"].split(" ")]
+            orig_len = len(f0_vals)
+            new_len = max(1, round(orig_len * speed))
+
+            if new_len == orig_len:
+                # No change needed
+                track["f0"] = " ".join(_fmt_f0(v) for v in f0_vals)
+            elif new_len > orig_len:
+                # Stretch: linear interpolation
+                old_indices = _np.linspace(0, orig_len - 1, orig_len)
+                new_indices = _np.linspace(0, orig_len - 1, new_len)
+                resampled = _np.interp(new_indices, old_indices, f0_vals)
+                track["f0"] = " ".join(_fmt_f0(v) for v in resampled)
+            else:
+                # Shrink: linear interpolation then take fewer samples
+                old_indices = _np.linspace(0, orig_len - 1, orig_len)
+                new_indices = _np.linspace(0, orig_len - 1, new_len)
+                resampled = _np.interp(new_indices, old_indices, f0_vals)
+                track["f0"] = " ".join(_fmt_f0(v) for v in resampled)
+
+    return midi_data
+
+
+def _fmt_dur(v: float) -> str:
+    """Format a duration value, cleaning up float artifacts."""
+    # Round to 4 decimal places, strip trailing zeros
+    s = f"{v:.4f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def _fmt_f0(v) -> str:
+    """Format an f0 value, cleaning up float artifacts."""
+    f = float(v)
+    if f == 0.0:
+        return "0.0"
+    s = f"{f:.1f}".rstrip("0").rstrip(".")
+    return s if s else "0"
 
 
 def extract_lyrics(midi_json_str: str, merge_repeated: bool = False) -> str:
@@ -1158,6 +1222,7 @@ class MIDIEditLyrics:
                  "high_pitch_threshold": ("INT", {"default": 79, "min": 0, "max": 127, "step": 1}),
                 "fixed_pause": ("BOOLEAN", {"default": True, "label_on": "Fixed", "label_off": "Flexible"}),
                 "split_mode": (["token", "duration"], {"default": "token"}),
+                "speed": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.1, "round": 0.01}),
             }
         }
 
@@ -1179,18 +1244,22 @@ class MIDIEditLyrics:
         "Flexible Pause: when tokens are crowded or SP is overly long, "
         "redistribute SP time proportionally to tokens. "
         "Split Mode: 'token' = allocate chars by original token count proportion; "
-        "'duration' = allocate chars by original section duration proportion."
+        "'duration' = allocate chars by original section duration proportion. "
+        "Speed: adjust playback speed (1.0 = normal, >1 faster, <1 slower). "
+        "Duration and f0 are scaled proportionally."
     )
 
     def edit_lyrics(self, midi_json: str, new_lyrics: str,
                     force_tone4: bool, high_pitch_threshold: int,
-                    fixed_pause: bool, split_mode: str) -> tuple:
+                    fixed_pause: bool, split_mode: str,
+                    speed: float) -> tuple:
         try:
             return (replace_lyrics(midi_json, new_lyrics,
                                     force_tone4_high_pitch=force_tone4,
                                     high_pitch_threshold=high_pitch_threshold,
                                     fixed_pause=fixed_pause,
-                                    split_mode=split_mode),)
+                                    split_mode=split_mode,
+                                    speed=speed),)
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid MIDI JSON input: {e}") from e
         except ValueError as e:

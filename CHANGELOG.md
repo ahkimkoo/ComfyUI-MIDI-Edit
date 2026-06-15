@@ -2,6 +2,16 @@
 
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
+## [2026-06-15] v1.7.0
+
+### Added
+
+- **变速功能**（`speed` 参数，默认 1.0）
+  - 范围 0.1 ~ 3.0，步进 0.1
+  - `duration` 按比例缩放（`*= speed`）
+  - `f0` 按比例线性插值重采样（帧数 = `round(原帧数 × speed)`），音高轮廓不变，只拉伸/压缩时间轴
+  - 浮点精度清理：duration 保留 4 位有效小数，f0 保留 1 位小数
+
 ## [2026-06-12] v1.6.0
 
 ### Added
