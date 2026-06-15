@@ -1165,6 +1165,30 @@ class TestApplySpeed:
         f0_out = result[0]["f0"].split(" ")
         assert len(f0_out) == 150
 
+    def test_time_field_scaled(self):
+        """time field [start, end] should be scaled by speed."""
+        midi = [{"duration": "0.5", "f0": "100.0 200.0", "time": [0, 1000]}]
+        result = _apply_speed(midi, 2.0)
+        assert result[0]["time"] == [0, 2000]
+
+    def test_time_field_slower(self):
+        """time field should shrink when speed < 1."""
+        midi = [{"duration": "0.5", "f0": "100.0 200.0", "time": [0, 15000]}]
+        result = _apply_speed(midi, 0.5)
+        assert result[0]["time"] == [0, 7500]
+
+    def test_time_field_missing(self):
+        """Missing time field should not crash."""
+        midi = [{"duration": "0.5", "f0": "100.0"}]
+        result = _apply_speed(midi, 2.0)
+        assert "time" not in result[0]
+
+    def test_time_field_not_list(self):
+        """time field that is not a list should be left alone."""
+        midi = [{"duration": "0.5", "f0": "100.0", "time": "0,1000"}]
+        result = _apply_speed(midi, 2.0)
+        assert result[0]["time"] == "0,1000"
+
 
 class TestSpeedIntegration:
     """Integration tests for speed in replace_lyrics."""

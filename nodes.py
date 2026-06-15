@@ -1102,6 +1102,10 @@ def _apply_speed(midi_data: list, speed: float) -> list:
             dur_vals = [float(x) * speed for x in track["duration"].split(" ")]
             track["duration"] = " ".join(_fmt_dur(d) for d in dur_vals)
 
+        # Scale time range (used by downstream to preallocate audio buffer)
+        if "time" in track and isinstance(track["time"], list) and len(track["time"]) == 2:
+            track["time"] = [round(track["time"][0] * speed), round(track["time"][1] * speed)]
+
         # Resample f0 (frame-level data at ~50fps)
         if "f0" in track and track["f0"].strip():
             f0_vals = [float(x) for x in track["f0"].split(" ")]
