@@ -115,8 +115,10 @@ class TestCleanLyrics:
     def test_removes_punctuation(self):
         assert clean_lyrics("你好，世界！") == "你好世界"
 
-    def test_removes_spaces_and_newlines(self):
-        assert clean_lyrics("hello world\nnew line") == "helloworldnewline"
+    def test_removes_punctuation_keeps_spaces(self):
+        # clean_lyrics now preserves spaces (needed for English word boundaries)
+        assert clean_lyrics("hello world\nnew line") == "hello worldnew line"
+        assert clean_lyrics("你好，世界！") == "你好世界"
 
     def test_keeps_chinese_and_english(self):
         assert clean_lyrics("A你好B") == "A你好B"
@@ -134,7 +136,7 @@ class TestMergeRepeatedChars:
         assert merge_repeated_chars("") == ""
 
     def test_single_char(self):
-        assert merge_repeated_chars("A") == "A"
+        assert merge_repeated_chars("啊") == "啊"
 
 
 # ===================================================================
@@ -183,9 +185,9 @@ class TestSectionHelpers:
         assert _get_section_sizes(midi) == [2, 3]
 
     def test_split_by_section_sizes(self):
-        assert _split_by_section_sizes("ABCDE", [2, 3]) == ["AB", "CDE"]
-        assert _split_by_section_sizes("ABC", [2, 3]) == ["AB", "C"]
-        assert _split_by_section_sizes("A", [3]) == ["A"]
+        assert _split_by_section_sizes("你好吗啊我", [2, 3]) == ["你好", "吗啊我"]
+        assert _split_by_section_sizes("你好吗", [2, 3]) == ["你好", "吗"]
+        assert _split_by_section_sizes("啊", [3]) == ["啊"]
 
 
 # ===================================================================
@@ -196,24 +198,24 @@ class TestSectionHelpers:
 class TestBuildCollapsedSlots:
     def test_no_duplicates(self):
         tokens = [
-            {"text": "A", "phoneme": "en_AH0", "duration": 0.3, "note_pitch": 60, "note_type": 2},
-            {"text": "B", "phoneme": "en_B", "duration": 0.3, "note_pitch": 62, "note_type": 2},
+            {"text": "啊", "phoneme": "en_AH0", "duration": 0.3, "note_pitch": 60, "note_type": 2},
+            {"text": "吧", "phoneme": "en_B", "duration": 0.3, "note_pitch": 62, "note_type": 2},
         ]
         slots = _build_collapsed_slots(tokens)
         assert len(slots) == 2
-        assert slots[0] == ("A", 1, [0])
-        assert slots[1] == ("B", 1, [1])
+        assert slots[0] == ("啊", 1, [0])
+        assert slots[1] == ("吧", 1, [1])
 
     def test_with_duplicates(self):
         tokens = [
-            {"text": "A", "phoneme": "en_AH0", "duration": 0.3, "note_pitch": 60, "note_type": 2},
-            {"text": "A", "phoneme": "en_AH0", "duration": 0.3, "note_pitch": 60, "note_type": 2},
-            {"text": "B", "phoneme": "en_B", "duration": 0.3, "note_pitch": 62, "note_type": 2},
+            {"text": "啊", "phoneme": "en_AH0", "duration": 0.3, "note_pitch": 60, "note_type": 2},
+            {"text": "啊", "phoneme": "en_AH0", "duration": 0.3, "note_pitch": 60, "note_type": 2},
+            {"text": "吧", "phoneme": "en_B", "duration": 0.3, "note_pitch": 62, "note_type": 2},
         ]
         slots = _build_collapsed_slots(tokens)
         assert len(slots) == 2
-        assert slots[0] == ("A", 2, [0, 1])
-        assert slots[1] == ("B", 1, [2])
+        assert slots[0] == ("啊", 2, [0, 1])
+        assert slots[1] == ("吧", 1, [2])
 
     def test_empty(self):
         assert _build_collapsed_slots([]) == []
@@ -227,7 +229,7 @@ class TestBuildCollapsedSlots:
 class TestSplitToken:
     def test_split_halves_duration(self):
         tokens = [
-            {"text": "A", "phoneme": "en_AH0", "duration": 1.0, "note_pitch": 60, "note_type": 2},
+            {"text": "啊", "phoneme": "en_AH0", "duration": 1.0, "note_pitch": 60, "note_type": 2},
         ]
         _split_token(tokens, 0)
         assert len(tokens) == 2
@@ -237,7 +239,7 @@ class TestSplitToken:
 
     def test_split_preserves_internal_tags(self):
         tokens = [
-            {"text": "A", "phoneme": "en_AH0", "duration": 1.0,
+            {"text": "啊", "phoneme": "en_AH0", "duration": 1.0,
              "note_pitch": 60, "note_type": 2, "_sec_id": 5},
         ]
         _split_token(tokens, 0)
@@ -258,79 +260,64 @@ class TestProcessSection:
         ]
 
     def test_collapse_mode_right_aligns(self):
-        """Bug 1 fix: Collapse mode should right-align, mapping last char to last slot."""
-        # 3 slots, 2 chars → skip first slot, map to last 2
-        tokens = self._make_tokens(["A", "B", "C"], [0.3, 0.3, 1.0])
-        _process_section(tokens, "XY", False, 79)
-        # First slot should be empty, last 2 filled
+        """Collapse mode right-aligns: last char → last slot."""
+        # Use Chinese chars (each is always 1 unit)
+        tokens = self._make_tokens(["啊", "吧", "呲"], [0.3, 0.3, 1.0])
+        _process_section(tokens, "你好", False, 79)
         assert tokens[0]["text"] == ""
-        assert tokens[1]["text"] == "X"
-        assert tokens[2]["text"] == "Y"
+        assert tokens[1]["text"] == "你"
+        assert tokens[2]["text"] == "好"
 
     def test_collapse_mode_right_align_preserves_long_note(self):
-        """The longest note (last slot) should retain its text in collapse mode."""
-        tokens = self._make_tokens(["A", "B", "C", "D"], [0.3, 0.3, 0.3, 1.08])
-        # 3 chars, 4 slots → skip first slot
-        _process_section(tokens, "XYZ", False, 79)
+        tokens = self._make_tokens(["啊", "吧", "呲", "的"], [0.3, 0.3, 0.3, 1.08])
+        _process_section(tokens, "你好吗", False, 79)
         assert tokens[0]["text"] == ""
-        assert tokens[1]["text"] == "X"
-        assert tokens[2]["text"] == "Y"
-        assert tokens[3]["text"] == "Z"
-        # Last slot (Z) keeps the long duration
+        assert tokens[1]["text"] == "你"
+        assert tokens[2]["text"] == "好"
+        assert tokens[3]["text"] == "吗"
         assert tokens[3]["duration"] == pytest.approx(1.08)
 
     def test_collapse_equal_slots_no_skip(self):
-        """When N == S, no slots are skipped (skip_count = 0)."""
-        tokens = self._make_tokens(["A", "B", "C"], [0.3, 0.3, 0.3])
-        _process_section(tokens, "XYZ", False, 79)
-        assert tokens[0]["text"] == "X"
-        assert tokens[1]["text"] == "Y"
-        assert tokens[2]["text"] == "Z"
+        tokens = self._make_tokens(["啊", "吧", "呲"], [0.3, 0.3, 0.3])
+        _process_section(tokens, "你好吗", False, 79)
+        assert tokens[0]["text"] == "你"
+        assert tokens[1]["text"] == "好"
+        assert tokens[2]["text"] == "吗"
 
     def test_expand_mode_splits_tokens(self):
-        """Expand mode should split longest tokens until count matches."""
-        tokens = self._make_tokens(["A", "B"], [0.6, 0.4])
-        _process_section(tokens, "WXYZ", False, 79)
+        tokens = self._make_tokens(["啊", "吧"], [0.6, 0.4])
+        _process_section(tokens, "你好吗啊", False, 79)
         assert len(tokens) == 4
-        assert tokens[0]["text"] == "W"
-        assert tokens[1]["text"] == "X"
-        assert tokens[2]["text"] == "Y"
-        assert tokens[3]["text"] == "Z"
+        assert tokens[0]["text"] == "你"
+        assert tokens[1]["text"] == "好"
+        assert tokens[2]["text"] == "吗"
+        assert tokens[3]["text"] == "啊"
 
     def test_empty_sentence_empties_all(self):
-        """Empty sentence should empty all token text/phoneme."""
-        tokens = self._make_tokens(["A", "B"], [0.3, 0.3])
+        tokens = self._make_tokens(["啊", "吧"], [0.3, 0.3])
         _process_section(tokens, "", False, 79)
         assert all(t["text"] == "" for t in tokens)
 
     def test_empty_tokens_returns_empty(self):
-        """Empty token list should return as-is."""
-        result = _process_section([], "ABC", False, 79)
+        result = _process_section([], "你好", False, 79)
         assert result == []
 
     def test_collapse_distribute_mode(self):
-        """Collapse+Distribute: multi-count slots distribute chars to individual tokens."""
-        # "A A B C" → slots: A(×2, [0,1]), B(×1, [2]), C(×1, [3])
-        # S=3, M=4. Sentence "WXYZ" → N=4. S < N <= M → Collapse+Distribute
-        tokens = self._make_tokens(["A", "A", "B", "C"], [0.29, 0.29, 0.40, 1.73])
-        _process_section(tokens, "WXYZ", False, 79)
-        assert tokens[0]["text"] == "W"
-        assert tokens[1]["text"] == "X"
-        assert tokens[2]["text"] == "Y"
-        assert tokens[3]["text"] == "Z"
+        # "啊 啊 吧 呲" → slots: 啊(×2, [0,1]), 吧(×1, [2]), 呲(×1, [3])
+        tokens = self._make_tokens(["啊", "啊", "吧", "呲"], [0.29, 0.29, 0.40, 1.73])
+        _process_section(tokens, "你好吗啊", False, 79)
+        assert tokens[0]["text"] == "你"
+        assert tokens[1]["text"] == "好"
+        assert tokens[2]["text"] == "吗"
+        assert tokens[3]["text"] == "啊"
 
     def test_collapse_distribute_partial_fill(self):
         """Collapse+Distribute: when N < total capacity, trailing slot tokens are emptied."""
-        # "A A A B" → slots: A(×3, [0,1,2]), B(×1, [3])
-        # S=2, M=4. Sentence "WXYZ" → N=4. S < N <= M → Collapse+Distribute
-        # A slot gets W,X,Y; B slot gets Z. No empties since N=M=4.
-        # For partial fill, use N=3: S < 3 < M=4
-        tokens = self._make_tokens(["A", "A", "A", "B"], [0.29, 0.29, 0.40, 1.73])
-        _process_section(tokens, "WXY", False, 79)
-        # A slot(×3): gets "W","X","Y"; B slot(×1): empty
-        assert tokens[0]["text"] == "W"
-        assert tokens[1]["text"] == "X"
-        assert tokens[2]["text"] == "Y"
+        tokens = self._make_tokens(["啊", "啊", "啊", "吧"], [0.29, 0.29, 0.40, 1.73])
+        _process_section(tokens, "你好吗", False, 79)
+        assert tokens[0]["text"] == "你"
+        assert tokens[1]["text"] == "好"
+        assert tokens[2]["text"] == "吗"
         assert tokens[3]["text"] == ""
 
     def test_collapse_distribute_tiantian_case(self):
@@ -373,9 +360,9 @@ class TestReplaceLyrics:
             "0 60 62 0",
             "1 2 2 1",
         )])
-        result = json.loads(replace_lyrics(orig, "XY"))
+        result = json.loads(replace_lyrics(orig, "你好"))
         tokens = result[0]["text"].split(" ")
-        assert tokens == ["<SP>", "X", "Y", "<SP>"]
+        assert tokens == ["<SP>", "你", "好", "<SP>"]
 
     def test_collapse_right_align_integration(self):
         """Integration: collapse mode should right-align across full pipeline."""
@@ -387,31 +374,31 @@ class TestReplaceLyrics:
             "1 2 2 2 1",
         )])
         # 2 chars → 3 slots, should right-align (skip first slot)
-        result = json.loads(replace_lyrics(orig, "XY"))
+        result = json.loads(replace_lyrics(orig, "你好"))
         tokens = result[0]["text"].split(" ")
         durations = [float(x) for x in result[0]["duration"].split(" ")]
         # The last non-SP token should be 'Y' with the long duration ~1.0
         non_sp = [(t, d) for t, d in zip(tokens, durations) if t != "<SP>"]
-        assert non_sp[-1][0] == "Y"
+        assert non_sp[-1][0] == "好"
         assert non_sp[-1][1] > 0.8  # long duration preserved
 
     def test_min_duration_enforcement(self):
         """Min-duration (0.30s) only applies when Expand occurred (more chars than slots)."""
-        # 7 slots but 7 chars = Collapse, durations should NOT be modified
+        # 6 Chinese chars, 6 slots = perfect match, no expand, no collapse skip
         orig = json.dumps([_make_track(
-            "<SP> A B C D E F G <SP>",
-            "<SP> en_a en_b en_c en_d en_e en_f en_g <SP>",
-            "0.5 0.29 0.29 0.40 0.30 0.34 0.26 0.32 1.73 0.15",
-            "0 52 53 46 53 53 54 53 51 0",
-            "1 2 3 2 2 2 2 2 2 1",
+            "<SP> 啊 吧 呲 的 额 佛 <SP>",
+            "<SP> zh_a4 zh_ba1 zh_ci1 zh_de5 zh_e2 zh_fo2 <SP>",
+            "0.5 0.29 0.29 0.40 0.30 0.34 0.26 0.5",
+            "0 52 53 46 53 53 54 0",
+            "1 2 3 2 2 2 2 1",
         )])
-        result = json.loads(replace_lyrics(orig, "ABCDEFG"))
+        result = json.loads(replace_lyrics(orig, "你好吗啊我哎"))
         durations = [float(x) for x in result[0]["duration"].split(" ")]
         text = result[0]["text"].split(" ")
         non_sp = [(t, d) for t, d in zip(text, durations) if t != "<SP>"]
-        # Collapse mode: durations must be preserved exactly (min-dur NOT applied)
-        assert non_sp[0][1] == pytest.approx(0.29), "Collapse should preserve original duration"
-        assert non_sp[5][1] == pytest.approx(0.26), "Collapse should preserve short duration"
+        # Exact match: durations preserved exactly (no min-dur, no redistribution)
+        assert non_sp[0][1] == pytest.approx(0.29), "Exact match should preserve duration"
+        assert non_sp[5][1] == pytest.approx(0.26), "Short duration preserved"
 
     def test_min_duration_enforcement_on_expand(self):
         """Min-duration (0.30s) applies when Expand occurs (token split)."""
@@ -423,7 +410,7 @@ class TestReplaceLyrics:
             "0 60 62 64 0",
             "1 2 2 2 1",
         )])
-        result = json.loads(replace_lyrics(orig, "ABCDEF"))
+        result = json.loads(replace_lyrics(orig, "你好吗啊我"))
         durations = [float(x) for x in result[0]["duration"].split(" ")]
         text = result[0]["text"].split(" ")
         # After Expand, non-SP tokens should not be below 0.30s
@@ -441,25 +428,137 @@ class TestReplaceLyrics:
             "0 60 62 64 0",
             "1 2 2 2 1",
         )])
-        result = json.loads(replace_lyrics(orig, "XYZ"))
+        result = json.loads(replace_lyrics(orig, "你好吗"))
         result_dur = sum(float(x) for x in result[0]["duration"].split(" "))
         orig_total = sum(float(x) for x in orig_dur.split(" "))
         assert result_dur == pytest.approx(orig_total)
 
     def test_multi_sentence(self):
         orig = json.dumps([_make_track(
-            "<SP> A B <SP> C D E <SP>",
-            "<SP> en_a en_b <SP> en_c en_d en_e <SP>",
+            "<SP> 啊 吧 <SP> 呲 的 额 <SP>",
+            "<SP> zh_a4 zh_ba1 <SP> zh_ci1 zh_de5 zh_e2 <SP>",
             "0.5 0.3 0.3 0.5 0.3 0.3 0.3 0.5",
             "0 60 62 0 64 65 67 0",
             "1 2 2 1 2 2 2 1",
         )])
-        result = json.loads(replace_lyrics(orig, "XY\nABC"))
+        result = json.loads(replace_lyrics(orig, "你好\n呲啊吧"))
         tokens = result[0]["text"].split(" ")
-        # First section: XY, second section: ABC
         non_sp = [t for t in tokens if t != "<SP>"]
-        assert non_sp[:2] == ["X", "Y"]
-        assert non_sp[2:] == ["A", "B", "C"]
+        assert non_sp[:2] == ["你", "好"]
+        assert non_sp[2:] == ["呲", "啊", "吧"]
+
+
+# ===================================================================
+# English word-level processing
+# ===================================================================
+
+
+class TestEnglishWordLevel:
+    """Test English word-level phoneme generation and distribution."""
+
+    def test_build_units_chinese(self):
+        """Chinese chars → individual units."""
+        from nodes import _build_units
+        units = _build_units("你好")
+        assert len(units) == 2
+        assert all(not u["is_word"] for u in units)
+        assert units[0]["text"] == "你"
+
+    def test_build_units_english(self):
+        """English words → single word units."""
+        from nodes import _build_units
+        units = _build_units("hello world")
+        assert len(units) == 2
+        assert units[0]["text"] == "hello"
+        assert units[0]["is_word"]
+        assert units[1]["text"] == "world"
+        assert units[1]["is_word"]
+
+    def test_build_units_mixed(self):
+        """Mixed Chinese + English."""
+        from nodes import _build_units
+        units = _build_units("我love你")
+        assert len(units) == 3
+        assert units[0]["text"] == "我"
+        assert not units[0]["is_word"]
+        assert units[1]["text"] == "love"
+        assert units[1]["is_word"]
+        assert units[2]["text"] == "你"
+        assert not units[2]["is_word"]
+
+    def test_english_word_phoneme_is_arpabet(self):
+        """English word phonemes should be en_X-Y-Z format (ARPAbet)."""
+        from nodes import _build_units
+        units = _build_units("wish")
+        assert len(units) == 1
+        ph = units[0]["phoneme"]
+        assert ph.startswith("en_")
+        # Should contain multiple ARPAbet phones joined by dash
+        parts = ph[3:].split("-")
+        assert len(parts) >= 2  # "wish" = W-IH1-SH = 4 phones
+
+    def test_english_proportional_distribution(self):
+        """English words with fewer units than slots → proportional distribution."""
+        # 5 slots with distinct texts (so collapse doesn't merge them)
+        tokens = [
+            {"text": c, "phoneme": f"zh_{c}", "duration": 0.3,
+             "note_pitch": 60, "note_type": 2}
+            for c in "啊吧呲的额"
+        ]
+        _process_section(tokens, "hello world", False, 79)
+        texts = [t["text"] for t in tokens]
+        types = [t["note_type"] for t in tokens]
+        # All tokens should have text (either "hello" or "world")
+        assert all(t in ("hello", "world") for t in texts)
+        # First token of each word = type 2, rest = type 3
+        assert types[0] == 2  # first "hello"
+        world_start = texts.index("world")
+        assert types[world_start] == 2  # first "world"
+        for i in range(1, world_start):
+            assert types[i] == 3  # continuation of "hello"
+
+    def test_english_continuation_note_type(self):
+        """English word spanning multiple notes: first=type2, rest=type3."""
+        tokens = [
+            {"text": c, "phoneme": f"zh_{c}", "duration": 0.3,
+             "note_pitch": 60, "note_type": 2}
+            for c in "啊吧呲"
+        ]
+        _process_section(tokens, "hello", False, 79)
+        assert all(t["text"] == "hello" for t in tokens)
+        assert tokens[0]["note_type"] == 2
+        assert tokens[1]["note_type"] == 3
+        assert tokens[2]["note_type"] == 3
+
+    def test_english_chinese_mixed_distribution(self):
+        """Mixed: Chinese chars get 1 slot each, English words get extra slots."""
+        tokens = [
+            {"text": c, "phoneme": f"zh_{c}", "duration": 0.3,
+             "note_pitch": 60, "note_type": 2}
+            for c in "啊吧呲的"
+        ]
+        _process_section(tokens, "你 hello", False, 79)
+        texts = [t["text"] for t in tokens]
+        types = [t["note_type"] for t in tokens]
+        assert texts[0] == "你"
+        assert types[0] == 2
+        assert all(t == "hello" for t in texts[1:])
+        assert types[1] == 2  # first "hello"
+        assert types[2] == 3  # continuation
+        assert types[3] == 3  # continuation
+
+    def test_english_word_phoneme_consistency(self):
+        """All tokens of the same English word should share the same phoneme."""
+        tokens = [
+            {"text": "x", "phoneme": "en_X", "duration": 0.3,
+             "note_pitch": 60, "note_type": 2}
+            for _ in range(4)
+        ]
+        _process_section(tokens, "wish", False, 79)
+        phs = [t["phoneme"] for t in tokens]
+        # All should have the same phoneme
+        assert len(set(phs)) == 1
+        assert phs[0].startswith("en_")
 
 
 # ===================================================================
@@ -470,15 +569,15 @@ class TestReplaceLyrics:
 class TestExtractLyrics:
     def test_basic_extraction(self):
         midi = json.dumps([_make_track(
-            "<SP> A B <SP>",
-            "<SP> en_a en_b <SP>",
+            "<SP> 你 好 <SP>",
+            "<SP> zh_ni3 zh_hao3 <SP>",
             "0.5 0.3 0.3 0.5",
             "0 60 62 0",
             "1 2 2 1",
         )])
         result = extract_lyrics(midi)
-        assert "A" in result
-        assert "B" in result
+        assert "你" in result
+        assert "好" in result
         assert "<SP>" not in result
 
     def test_invalid_json(self):
@@ -487,15 +586,15 @@ class TestExtractLyrics:
 
     def test_merge_repeated(self):
         midi = json.dumps([_make_track(
-            "A A B <SP>",
-            "en_a en_a en_b <SP>",
+            "你 你 好 <SP>",
+            "zh_ni3 zh_ni3 zh_hao3 <SP>",
             "0.3 0.3 0.3 0.5",
             "60 60 62 0",
             "2 2 2 1",
         )])
         result = extract_lyrics(midi, merge_repeated=True)
-        assert "AA" not in result
-        assert "A" in result
+        assert "你你" not in result
+        assert "你" in result
 
 
 # ===================================================================
@@ -542,10 +641,10 @@ class TestSplitToMiniSentence:
 
 class TestTokenIDConverter:
     def test_basic_conversion(self):
-        tokens = ["A", "B", "C", "<UNK>"]
+        tokens = ["啊", "吧", "呲", "<UNK>"]
         conv = _TokenIDConverter(tokens)
-        assert conv.tokens2ids(["A", "B", "C"]) == [0, 1, 2]
-        assert conv.tokens2ids(["A", "X"]) == [0, 3]  # unknown -> UNK id
+        assert conv.tokens2ids(["啊", "吧", "呲"]) == [0, 1, 2]
+        assert conv.tokens2ids(["啊", "你"]) == [0, 3]  # unknown -> UNK id
         assert conv.unk_id == 3
         assert conv.unk_symbol == "<UNK>"
 
@@ -708,7 +807,7 @@ class TestSmartSplitSentences:
         try:
             # 2 sections, slot counts [1, 1] → 8 chars → expected [4, 4]
             # AI cut at 4 → within tolerance
-            midi = self._make_midi_data([["A"], ["B"]])
+            midi = self._make_midi_data([["啊"], ["吧"]])
             result = _smart_split_sentences("ABCDEFGH", midi)
             assert len(result) == 2
             assert result[0] == "ABCD"
@@ -718,7 +817,7 @@ class TestSmartSplitSentences:
 
     def test_empty_input(self):
         """Empty lyrics → all sections get empty strings."""
-        midi = self._make_midi_data([["A", "B"], ["C"]])
+        midi = self._make_midi_data([["啊", "吧"], ["呲"]])
         result = _smart_split_sentences("", midi)
         assert result == ["", ""]
 
@@ -819,7 +918,7 @@ class TestFlexiblePause:
             "0 60 62 0",
             "1 2 2 1",
         )])
-        result = json.loads(replace_lyrics(orig, "XY", fixed_pause=True))
+        result = json.loads(replace_lyrics(orig, "你好", fixed_pause=True))
         durations = [float(x) for x in result[0]["duration"].split(" ")]
         text = result[0]["text"].split(" ")
         # SP durations should remain unchanged
@@ -836,7 +935,7 @@ class TestFlexiblePause:
             "0 60 62 0",
             "1 2 2 1",
         )])
-        result = json.loads(replace_lyrics(orig, "XY", fixed_pause=False))
+        result = json.loads(replace_lyrics(orig, "你好", fixed_pause=False))
         durations = [float(x) for x in result[0]["duration"].split(" ")]
         text = result[0]["text"].split(" ")
         # Total must be preserved
@@ -858,7 +957,7 @@ class TestFlexiblePause:
             "0 52 53 46 53 53 54 53 0",
             "1 2 3 2 2 2 2 2 1",
         )])
-        result = json.loads(replace_lyrics(orig, "ABCDEFG", fixed_pause=False))
+        result = json.loads(replace_lyrics(orig, "你好吗啊我哎", fixed_pause=False))
         durations = [float(x) for x in result[0]["duration"].split(" ")]
         text = result[0]["text"].split(" ")
         tok_durs = [d for t, d in zip(text, durations) if t != "<SP>"]
@@ -878,7 +977,7 @@ class TestFlexiblePause:
             "0 60 62 0",
             "1 2 2 1",
         )])
-        result = json.loads(replace_lyrics(orig, "XY", fixed_pause=False))
+        result = json.loads(replace_lyrics(orig, "你好", fixed_pause=False))
         durations = [float(x) for x in result[0]["duration"].split(" ")]
         # Should remain unchanged — no trigger condition met
         assert durations == [pytest.approx(0.5)] * 4
@@ -902,7 +1001,7 @@ class TestFlexiblePause:
             "0 60 62 0",
             "1 2 2 1",
         )])
-        result = json.loads(replace_lyrics(orig, "XY", fixed_pause=False))
+        result = json.loads(replace_lyrics(orig, "你好", fixed_pause=False))
         durations = [float(x) for x in result[0]["duration"].split(" ")]
         text = result[0]["text"].split(" ")
         tok_durs = [d for t, d in zip(text, durations) if t != "<SP>"]
@@ -1238,7 +1337,7 @@ class TestSpeedIntegration:
             "1 2 2 1",
             "0.0 0.0 267.2 267.2 0.0 0.0 0.0 0.0",
         )])
-        result = json.loads(replace_lyrics(orig, "XY", speed=2.0))
+        result = json.loads(replace_lyrics(orig, "你好", speed=2.0))
         durs = [float(x) for x in result[0]["duration"].split(" ")]
         # Total duration should halve (speed up = shorter)
         orig_total = 0.5 + 0.3 + 0.3 + 0.5
@@ -1258,8 +1357,8 @@ class TestSpeedIntegration:
             "0 60 62 0",
             "1 2 2 1",
         )])
-        result = replace_lyrics(orig, "XY")
-        result_default = replace_lyrics(orig, "XY", speed=1.0)
+        result = replace_lyrics(orig, "你好")
+        result_default = replace_lyrics(orig, "你好", speed=1.0)
         assert result == result_default
 
     def test_speed_slower_total_duration(self):
@@ -1272,7 +1371,7 @@ class TestSpeedIntegration:
             "1 2 2 1",
             "0.0 0.0 267.2 267.2 0.0 0.0 0.0 0.0",
         )])
-        result = json.loads(replace_lyrics(orig, "XY", speed=0.5))
+        result = json.loads(replace_lyrics(orig, "你好", speed=0.5))
         durs = [float(x) for x in result[0]["duration"].split(" ")]
         orig_total = 0.5 + 0.3 + 0.3 + 0.5
         new_total = sum(durs)

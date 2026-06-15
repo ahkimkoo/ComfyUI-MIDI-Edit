@@ -119,9 +119,50 @@ def char_to_phoneme(char: str, lang: str = "Mandarin") -> str:
     return "<SP>"
 
 
+def _word_to_phoneme(word: str) -> str:
+    """Convert an English word to its ARPAbet phoneme string (en_X-Y-Z)."""
+    g2p = _get_g2p_en()
+    result = g2p(word.lower())
+    return EN_FLAG + "-".join(result)
+
+
+def _build_units(sentence: str) -> list[dict]:
+    """Parse a sentence into a list of units for slot mapping.
+
+    Each unit is a dict:
+      - Chinese char: {"text": "你", "phoneme": "zh_ni3", "is_word": False}
+      - English word: {"text": "love", "phoneme": "en_L-AH1-V", "is_word": True}
+
+    English words stay as single units (matching SoulX-Singer's format where
+    one word = one token). Spaces serve as word delimiters and are excluded.
+    """
+    units: list[dict] = []
+    parts = sentence.split()
+    for part in parts:
+        if not part:
+            continue
+        i = 0
+        while i < len(part):
+            if is_chinese_char(part[i]):
+                ph = char_to_phoneme(part[i])
+                units.append({"text": part[i], "phoneme": ph, "is_word": False})
+                i += 1
+            elif part[i].isascii() and part[i].isalpha():
+                j = i
+                while j < len(part) and part[j].isascii() and part[j].isalpha():
+                    j += 1
+                word = part[i:j]
+                ph = _word_to_phoneme(word)
+                units.append({"text": word, "phoneme": ph, "is_word": True})
+                i = j
+            else:
+                i += 1  # skip punctuation
+    return units
+
+
 def clean_lyrics(text: str) -> str:
-    """Remove punctuation, spaces, and newlines. Keep only Chinese chars and English letters."""
-    return re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", text)
+    """Remove punctuation and newlines. Keep Chinese chars, English letters, and spaces."""
+    return re.sub(r"[^\u4e00-\u9fffA-Za-z ]", "", text)
 
 
 # --- Lyrics sentence splitting ---
@@ -134,9 +175,16 @@ def _split_lyrics_to_sentences(new_lyrics: str) -> list[str]:
     """Split user lyrics into sentences by newlines and punctuation.
 
     Returns a list of cleaned (non-empty) sentence strings.
+    Preserves spaces within sentences (needed for English word boundaries).
     """
     raw = _SENTENCE_DELIM_RE.split(new_lyrics)
-    return [clean_lyrics(s) for s in raw if clean_lyrics(s)]
+    result = []
+    for s in raw:
+        # Strip leading/trailing whitespace and collapse multiple spaces
+        cleaned = " ".join(s.split())
+        if cleaned:
+            result.append(cleaned)
+    return result
 
 
 def _count_total_sections(midi_data: list) -> int:
@@ -158,9 +206,10 @@ def _count_total_sections(midi_data: list) -> int:
 
 
 def _split_by_section_sizes(plain_text: str, section_sizes: list[int]) -> list[str]:
-    """Split plain text (no punctuation) into chunks matching original section sizes.
+    """Split plain text into chunks matching original section sizes.
 
     Walks through section_sizes, slicing plain_text at each boundary.
+    For English text (with spaces), cuts at word boundaries when possible.
     The last chunk gets whatever remains (may be shorter or empty).
     """
     result = []
@@ -170,7 +219,13 @@ def _split_by_section_sizes(plain_text: str, section_sizes: list[int]) -> list[s
             result.append("")
         else:
             end = min(pos + size, len(plain_text))
-            result.append(plain_text[pos:end])
+            # If in the middle of a word, extend to word boundary
+            if end < len(plain_text) and plain_text[end - 1] != " " and plain_text[end] != " ":
+                word_end = plain_text.find(" ", end)
+                if word_end != -1 and word_end < end + 20:  # don't extend too far
+                    end = word_end
+            chunk = plain_text[pos:end].strip()
+            result.append(chunk)
             pos = end
     return result
 
@@ -712,105 +767,193 @@ def _split_token(tokens: list[dict], idx: int) -> None:
 
 
 def _apply_char(tokens: list[dict], idx: int, char: str,
-                force_tone4: bool, threshold: int) -> None:
-    """Replace token text with *char*, regenerate phoneme, optional high-pitch adjustment."""
-    phoneme = char_to_phoneme(char)
-    if force_tone4 and phoneme.startswith(ZH_FLAG):
-        try:
-            if int(tokens[idx].get("note_pitch", 0)) >= threshold:
-                phoneme = re.sub(r"(\d)$", "4", phoneme)
-        except (ValueError, TypeError):
-            pass
+                force_tone4: bool, threshold: int,
+                preset_phoneme: str | None = None,
+                is_continuation: bool = False) -> None:
+    """Replace token text with *char*, regenerate phoneme, optional high-pitch adjustment.
+
+    If *preset_phoneme* is given (English word-level), use it instead of calling
+    char_to_phoneme. If *is_continuation* is True, set note_type to 3 (SoulX-Singer
+    continuation/tie marker for multi-note words).
+    """
+    if preset_phoneme is not None:
+        phoneme = preset_phoneme
+    else:
+        phoneme = char_to_phoneme(char)
+        if force_tone4 and phoneme.startswith(ZH_FLAG):
+            try:
+                if int(tokens[idx].get("note_pitch", 0)) >= threshold:
+                    phoneme = re.sub(r"(\d)$", "4", phoneme)
+            except (ValueError, TypeError):
+                pass
     tokens[idx]["text"] = char
     tokens[idx]["phoneme"] = phoneme
+    if is_continuation:
+        tokens[idx]["note_type"] = 3
+    elif tokens[idx].get("note_type") == 3:
+        tokens[idx]["note_type"] = 2
 
 
 def _process_section(
     tokens: list[dict], sentence: str,
     force_tone4_high_pitch: bool, high_pitch_threshold: int,
 ) -> list[dict]:
-    """Apply the 3-mode algorithm to a single section.
+    """Apply the slot-mapping algorithm to a single section.
 
-    Modes:
-    - Collapse (N <= S): map chars to slots (right-aligned), expand by repeat count.
-    - Collapse+Distribute (S < N <= M): assign chars to collapsed slots;
-      multi-count slots can accept multiple chars (one per token in the slot).
-    - Expand (N > M): split longest-duration tokens until count matches, then 1:1.
+    Supports Chinese (char-by-char) and English (word-level) and mixed.
+    Builds a unit list where each Chinese char or English word is one unit,
+    then distributes units across note slots.
+
+    Distribution modes:
+    - Collapse (N <= S): right-aligned, skip leading slots. For English words
+      when N < S, extra slots become continuation notes (type=3).
+    - Collapse+Distribute (S < N <= M): multi-count slots accept multiple units.
+    - Expand (N > M): split longest tokens, then 1:1.
     """
     if not tokens:
         return tokens
 
     if not sentence:
-        # No sentence available for this section — empty all text/phoneme
-        # (keep token count for timing/alignment).
         for tok in tokens:
             tok["text"] = ""
             tok["phoneme"] = ""
         return tokens
 
-    N = len(sentence)
+    units = _build_units(sentence)
+    N = len(units)
     M = len(tokens)
     slots = _build_collapsed_slots(tokens)
     S = len(slots)
 
+    has_english = any(u["is_word"] for u in units)
+
+    # --- English/mixed with fewer units than slots: proportional distribution ---
+    if has_english and N < S:
+        return _distribute_units_proportional(
+            tokens, units, slots, force_tone4_high_pitch, high_pitch_threshold
+        )
+
+    # --- Standard collapse / distribute / expand (works for Chinese and English) ---
     if N <= S:
-        # ===== Collapse mode (right-aligned) =====
-        # Skip the first (S-N) slots so that the last char maps to the
-        # last slot, preserving sustained endings (e.g. long final notes).
         skip_count = S - N
         for slot_idx, (_orig_char, _count, token_indices) in enumerate(slots):
             if slot_idx < skip_count:
-                # Skip: empty these slots
                 for ti in token_indices:
                     tokens[ti]["text"] = ""
                     tokens[ti]["phoneme"] = ""
             else:
-                char_idx = slot_idx - skip_count
-                new_char = sentence[char_idx]
+                unit_idx = slot_idx - skip_count
+                unit = units[unit_idx]
                 for ti in token_indices:
-                    _apply_char(tokens, ti, new_char,
-                                force_tone4_high_pitch, high_pitch_threshold)
+                    _apply_char(tokens, ti, unit["text"],
+                                force_tone4_high_pitch, high_pitch_threshold,
+                                preset_phoneme=unit["phoneme"],
+                                is_continuation=False)
         return tokens
 
     if N <= M:
-        # ===== Collapse + Distribute mode (S < N <= M) =====
-        # Assign chars to collapsed slots. Multi-count slots distribute
-        # up to `count` different chars (one per token in the slot).
-        remaining = list(sentence)
+        remaining = list(units)
         for _orig_char, count, token_indices in slots:
             if not remaining:
                 for ti in token_indices:
                     tokens[ti]["text"] = ""
                     tokens[ti]["phoneme"] = ""
             elif count == 1:
-                char = remaining.pop(0)
-                _apply_char(tokens, token_indices[0], char,
-                            force_tone4_high_pitch, high_pitch_threshold)
+                unit = remaining.pop(0)
+                _apply_char(tokens, token_indices[0], unit["text"],
+                            force_tone4_high_pitch, high_pitch_threshold,
+                            preset_phoneme=unit["phoneme"])
             else:
                 n_assign = min(count, len(remaining))
                 for j in range(n_assign):
-                    char = remaining.pop(0)
-                    _apply_char(tokens, token_indices[j], char,
-                                force_tone4_high_pitch, high_pitch_threshold)
+                    unit = remaining.pop(0)
+                    _apply_char(tokens, token_indices[j], unit["text"],
+                                force_tone4_high_pitch, high_pitch_threshold,
+                                preset_phoneme=unit["phoneme"])
                 for j in range(n_assign, count):
                     tokens[token_indices[j]]["text"] = ""
                     tokens[token_indices[j]]["phoneme"] = ""
         return tokens
 
-    # ===== Expand mode (N > M) =====
-    # Split longest tokens until count matches, then 1:1 mapping.
+    # Expand mode
     while len(tokens) < N:
         longest_idx = max(range(len(tokens)), key=lambda i: tokens[i]["duration"])
         _split_token(tokens, longest_idx)
 
     for i in range(min(N, len(tokens))):
-        _apply_char(tokens, i, sentence[i],
-                    force_tone4_high_pitch, high_pitch_threshold)
+        unit = units[i]
+        _apply_char(tokens, i, unit["text"],
+                    force_tone4_high_pitch, high_pitch_threshold,
+                    preset_phoneme=unit["phoneme"])
 
-    # Empty remaining tokens (don't keep original lyrics)
     for i in range(N, len(tokens)):
         tokens[i]["text"] = ""
         tokens[i]["phoneme"] = ""
+
+    return tokens
+
+
+def _distribute_units_proportional(
+    tokens: list[dict], units: list[dict], slots: list,
+    force_tone4: bool, threshold: int,
+) -> list[dict]:
+    """Distribute units across slots when there are fewer units than slots.
+
+    English words get multiple consecutive slots (first = type 2, rest = type 3
+    continuation). Chinese chars get exactly 1 slot each.
+
+    Allocation: each unit starts with 1 slot. Extra slots are distributed to
+    English words proportionally by word length. Chinese chars never expand.
+    """
+    N = len(units)
+    S = len(slots)
+
+    # Collect ALL token indices in order
+    all_token_indices: list[int] = []
+    for _, _, ti_list in slots:
+        all_token_indices.extend(ti_list)
+
+    total_tokens = len(all_token_indices)
+
+    # Base allocation: 1 per unit
+    allocation = [1] * N
+    extra = total_tokens - N
+
+    if extra > 0:
+        # Only English words can absorb extra slots
+        en_indices = [i for i, u in enumerate(units) if u["is_word"]]
+        if en_indices:
+            en_lens = [len(units[i]["text"]) for i in en_indices]
+            total_en_len = sum(en_lens)
+            for j, idx in enumerate(en_indices):
+                allocation[idx] += round(extra * en_lens[j] / total_en_len)
+
+            # Fix rounding
+            while sum(allocation) > total_tokens:
+                # Remove from largest English allocation
+                idx = max(en_indices, key=lambda i: allocation[i])
+                if allocation[idx] > 1:
+                    allocation[idx] -= 1
+                else:
+                    break
+            while sum(allocation) < total_tokens:
+                # Add to any English word
+                idx = min(en_indices, key=lambda i: allocation[i])
+                allocation[idx] += 1
+
+    # Assign units to consecutive token ranges
+    tok_pos = 0
+    for unit_idx in range(N):
+        unit = units[unit_idx]
+        count = allocation[unit_idx]
+        for j in range(count):
+            if tok_pos < total_tokens:
+                ti = all_token_indices[tok_pos]
+                _apply_char(tokens, ti, unit["text"],
+                            force_tone4, threshold,
+                            preset_phoneme=unit["phoneme"],
+                            is_continuation=(j > 0 and unit["is_word"]))
+                tok_pos += 1
 
     return tokens
 
