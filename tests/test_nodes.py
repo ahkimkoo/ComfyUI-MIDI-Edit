@@ -73,9 +73,11 @@ class TestCharToPhoneme:
         assert result != "zh_"  # should have actual pinyin
 
     def test_single_english_letter(self):
-        # Single letters go through g2p_en → ARPAbet phonemes
+        # Single letters use single ARPAbet phoneme (not letter name)
         assert char_to_phoneme("A") == "en_AH0"
-        assert char_to_phoneme("b") == "en_B-IY1"
+        assert char_to_phoneme("b") == "en_B"
+        assert char_to_phoneme("s") == "en_S"
+        assert char_to_phoneme("e") == "en_EH0"
 
     def test_unknown_char(self):
         assert char_to_phoneme("123") == "<SP>"
@@ -195,7 +197,7 @@ class TestBuildCollapsedSlots:
     def test_no_duplicates(self):
         tokens = [
             {"text": "A", "phoneme": "en_AH0", "duration": 0.3, "note_pitch": 60, "note_type": 2},
-            {"text": "B", "phoneme": "en_B-IY1", "duration": 0.3, "note_pitch": 62, "note_type": 2},
+            {"text": "B", "phoneme": "en_B", "duration": 0.3, "note_pitch": 62, "note_type": 2},
         ]
         slots = _build_collapsed_slots(tokens)
         assert len(slots) == 2
@@ -206,7 +208,7 @@ class TestBuildCollapsedSlots:
         tokens = [
             {"text": "A", "phoneme": "en_AH0", "duration": 0.3, "note_pitch": 60, "note_type": 2},
             {"text": "A", "phoneme": "en_AH0", "duration": 0.3, "note_pitch": 60, "note_type": 2},
-            {"text": "B", "phoneme": "en_B-IY1", "duration": 0.3, "note_pitch": 62, "note_type": 2},
+            {"text": "B", "phoneme": "en_B", "duration": 0.3, "note_pitch": 62, "note_type": 2},
         ]
         slots = _build_collapsed_slots(tokens)
         assert len(slots) == 2

@@ -80,12 +80,28 @@ def is_english_word(word: str) -> bool:
     return bool(word) and bool(_EN_WORD_RE.fullmatch(word))
 
 
+# Single English letter → single ARPAbet phoneme.
+# Letter-name pronunciation (e.g., g2p_en("s") → "EH1-S") produces multi-phoneme
+# tokens that don't fit in short MIDI notes (< 0.1s). Instead, map each letter to
+# its most common consonant/vowel sound so each note has exactly 1 phoneme.
+_EN_LETTER_TO_PHONEME: dict[str, str] = {
+    # Vowels — most common sound (schwa/short vowel)
+    "a": "AH0", "e": "EH0", "i": "IH0", "o": "OW0", "u": "AH0",
+    # Consonants — direct ARPAbet mapping
+    "b": "B", "c": "K", "d": "D", "f": "F", "g": "G",
+    "h": "HH", "j": "JH", "k": "K", "l": "L", "m": "M",
+    "n": "N", "p": "P", "q": "K", "r": "R", "s": "S",
+    "t": "T", "v": "V", "w": "W", "x": "K", "y": "Y", "z": "Z",
+}
+
+
 def char_to_phoneme(char: str, lang: str = "Mandarin") -> str:
     """Convert a single character to its phoneme representation.
 
-    Chinese chars  -> zh_<pinyin_with_tone>
-    English letters -> en_<ARPAbet_phonemes_joined_by_dash>  (via g2p_en)
-    Unknown / SP   -> <SP>
+    Chinese chars   -> zh_<pinyin_with_tone>
+    English letters -> en_<single ARPAbet phoneme>  (consonant/vowel, not letter name)
+    English words   -> en_<ARPAbet_phonemes_joined_by_dash>  (via g2p_en)
+    Unknown / SP    -> <SP>
     """
     if char == "<SP>":
         return "<SP>"
@@ -93,6 +109,9 @@ def char_to_phoneme(char: str, lang: str = "Mandarin") -> str:
         g2p = _get_g2p_zh()
         result = g2p(char, tone=True, char_split=False)
         return ZH_FLAG + result[0]
+    if len(char) == 1 and char.isascii() and char.isalpha():
+        # Single English letter — use single ARPAbet phoneme (not letter name)
+        return EN_FLAG + _EN_LETTER_TO_PHONEME.get(char.lower(), "AH0")
     if is_english_word(char):
         g2p = _get_g2p_en()
         result = g2p(char.lower())
