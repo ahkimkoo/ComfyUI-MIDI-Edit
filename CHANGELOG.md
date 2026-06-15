@@ -2,6 +2,17 @@
 
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
+## [2026-06-15] v1.7.1
+
+### Fixed
+
+- **Collapse 模式下 duration 不再被篡改**：当新歌词字数与原曲完全对应（N == S）时，duration 严格保持原值不变。此前 min-duration enforcement（0.30s 最低时长）会无条件把短 token 拉长并从长 token 借时间，破坏节奏。
+- **浮点精度统一为 2 位小数**：输出 duration 不再出现 `0.32000000000000006` 等浮点伪影。新增 `_fmt_durs()` 校正函数，在四舍五入后调整末元素以确保总计不变。
+
+### Changed
+
+- Min-duration enforcement 现在仅在 Expand（拆分 token）时生效，Collapse 模式完全跳过。
+
 ## [2026-06-15] v1.7.0
 
 ### Added

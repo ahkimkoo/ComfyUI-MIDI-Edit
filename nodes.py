@@ -923,22 +923,24 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                 # Clean up internal tag before output
                 tok.pop("_sec_id", None)
 
-            new_segments: list[tuple[str, object, int]] = []
+            new_segments: list[tuple[str, object, int, bool]] = []
             seg_id_counter = 0
             marker_idx = 0
             for orig_seg_type, _orig_seg_data in segments:
                 if orig_seg_type == "sp":
-                    new_segments.append(("sp", sp_markers[marker_idx][1], 0))
+                    new_segments.append(("sp", sp_markers[marker_idx][1], 0, False))
                     marker_idx += 1
                 else:
                     orig_count = len(_orig_seg_data)
-                    new_segments.append(("section", section_groups.get(seg_id_counter, []), orig_count))
+                    sec_group = section_groups.get(seg_id_counter, [])
+                    was_expanded = len(sec_group) > orig_count
+                    new_segments.append(("section", sec_group, orig_count, was_expanded))
                     seg_id_counter += 1
         else:
-            new_segments: list[tuple[str, object, int]] = []
+            new_segments: list[tuple[str, object, int, bool]] = []
             for seg_type, seg_data in segments:
                 if seg_type == "sp":
-                    new_segments.append(("sp", seg_data, 0))
+                    new_segments.append(("sp", seg_data, 0, False))
                 else:
                     orig_token_count = len(seg_data)
                     sentence = sentences[global_sec_idx] if global_sec_idx < len(sentences) else ""
@@ -946,7 +948,8 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
                     processed = _process_section(
                         seg_data, sentence, force_tone4_high_pitch, high_pitch_threshold,
                     )
-                    new_segments.append(("section", processed, orig_token_count))
+                    was_expanded = len(processed) > orig_token_count
+                    new_segments.append(("section", processed, orig_token_count, was_expanded))
 
         # Reconstruct track: emit tokens, removing empties, merging SPs.
         # Empty tokens' duration is either:
@@ -963,7 +966,7 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
         pending_sp: dict | None = None
         pending_empty_dur: float = 0.0
 
-        for seg_type, seg_data, orig_token_count in new_segments:
+        for seg_type, seg_data, orig_token_count, was_expanded in new_segments:
             if seg_type == "sp":
                 sp = dict(seg_data)
                 if pending_sp is not None:
@@ -992,8 +995,10 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
 
                 # Enforce minimum duration: boost tokens below 0.30s by borrowing
                 # from the longest token in the same section.
+                # Only applies when Expand occurred (token was split), because
+                # Collapse mode must preserve original durations exactly.
                 MIN_DUR = 0.30
-                if filled:
+                if filled and was_expanded:
                     needs_boost = [
                         (i, MIN_DUR - t["duration"])
                         for i, t in enumerate(filled)
@@ -1070,7 +1075,7 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
 
         new_track["text"] = " ".join(all_text)
         new_track["phoneme"] = " ".join(all_phoneme)
-        new_track["duration"] = " ".join(str(d) for d in all_duration)
+        new_track["duration"] = " ".join(_fmt_durs(all_duration))
         new_track["note_pitch"] = " ".join(str(p) for p in all_pitch)
         new_track["note_type"] = " ".join(str(t) for t in all_type)
         # f0 is NOT rebuilt — it is frame-level data, not token-level.
@@ -1104,7 +1109,7 @@ def _apply_speed(midi_data: list, speed: float) -> list:
         # Scale durations
         if "duration" in track:
             dur_vals = [float(x) * ratio for x in track["duration"].split(" ")]
-            track["duration"] = " ".join(_fmt_dur(d) for d in dur_vals)
+            track["duration"] = " ".join(_fmt_durs(dur_vals))
 
         # Scale time range (used by downstream to preallocate audio buffer)
         if "time" in track and isinstance(track["time"], list) and len(track["time"]) == 2:
@@ -1136,10 +1141,22 @@ def _apply_speed(midi_data: list, speed: float) -> list:
 
 
 def _fmt_dur(v: float) -> str:
-    """Format a duration value, cleaning up float artifacts."""
-    # Round to 4 decimal places, strip trailing zeros
-    s = f"{v:.4f}".rstrip("0").rstrip(".")
-    return s if s else "0"
+    """Format a duration value, cleaning up float artifacts. Keeps 2 decimal places."""
+    return f"{v:.2f}"
+
+
+def _fmt_durs(durations: list[float]) -> list[str]:
+    """Format a list of durations to 2 decimal places, adjusting the last
+    element so the rounded total matches the true total."""
+    if not durations:
+        return []
+    true_total = sum(durations)
+    rounded = [round(d, 2) for d in durations]
+    rounded_total = sum(rounded)
+    diff = round(true_total - rounded_total, 2)
+    if diff != 0 and rounded:
+        rounded[-1] = round(rounded[-1] + diff, 2)
+    return [f"{d:.2f}" for d in rounded]
 
 
 def _fmt_f0(v) -> str:

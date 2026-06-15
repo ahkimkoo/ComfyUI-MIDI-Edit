@@ -47,6 +47,7 @@ from nodes import (
     _get_section_durations,
     _apply_speed,
     _fmt_dur,
+    _fmt_durs,
     _fmt_f0,
     _code_mix_split_words,
     _split_to_mini_sentence,
@@ -392,7 +393,8 @@ class TestReplaceLyrics:
         assert non_sp[-1][1] > 0.8  # long duration preserved
 
     def test_min_duration_enforcement(self):
-        """Integration: tokens below 0.30s should be boosted by borrowing from longest."""
+        """Min-duration (0.30s) only applies when Expand occurred (more chars than slots)."""
+        # 7 slots but 7 chars = Collapse, durations should NOT be modified
         orig = json.dumps([_make_track(
             "<SP> A B C D E F G <SP>",
             "<SP> en_a en_b en_c en_d en_e en_f en_g <SP>",
@@ -403,10 +405,28 @@ class TestReplaceLyrics:
         result = json.loads(replace_lyrics(orig, "ABCDEFG"))
         durations = [float(x) for x in result[0]["duration"].split(" ")]
         text = result[0]["text"].split(" ")
-        # No non-SP token should be below 0.30s
+        non_sp = [(t, d) for t, d in zip(text, durations) if t != "<SP>"]
+        # Collapse mode: durations must be preserved exactly (min-dur NOT applied)
+        assert non_sp[0][1] == pytest.approx(0.29), "Collapse should preserve original duration"
+        assert non_sp[5][1] == pytest.approx(0.26), "Collapse should preserve short duration"
+
+    def test_min_duration_enforcement_on_expand(self):
+        """Min-duration (0.30s) applies when Expand occurs (token split)."""
+        # 3 slots but 6 chars → Expand mode: some tokens get split and may be < 0.30s
+        orig = json.dumps([_make_track(
+            "<SP> A B C <SP>",
+            "<SP> en_a en_b en_c <SP>",
+            "0.5 0.80 0.80 0.80 0.5",
+            "0 60 62 64 0",
+            "1 2 2 2 1",
+        )])
+        result = json.loads(replace_lyrics(orig, "ABCDEF"))
+        durations = [float(x) for x in result[0]["duration"].split(" ")]
+        text = result[0]["text"].split(" ")
+        # After Expand, non-SP tokens should not be below 0.30s
         for t, d in zip(text, durations):
             if t != "<SP>":
-                assert d >= 0.30, f"Token '{t}' has duration {d:.4f} < 0.30"
+                assert d >= 0.30, f"Token '{t}' has duration {d:.4f} < 0.30 (post-expand)"
 
     def test_duration_preserved_total(self):
         """Total duration should be preserved after replacement."""
@@ -1047,14 +1067,24 @@ class TestFmtDur:
     """Tests for _fmt_dur helper."""
 
     def test_clean_float(self):
-        assert _fmt_dur(0.3) == "0.3"
-        assert _fmt_dur(0.30000000000000004) == "0.3"
+        assert _fmt_dur(0.3) == "0.30"
+        assert _fmt_dur(0.30000000000000004) == "0.30"
+        assert _fmt_dur(0.32000000000000006) == "0.32"
 
     def test_precision(self):
-        assert _fmt_dur(0.12345) == "0.1235"
+        assert _fmt_dur(0.12345) == "0.12"
 
     def test_zero(self):
-        assert _fmt_dur(0.0) == "0"
+        assert _fmt_dur(0.0) == "0.00"
+
+    def test_fmt_durs_preserves_total(self):
+        """_fmt_durs adjusts last element to preserve total after rounding."""
+        # 7 × 0.242857 = 1.699999; each rounds to 0.24 → 1.68; adj last to 1.70
+        durs = [0.242857] * 7
+        result = _fmt_durs(durs)
+        vals = [float(x) for x in result]
+        assert vals[0] == 0.24
+        assert sum(vals) == pytest.approx(sum(durs), abs=0.01)
 
 
 class TestFmtF0:
@@ -1077,7 +1107,7 @@ class TestApplySpeed:
         """Speed 1.0 should not modify anything."""
         midi = [{"duration": "0.3 0.5 0.2", "f0": "0.0 267.2 0.0"}]
         result = _apply_speed(midi, 1.0)
-        assert result[0]["duration"] == "0.3 0.5 0.2"
+        assert result[0]["duration"] == "0.30 0.50 0.20"
         assert result[0]["f0"] == "0.0 267.2 0.0"
 
     def test_duration_scaled(self):
@@ -1142,8 +1172,8 @@ class TestApplySpeed:
         result = _apply_speed(midi, 1.5)
         assert "f0" not in result[0]
         durs = [float(x) for x in result[0]["duration"].split(" ")]
-        # speed 1.5 → duration / 1.5 = 0.3333
-        assert durs[0] == pytest.approx(0.3333, abs=0.001)
+        # speed 1.5 → duration / 1.5 = 0.3333, formatted as 0.33
+        assert durs[0] == pytest.approx(0.33, abs=0.01)
 
     def test_multi_track(self):
         """Multiple tracks should all be processed."""
