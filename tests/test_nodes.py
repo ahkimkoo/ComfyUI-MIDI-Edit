@@ -1081,38 +1081,38 @@ class TestApplySpeed:
         assert result[0]["f0"] == "0.0 267.2 0.0"
 
     def test_duration_scaled(self):
-        """Duration should be multiplied by speed."""
+        """Speed 2.0 (faster) → durations halved."""
         midi = [{"duration": "0.3 0.5 0.2", "f0": "0.0 267.2 0.0"}]
         result = _apply_speed(midi, 2.0)
         durs = [float(x) for x in result[0]["duration"].split(" ")]
-        assert durs == [pytest.approx(0.6), pytest.approx(1.0), pytest.approx(0.4)]
+        assert durs == [pytest.approx(0.15), pytest.approx(0.25), pytest.approx(0.1)]
 
     def test_duration_slower(self):
-        """Speed < 1 should shrink durations."""
+        """Speed 0.5 (slower) → durations doubled."""
         midi = [{"duration": "0.4 0.6", "f0": "0.0 267.2"}]
         result = _apply_speed(midi, 0.5)
         durs = [float(x) for x in result[0]["duration"].split(" ")]
-        assert durs == [pytest.approx(0.2), pytest.approx(0.3)]
+        assert durs == [pytest.approx(0.8), pytest.approx(1.2)]
 
     def test_f0_stretch(self):
-        """f0 should be stretched (more frames) when speed > 1."""
-        # 4 f0 frames → speed 2.0 → 8 frames (linear interpolation)
+        """Speed 0.5 (slower) → f0 gets more frames (stretched)."""
+        # 4 f0 frames → speed 0.5 → 8 frames (linear interpolation)
         f0_in = "100.0 200.0 300.0 400.0"
         midi = [{"duration": "1.0", "f0": f0_in}]
-        result = _apply_speed(midi, 2.0)
+        result = _apply_speed(midi, 0.5)
         f0_out = [float(x) for x in result[0]["f0"].split(" ")]
         assert len(f0_out) == 8
         # First and last should be preserved
         assert f0_out[0] == pytest.approx(100.0)
         assert f0_out[-1] == pytest.approx(400.0)
-        # Middle should be interpolated (index 3 in 8 frames = between 2nd and 3rd original)
+        # Middle should be interpolated
         assert f0_out[3] == pytest.approx(228.6, abs=1.0)
 
     def test_f0_shrink(self):
-        """f0 should be shrunk (fewer frames) when speed < 1."""
+        """Speed 2.0 (faster) → f0 gets fewer frames (shrunk)."""
         f0_in = "100.0 150.0 200.0 250.0 300.0 350.0 400.0 450.0"
         midi = [{"duration": "1.0", "f0": f0_in}]
-        result = _apply_speed(midi, 0.5)
+        result = _apply_speed(midi, 2.0)
         f0_out = [float(x) for x in result[0]["f0"].split(" ")]
         assert len(f0_out) == 4
         assert f0_out[0] == pytest.approx(100.0)
@@ -1122,7 +1122,7 @@ class TestApplySpeed:
         """Zero f0 values (silence) should stay zero after resampling."""
         f0_in = "0.0 0.0 0.0 0.0 267.2 267.2 0.0 0.0"
         midi = [{"duration": "1.0", "f0": f0_in}]
-        result = _apply_speed(midi, 2.0)
+        result = _apply_speed(midi, 0.5)
         f0_out = [float(x) for x in result[0]["f0"].split(" ")]
         assert len(f0_out) == 16
         # Early frames (silence) should be ~0
@@ -1142,7 +1142,8 @@ class TestApplySpeed:
         result = _apply_speed(midi, 1.5)
         assert "f0" not in result[0]
         durs = [float(x) for x in result[0]["duration"].split(" ")]
-        assert durs[0] == pytest.approx(0.75)
+        # speed 1.5 → duration / 1.5 = 0.3333
+        assert durs[0] == pytest.approx(0.3333, abs=0.001)
 
     def test_multi_track(self):
         """Multiple tracks should all be processed."""
@@ -1151,31 +1152,32 @@ class TestApplySpeed:
             {"duration": "1.0", "f0": "300.0 400.0 500.0 600.0"},
         ]
         result = _apply_speed(midi, 2.0)
-        assert float(result[0]["duration"]) == pytest.approx(1.0)
-        assert len(result[0]["f0"].split(" ")) == 4
-        assert float(result[1]["duration"]) == pytest.approx(2.0)
-        assert len(result[1]["f0"].split(" ")) == 8
+        # speed 2.0 → durations halved, f0 halved
+        assert float(result[0]["duration"]) == pytest.approx(0.25)
+        assert len(result[0]["f0"].split(" ")) == 1
+        assert float(result[1]["duration"]) == pytest.approx(0.5)
+        assert len(result[1]["f0"].split(" ")) == 2
 
     def test_f0_frame_ratio_preserved(self):
-        """Frame ratio should be exact speed multiplier."""
-        # 100 frames at speed 1.5 → 150 frames
+        """Frame count should be orig / speed."""
+        # 100 frames at speed 2.0 → 50 frames (faster = fewer frames)
         f0_in = " ".join(str(float(i)) for i in range(100))
         midi = [{"duration": "2.0", "f0": f0_in}]
-        result = _apply_speed(midi, 1.5)
+        result = _apply_speed(midi, 2.0)
         f0_out = result[0]["f0"].split(" ")
-        assert len(f0_out) == 150
+        assert len(f0_out) == 50
 
     def test_time_field_scaled(self):
-        """time field [start, end] should be scaled by speed."""
+        """time field [start, end] should shrink when speed > 1 (faster)."""
         midi = [{"duration": "0.5", "f0": "100.0 200.0", "time": [0, 1000]}]
         result = _apply_speed(midi, 2.0)
-        assert result[0]["time"] == [0, 2000]
+        assert result[0]["time"] == [0, 500]
 
     def test_time_field_slower(self):
-        """time field should shrink when speed < 1."""
+        """time field should grow when speed < 1 (slower)."""
         midi = [{"duration": "0.5", "f0": "100.0 200.0", "time": [0, 15000]}]
         result = _apply_speed(midi, 0.5)
-        assert result[0]["time"] == [0, 7500]
+        assert result[0]["time"] == [0, 30000]
 
     def test_time_field_missing(self):
         """Missing time field should not crash."""
@@ -1194,7 +1196,7 @@ class TestSpeedIntegration:
     """Integration tests for speed in replace_lyrics."""
 
     def test_speed_via_replace_lyrics(self):
-        """replace_lyrics with speed should scale durations and resample f0."""
+        """replace_lyrics with speed=2.0 (faster) should halve durations and f0 frames."""
         orig = json.dumps([_make_track(
             "<SP> A B <SP>",
             "<SP> en_a en_b <SP>",
@@ -1205,14 +1207,14 @@ class TestSpeedIntegration:
         )])
         result = json.loads(replace_lyrics(orig, "XY", speed=2.0))
         durs = [float(x) for x in result[0]["duration"].split(" ")]
-        # Total duration should double
+        # Total duration should halve (speed up = shorter)
         orig_total = 0.5 + 0.3 + 0.3 + 0.5
         new_total = sum(durs)
-        assert new_total == pytest.approx(orig_total * 2.0)
-        # f0 should have more frames
+        assert new_total == pytest.approx(orig_total / 2.0)
+        # f0 should have fewer frames
         orig_f0_count = len("0.0 0.0 267.2 267.2 0.0 0.0 0.0 0.0".split(" "))
         new_f0_count = len(result[0]["f0"].split(" "))
-        assert new_f0_count == round(orig_f0_count * 2.0)
+        assert new_f0_count == round(orig_f0_count / 2.0)
 
     def test_speed_default_unchanged(self):
         """Default speed=1.0 should not affect output."""
@@ -1228,7 +1230,7 @@ class TestSpeedIntegration:
         assert result == result_default
 
     def test_speed_slower_total_duration(self):
-        """Speed 0.5 should halve total duration."""
+        """Speed 0.5 (slower) should double total duration."""
         orig = json.dumps([_make_track(
             "<SP> A B <SP>",
             "<SP> en_a en_b <SP>",
@@ -1241,7 +1243,7 @@ class TestSpeedIntegration:
         durs = [float(x) for x in result[0]["duration"].split(" ")]
         orig_total = 0.5 + 0.3 + 0.3 + 0.5
         new_total = sum(durs)
-        assert new_total == pytest.approx(orig_total * 0.5)
+        assert new_total == pytest.approx(orig_total / 0.5)
         f0_count = len(result[0]["f0"].split(" "))
-        assert f0_count == 4  # 8 * 0.5 = 4
+        assert f0_count == 16  # 8 / 0.5 = 16
 

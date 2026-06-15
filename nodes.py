@@ -1089,28 +1089,32 @@ def _apply_speed(midi_data: list, speed: float) -> list:
 
     Args:
         midi_data: List of track dicts (already processed by replace_lyrics).
-        speed: Speed multiplier (e.g. 1.2 = 20% faster, 0.8 = 20% slower).
+        speed: Speed multiplier (e.g. 1.5 = 150% speed = faster = shorter duration,
+               0.5 = 50% speed = slower = longer duration).
+               duration_new = duration_orig / speed
 
     Returns:
         Modified midi_data with scaled durations and resampled f0.
     """
     import numpy as _np
 
+    ratio = 1.0 / speed  # duration scale factor (speed up → ratio < 1 → shorter)
+
     for track in midi_data:
         # Scale durations
         if "duration" in track:
-            dur_vals = [float(x) * speed for x in track["duration"].split(" ")]
+            dur_vals = [float(x) * ratio for x in track["duration"].split(" ")]
             track["duration"] = " ".join(_fmt_dur(d) for d in dur_vals)
 
         # Scale time range (used by downstream to preallocate audio buffer)
         if "time" in track and isinstance(track["time"], list) and len(track["time"]) == 2:
-            track["time"] = [round(track["time"][0] * speed), round(track["time"][1] * speed)]
+            track["time"] = [round(track["time"][0] * ratio), round(track["time"][1] * ratio)]
 
         # Resample f0 (frame-level data at ~50fps)
         if "f0" in track and track["f0"].strip():
             f0_vals = [float(x) for x in track["f0"].split(" ")]
             orig_len = len(f0_vals)
-            new_len = max(1, round(orig_len * speed))
+            new_len = max(1, round(orig_len * ratio))
 
             if new_len == orig_len:
                 # No change needed
