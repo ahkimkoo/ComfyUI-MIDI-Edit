@@ -137,6 +137,8 @@ def _build_units(sentence: str) -> list[dict]:
     one word = one token). Spaces serve as word delimiters and are excluded.
     """
     units: list[dict] = []
+    if not sentence:
+        return units
     parts = sentence.split()
     for part in parts:
         if not part:
@@ -162,6 +164,8 @@ def _build_units(sentence: str) -> list[dict]:
 
 def clean_lyrics(text: str) -> str:
     """Remove punctuation and newlines. Keep Chinese chars, English letters, and spaces."""
+    if not text:
+        return ""
     return re.sub(r"[^\u4e00-\u9fffA-Za-z ]", "", text)
 
 
@@ -177,6 +181,8 @@ def _split_lyrics_to_sentences(new_lyrics: str) -> list[str]:
     Returns a list of cleaned (non-empty) sentence strings.
     Preserves spaces within sentences (needed for English word boundaries).
     """
+    if not new_lyrics:
+        return []
     raw = _SENTENCE_DELIM_RE.split(new_lyrics)
     result = []
     for s in raw:
@@ -1000,6 +1006,10 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
     if not isinstance(midi_data, list):
         raise ValueError("MIDI JSON must be a list (array) of track objects")
 
+    # Guard against None / empty lyrics input
+    if not new_lyrics or not new_lyrics.strip():
+        return midi_json_str
+
     sentences = _split_lyrics_to_sentences(new_lyrics)
 
     # Smart split: when sentence count != original section count, use
@@ -1024,13 +1034,18 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
 
     result = []
     for track in midi_data:
-        if "text" not in track or "phoneme" not in track:
+        if not isinstance(track, dict):
+            result.append(track)
+            continue
+        track_text = track.get("text") or ""
+        track_phoneme = track.get("phoneme") or ""
+        if not track_text or not track_phoneme:
             result.append(track)
             continue
 
         # Parse all token arrays from the track
-        text_tokens = track["text"].split(" ")
-        phoneme_tokens = track["phoneme"].split(" ")
+        text_tokens = track_text.split(" ")
+        phoneme_tokens = track_phoneme.split(" ")
         duration_raw = track.get("duration", "")
         duration_tokens = duration_raw.split(" ") if duration_raw else []
         pitch_raw = track.get("note_pitch", "")
@@ -1436,6 +1451,11 @@ class MIDIEditLyrics:
                     force_tone4: bool, high_pitch_threshold: int,
                     fixed_pause: bool, split_mode: str,
                     speed: float) -> tuple:
+        # Guard against None inputs from ComfyUI (empty/disconnected nodes)
+        midi_json = midi_json or ""
+        new_lyrics = new_lyrics or ""
+        if not midi_json.strip():
+            return (midi_json,)
         try:
             return (replace_lyrics(midi_json, new_lyrics,
                                     force_tone4_high_pitch=force_tone4,
