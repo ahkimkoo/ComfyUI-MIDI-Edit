@@ -80,6 +80,17 @@ def is_english_word(word: str) -> bool:
     return bool(word) and bool(_EN_WORD_RE.fullmatch(word))
 
 
+# Arabic digits → Chinese number chars (g2pM can pronounce these)
+_DIGIT_TO_ZH = str.maketrans("0123456789", "零一二三四五六七八九")
+
+
+def _normalize_digits(text: str) -> str:
+    """Convert Arabic digits to Chinese number chars so they get proper phonemes."""
+    if not text:
+        return text
+    return text.translate(_DIGIT_TO_ZH)
+
+
 # Single English letter → single ARPAbet phoneme.
 # Letter-name pronunciation (e.g., g2p_en("s") → "EH1-S") produces multi-phoneme
 # tokens that don't fit in short MIDI notes (< 0.1s). Instead, map each letter to
@@ -139,6 +150,7 @@ def _build_units(sentence: str) -> list[dict]:
     units: list[dict] = []
     if not sentence:
         return units
+    sentence = _normalize_digits(sentence)
     parts = sentence.split()
     for part in parts:
         if not part:
@@ -163,9 +175,11 @@ def _build_units(sentence: str) -> list[dict]:
 
 
 def clean_lyrics(text: str) -> str:
-    """Remove punctuation and newlines. Keep Chinese chars, English letters, and spaces."""
+    """Remove punctuation and newlines. Keep Chinese chars, English letters, and spaces.
+    Arabic digits are converted to Chinese number chars."""
     if not text:
         return ""
+    text = _normalize_digits(text)
     return re.sub(r"[^\u4e00-\u9fffA-Za-z ]", "", text)
 
 
