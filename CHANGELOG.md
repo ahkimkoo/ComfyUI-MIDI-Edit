@@ -2,6 +2,30 @@
 
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
+## [2026-06-16] v1.8.0
+
+### Added
+
+- **英文单词级音素生成**：英文歌词不再逐字母处理，而是按完整单词生成 ARPAbet 音素（如 `wish` → `en_W-IH1-SH`），与 SoulX-Singer 原生格式完全一致
+- **中英混合歌词支持**：同一句歌词可同时包含中文和英文，中文字逐字处理，英文词按词处理
+- **英文单词比例分配**：当音符数多于英文单词数时，单词按词长比例分配到多个音符，首个音符 `note_type=2`，后续延续音符 `note_type=3`，共享同一音素
+- **阿拉伯数字自动转中文**：歌词中的 `0-9` 自动转为 `零一二三四五六七八九`，再通过 g2pM 生成拼音
+
+### Fixed
+
+- **英文音素 `KeyError: 'en_a'`**：单字母不再直接作为音素，英文统一走 g2p_en 生成 ARPAbet 格式
+- **英文合成噪声**：逐字母生成多音素"字母名"发音（如 `s` → `en_EH1-S`）导致短音符无法承载。改为单词级处理，每个音符承载完整单词音素
+- **Collapse 模式 duration 篡改**（v1.7.1 已修复，此处补充说明）
+- **`None` 输入崩溃**：ComfyUI 空输入/未连接节点导致 `expected string or bytes-like object` 错误。所有入口添加 None 防御
+- **NLTK 数据路径**：`_NLTK_PACKAGES` 使用完整路径格式（`taggers/averaged_perceptron_tagger_eng`），避免本地数据查找失败导致下载超时
+
+### Changed
+
+- `clean_lyrics()` 保留空格（英文单词分词需要）
+- `_split_lyrics_to_sentences()` 保留句内空格
+- `_apply_char()` 支持 `preset_phoneme` 和 `is_continuation` 参数
+- 英文单字母音素映射表 `_EN_LETTER_TO_PHONEME` 保留作为 fallback
+
 ## [2026-06-15] v1.7.1
 
 ### Fixed

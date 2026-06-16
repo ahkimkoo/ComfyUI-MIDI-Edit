@@ -1,6 +1,6 @@
 # ComfyUI-MIDI-Edit
 
-[ComfyUI](https://github.com/comfyanonymous/ComfyUI) 自定义节点插件，搭配 [ComfyUI_RH_SoulX-Singer](https://github.com/HM-RunningHub/ComfyUI_RH_SoulX-Singer) 实现魔改歌词——替换 MIDI JSON 中的歌词文本并自动生成拼音/音素，也可从 MIDI JSON 中提取歌词。适用于 MIDI 歌曲生成工作流，支持中文和英文。
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI) 自定义节点插件，搭配 [ComfyUI_RH_SoulX-Singer](https://github.com/HM-RunningHub/ComfyUI_RH_SoulX-Singer) 实现魔改歌词——替换 MIDI JSON 中的歌词文本并自动生成拼音/音素，也可从 MIDI JSON 中提取歌词。适用于 MIDI 歌曲生成工作流，支持中文、英文及中英混合歌词。
 
 提供三个节点：
 
@@ -15,7 +15,9 @@
 - 歌词替换 + 自动音素生成
 - 歌词提取
 - 连续重复字符合并
-- 支持中文（`zh_` 前缀拼音）和英文（`en_` 前缀音素）
+- 支持中文（`zh_` 前缀拼音）、英文（`en_` 前缀 ARPAbet 音素）及中英混合歌词
+- **英文按单词级处理**：英文歌词按完整单词生成 ARPAbet 音素（如 `wish` → `en_W-IH1-SH`），单词按词长比例分配到多个音符，延续音符标记 `note_type=3`，与 SoulX-Singer 原生格式一致
+- **阿拉伯数字自动转中文**：歌词中的 `0-9` 自动转为 `零一二三四五六七八九`
 - `<SP>` 标记自动保留，不影响音素对齐
 - **智能匹配算法**：3 种模式自动适配新旧歌词长度差异
   - **Collapse**（新词 ≤ 去重 slot 数）：右对齐映射，保护结尾长音
@@ -111,11 +113,12 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
    - **Collapse+Distribute**（slot 数 < 新字数 ≤ token 数）：slot 内多个 token 分配不同的字（如原曲 `天天` → 新歌词 `把它`）
    - **Expand**（新字数 > token 数）：拆分最长 duration 的 token（减半，pitch 不变）
 5. 原曲连续重复字（如 `天 天`）collapse 为 1 个 slot 后展开，新字自动按重复数复制
-6. 为每个替换的字自动生成音素（中文 → `zh_` 拼音，英文 → `en_` 音素）
-7. 空 token 的 duration 重分配给同 section 的已填 token
-8. Expand（拆分 token）时，非 SP token 的 duration 不低于 0.30s；Collapse 模式保持原 duration 不变
-9. 灵活停顿模式下（`fixed_pause=Flexible`）：当 SP ≥ 2 倍 token 平均时长或 token 平均时长 < 0.30s 时，SP 降至 token 平均时长，释放时间按比例分给 token（总时长守恒）
-10. 变速模式下（`speed ≠ 1.0`）：所有 duration 乘以速度倍率，f0 同步线性插值重采样（帧数等比变化）
+6. 为每个替换的字自动生成音素（中文 → `zh_` 拼音，英文 → `en_` ARPAbet 单词级音素）
+7. 英文单词按词长比例分配到多个音符，首个音符 `note_type=2`，延续音符 `note_type=3`
+8. 空 token 的 duration 重分配给同 section 的已填 token
+9. Expand（拆分 token）时，非 SP token 的 duration 不低于 0.30s；Collapse 模式保持原 duration 不变
+10. 灵活停顿模式下（`fixed_pause=Flexible`）：当 SP ≥ 2 倍 token 平均时长或 token 平均时长 < 0.30s 时，SP 降至 token 平均时长，释放时间按比例分给 token（总时长守恒）
+11. 变速模式下（`speed ≠ 1.0`）：所有 duration 乘以速度倍率，f0 同步线性插值重采样（帧数等比变化）
 
 **分类：** `MIDI-Edit`
 
