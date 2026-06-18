@@ -593,6 +593,81 @@ class TestEndToEnd:
         new_sum = sum(t.duration for t in new_tokens)
         assert abs(orig_sum - new_sum) < 0.01
 
+    def test_multi_track_lyrics_distribution(self):
+        """Multi-track: lyrics distributed by duration proportion, not full copy per track.
+
+        Regression for real-world bug: the old ``align_lyrics`` fed the FULL
+        lyrics string into every track independently. When the input had a
+        small track (e.g. 1 non-SP slot) alongside a larger one, the small
+        track was force-fed the entire lyric → catastrophic SPLIT storm
+        (every char crammed into one slot, durations far below min_dur).
+
+        After the fix, lyrics are split across tracks by non-SP duration
+        proportion. The small track receives only its proportional share
+        (or, when nothing is left, is preserved unchanged).
+        """
+        from nodes import MidiLyricsAlignment
+
+        # track0: 2 non-SP tokens, total non-SP duration 1.0s
+        # track1: 1 non-SP token, total non-SP duration 0.4s  (smaller capacity)
+        multi_track_json = json.dumps([
+            {"text": "<SP> 啊 啊 <SP>",
+             "phoneme": "<SP> zh_a1 zh_a1 <SP>",
+             "duration": "0.3 0.5 0.5 0.3",
+             "note_pitch": "0 60 62 0",
+             "note_type": "1 2 2 1"},
+            {"text": "<SP> 啊 <SP>",
+             "phoneme": "<SP> zh_a1 <SP>",
+             "duration": "0.3 0.4 0.3",
+             "note_pitch": "0 60 0",
+             "note_type": "1 2 1"},
+        ])
+        node = MidiLyricsAlignment()
+        # 4 short lines × 2 chars = 8 chars; lines use disjoint character
+        # sets so a "both tracks got the full lyric" bug is detectable by
+        # set intersection (under the bug, both tracks' char sets would
+        # be identical and thus trivially overlap on every char).
+        result = node.align_lyrics(multi_track_json, "天空\n海洋\n山林\n河流")
+        out = result[0]
+        assert not out.startswith("Error"), f"unexpected error: {out}"
+
+        parsed = json.loads(out)
+        assert len(parsed) == 2, "both tracks must survive in output"
+
+        def non_sp_chars(track_text):
+            return [c for c in track_text.split() if c != "<SP>"]
+
+        track0_chars = non_sp_chars(parsed[0]["text"])
+        track1_chars = non_sp_chars(parsed[1]["text"])
+
+        # Hard regression bound: the small track must NOT inherit the full
+        # 8-char lyric (old bug squeezed all 8 into one slot via SPLIT).
+        # Capacity share for track1 = 0.4 / 1.4 ≈ 29% of 8 ≈ 2-3 chars;
+        # 5 is a generous upper bound that still catches the storm.
+        assert len(track1_chars) < 5, (
+            f"track1 received too many chars - multi-track distribution "
+            f"broken (got {track1_chars!r} in text={parsed[1]['text']!r})"
+        )
+
+        # And track0 should carry more than track1 (it has 2.5x the capacity).
+        assert len(track0_chars) > len(track1_chars), (
+            f"larger track should receive more lyrics: "
+            f"track0={track0_chars!r}, track1={track1_chars!r}"
+        )
+
+        # The lyric lines are partitioned, not duplicated. Under the old
+        # bug both tracks received every line, so their char sets would
+        # be identical. With disjoint lyric lines, post-fix tracks should
+        # have no char in common. (When track1 was preserved verbatim the
+        # original "啊" appears there but not in the lyric, so we exclude
+        # that case explicitly.)
+        if "啊" not in track1_chars and track0_chars and track1_chars:
+            common = set(track0_chars) & set(track1_chars)
+            assert not common, (
+                f"tracks share chars {common!r} - lyrics not partitioned; "
+                f"track0={track0_chars!r}, track1={track1_chars!r}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Regression tests against a real-world vocal track (Task 11)

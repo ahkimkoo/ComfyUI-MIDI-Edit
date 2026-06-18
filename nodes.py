@@ -1556,6 +1556,86 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 # --- Unified DP-based alignment node (Task 10) ---
 
 
+def _distribute_lyrics(lyrics: str, tracks: list) -> list[str]:
+    """Split a full lyric block across multiple tracks by duration proportion.
+
+    Real-world inputs (e.g. a long vocal track plus a short echo track) feed
+    a single lyric string into the alignment node. Feeding that full string
+    into every track independently causes catastrophic SPLITs on the small
+    track (see P1 in CHANGELOG / plan). This helper partitions the lyric
+    along line boundaries so each track receives a share proportional to
+    its non-SP token duration.
+
+    Args:
+        lyrics: Full lyric string (may contain newlines for sentence splits).
+        tracks: Parsed ``Track`` objects (only ``tokens[*].duration`` and
+            ``tokens[*].is_sp`` are read).
+
+    Returns:
+        A list of per-track lyric substrings (same order as ``tracks``).
+        When ``tracks`` has only one entry, the original lyric is returned
+        unchanged. When a track ends up with no share (degenerate split),
+        its entry is an empty string — callers must preserve such tracks
+        verbatim instead of trying to align empty lyrics.
+    """
+    if len(tracks) <= 1:
+        return [lyrics]
+
+    # Capacity = total non-SP duration. Duration (not token count) tracks
+    # real acoustic capacity: a 0.4s slot can hold ~2x as many chars as a
+    # 0.2s slot regardless of how the source MIDI quantised them.
+    capacities = [
+        sum(t.duration for t in track.tokens if not t.is_sp)
+        for track in tracks
+    ]
+    total_cap = sum(capacities)
+    if total_cap <= 0:
+        # Degenerate: no acoustic capacity anywhere. Fall back to giving
+        # every track the full lyric so the existing per-track alignment
+        # decides what to do (back-compat with all-zero-duration inputs).
+        return [lyrics] * len(tracks)
+
+    # Split on newlines but keep non-empty lines. Line boundaries are the
+    # natural place to partition — mid-sentence cuts would corrupt meaning
+    # and the normalizer relies on line breaks as soft SP placement hints.
+    lines = [ln for ln in lyrics.split("\n") if ln.strip()]
+    if not lines:
+        lines = [lyrics]
+
+    total_chars = sum(len(line) for line in lines)
+    result: list[str] = []
+    line_idx = 0
+
+    for i in range(len(tracks)):
+        if i == len(tracks) - 1:
+            # Last track absorbs whatever remains so the entire lyric is
+            # always covered (no char is silently dropped).
+            result.append("\n".join(lines[line_idx:]))
+            break
+
+        # Proportional char budget for this track, snapped to int.
+        target_chars = int(total_chars * capacities[i] / total_cap)
+
+        # Accumulate whole lines until the budget is met. A track with
+        # capacity 0 (e.g. all-SP) gets target_chars=0 and naturally
+        # receives an empty share — ``align_lyrics`` then preserves it
+        # verbatim, which is the right behaviour for a no-content track.
+        accumulated = 0
+        end_idx = line_idx
+        while end_idx < len(lines) and accumulated < target_chars:
+            accumulated += len(lines[end_idx])
+            end_idx += 1
+
+        result.append("\n".join(lines[line_idx:end_idx]))
+        line_idx = end_idx
+
+    # Defensive padding: if there were fewer lines than tracks, later
+    # tracks get "" and callers preserve them unchanged.
+    while len(result) < len(tracks):
+        result.append("")
+    return result
+
+
 class MidiLyricsAlignment:
     """统一对齐算法节点（基于联合 DP）.
 
@@ -1614,14 +1694,31 @@ class MidiLyricsAlignment:
             w_pitch=w_pitch, w_duration=w_duration, w_structure=w_structure,
         )
 
+        # P1: partition the full lyric across tracks by duration proportion.
+        # Without this, every track is force-fed the entire lyric and small
+        # tracks undergo catastrophic SPLIT storms.
+        lyrics_per_track = _distribute_lyrics(lyrics, tracks)
+
         result_tracks = []
         warnings_list = []
 
-        for track in tracks:
+        for track_idx, track in enumerate(tracks):
+            track_lyrics = (
+                lyrics_per_track[track_idx]
+                if track_idx < len(lyrics_per_track) else ""
+            )
+
+            # Empty share → preserve the original track verbatim. Trying to
+            # normalize empty lyrics raises ValueError("empty"); preserving
+            # is the right semantic (no lyric content assigned to this track).
+            if not track_lyrics or not track_lyrics.strip():
+                result_tracks.append(track)
+                continue
+
             sp_target = sum(1 for t in track.tokens if t.is_sp)
             try:
                 norm_text, sp_positions = normalize_lyrics(
-                    lyrics, sp_target, normalize_digits
+                    track_lyrics, sp_target, normalize_digits
                 )
                 units = tokenize_units(norm_text, sp_positions, weights)
             except ValueError as e:
@@ -1637,16 +1734,32 @@ class MidiLyricsAlignment:
                 new_tokens, track.tokens, path, weights
             )
 
+            # P2: surface min_duration violations that allocate_durations
+            # could not resolve (no in-section lender available). rebuild.py
+            # silently leaves these short; tagging them here lets users
+            # diagnose "why does this track sound cramped" without altering
+            # the alignment subpackage's public API.
+            short_count = sum(
+                1 for t in new_tokens
+                if not t.is_sp and t.duration < weights.min_duration
+            )
+            if short_count > 0:
+                warnings_list.append(
+                    f"MIN_DURATION_UNRESOLVED(t{track_idx}:{short_count})"
+                )
+
             result_track = Track(tokens=new_tokens, meta=dict(track.meta),
                                  f0=track.f0)
             result_tracks.append(result_track)
 
+            # Existing quality warnings, now tagged with the track index so
+            # multi-track inputs can be diagnosed per-track.
             split_count = sum(1 for o in path.ops if o.kind == "SPLIT")
             drop_count = sum(1 for o in path.ops if o.kind == "DROP")
             if split_count > 0.4 * len(units):
-                warnings_list.append("HIGH_SPLIT_RATIO")
+                warnings_list.append(f"HIGH_SPLIT_RATIO(t{track_idx})")
             if drop_count > 0.3 * len(track.tokens):
-                warnings_list.append("HIGH_DROP_RATIO")
+                warnings_list.append(f"HIGH_DROP_RATIO(t{track_idx})")
 
         if speed != 1.0:
             result_tracks = apply_speed_change(result_tracks, speed)
