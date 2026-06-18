@@ -8,9 +8,11 @@ from alignment.cost import (
     replace_cost, word_span_cost, split_cost, drop_cost, sp_align_cost,
 )
 from alignment.preprocess import normalize_lyrics, tokenize_units
+from alignment.dp import solve_alignment
 __all__ = [
     "Token", "Track", "Unit", "AlignmentOp", "AlignmentPath", "CostWeights",
     "parse_tracks", "serialize_track", "serialize_tracks",
     "replace_cost", "word_span_cost", "split_cost", "drop_cost", "sp_align_cost",
     "normalize_lyrics", "tokenize_units",
+    "solve_alignment",
 ]

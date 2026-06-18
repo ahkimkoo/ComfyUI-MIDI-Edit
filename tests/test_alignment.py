@@ -226,3 +226,92 @@ class TestTokenizer:
         assert len(units) == 2
         assert units[0].text == "hello"
         assert units[1].text == "world"
+
+
+from alignment.dp import solve_alignment
+
+
+def _make_tokens(specs):
+    """快捷构造 token 列表。specs = [(text, pitch, type, dur), ...]"""
+    return [Token(t, "<SP>" if t == "<SP>" else f"ph_{t}",
+                  d, p, nt, i) for i, (t, p, nt, d) in enumerate(specs)]
+
+
+class TestDP:
+    def setup_method(self):
+        self.w = CostWeights()
+
+    def test_perfect_match_zero_cost(self):
+        """字数等长 + SP 对齐 → 全 REPLACE，代价 0."""
+        tokens = _make_tokens([
+            ("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.4),
+            ("好", 62, 2, 0.4), ("<SP>", 0, 1, 0.3),
+        ])
+        units = [
+            Unit("<SP>", "<SP>", "sp", 1, "punct"),
+            Unit("呀", "zh_ya1", "zh", 1),
+            Unit("哎", "zh_ai1", "zh", 1),
+            Unit("<SP>", "<SP>", "sp", 1, "punct"),
+        ]
+        path = solve_alignment(tokens, units, self.w)
+        assert path.total_cost == 0.0
+        assert len(path.ops) == 4
+        assert all(o.kind == "REPLACE" or o.kind == "SP_ALIGN"
+                   for o in path.ops)
+
+    def test_split_triggered_when_more_units(self):
+        """字数多于 token → SPLIT 触发."""
+        tokens = _make_tokens([("<SP>", 0, 1, 0.3), ("啊", 60, 2, 1.0), ("<SP>", 0, 1, 0.3)])
+        units = [
+            Unit("<SP>", "<SP>", "sp", 1, "punct"),
+            Unit("天", "zh_tian1", "zh", 1),
+            Unit("气", "zh_qi4", "zh", 1),
+            Unit("<SP>", "<SP>", "sp", 1, "punct"),
+        ]
+        path = solve_alignment(tokens, units, self.w)
+        kinds = [o.kind for o in path.ops]
+        assert "SPLIT" in kinds
+
+    def test_drop_triggered_when_fewer_units(self):
+        """字数少于 token → DROP 触发."""
+        tokens = _make_tokens([
+            ("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.4),
+            ("好", 62, 2, 0.4), ("<SP>", 0, 1, 0.3),
+        ])
+        units = [
+            Unit("<SP>", "<SP>", "sp", 1, "punct"),
+            Unit("哎", "zh_ai1", "zh", 1),
+            Unit("<SP>", "<SP>", "sp", 1, "punct"),
+        ]
+        path = solve_alignment(tokens, units, self.w)
+        kinds = [o.kind for o in path.ops]
+        assert "DROP" in kinds
+
+    def test_sp_count_conserved(self):
+        """SP_ALIGN 次数 = SP 单元数."""
+        tokens = _make_tokens([
+            ("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.4), ("<SP>", 0, 1, 0.3),
+        ])
+        units = [
+            Unit("<SP>", "<SP>", "sp", 1, "punct"),
+            Unit("呀", "zh_ya1", "zh", 1),
+            Unit("<SP>", "<SP>", "sp", 1, "punct"),
+        ]
+        path = solve_alignment(tokens, units, self.w)
+        assert len(path.sp_placements) == 2
+
+    def test_word_span_for_english(self):
+        """英文词占多 token → WORD_SPAN."""
+        tokens = _make_tokens([
+            ("<SP>", 0, 1, 0.3),
+            ("la", 60, 2, 0.3), ("la", 62, 2, 0.3), ("la", 64, 2, 0.3),
+            ("<SP>", 0, 1, 0.3),
+        ])
+        units = [
+            Unit("<SP>", "<SP>", "sp", 1, "punct"),
+            Unit("love", "en_L-AH1-V", "en", 3),
+            Unit("<SP>", "<SP>", "sp", 1, "punct"),
+        ]
+        path = solve_alignment(tokens, units, self.w)
+        kinds = [o.kind for o in path.ops]
+        assert "WORD_SPAN" in kinds
