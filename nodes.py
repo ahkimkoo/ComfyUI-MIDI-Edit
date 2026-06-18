@@ -1551,3 +1551,109 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MIDIExtractLyrics": "MIDI Extract Lyrics",
     "MIDIMergeRepeatedChars": "MIDI Merge Repeated Chars",
 }
+
+
+# --- Unified DP-based alignment node (Task 10) ---
+
+
+class MidiLyricsAlignment:
+    """统一对齐算法节点（基于联合 DP）.
+
+    替代 MIDIEditLyrics 的场景分支式处理，用单一 DP 求全局最优对齐。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "midi_json": ("STRING", {"multiline": True}),
+                "lyrics": ("STRING", {"multiline": True}),
+                "speed": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.1}),
+                "normalize_digits": ("BOOLEAN", {"default": True}),
+                "force_tone4": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "w_pitch": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
+                "w_duration": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.1}),
+                "w_structure": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.1}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("midi_json",)
+    FUNCTION = "align_lyrics"
+    CATEGORY = "MIDI"
+
+    def align_lyrics(self, midi_json, lyrics, speed=1.0,
+                     normalize_digits=True, force_tone4=False,
+                     w_pitch=0.5, w_duration=0.3, w_structure=0.2):
+        from alignment import (
+            parse_tracks, serialize_tracks, normalize_lyrics, tokenize_units,
+            solve_alignment, rebuild_tokens, allocate_durations,
+            apply_speed_change, CostWeights,
+        )
+        from alignment.models import Track
+
+        # 输入校验（内联 str() 替代 plan 原文的 _safe_string — 该 helper
+        # 在 nodes.py 中无定义；这里直接处理 None 输入）
+        if midi_json is None:
+            midi_json = ""
+        else:
+            midi_json = str(midi_json)
+        if lyrics is None:
+            lyrics = ""
+        else:
+            lyrics = str(lyrics)
+
+        try:
+            tracks = parse_tracks(midi_json)
+        except ValueError as e:
+            return (f"Error: {e}",)
+
+        weights = CostWeights(
+            w_pitch=w_pitch, w_duration=w_duration, w_structure=w_structure,
+        )
+
+        result_tracks = []
+        warnings_list = []
+
+        for track in tracks:
+            sp_target = sum(1 for t in track.tokens if t.is_sp)
+            try:
+                norm_text, sp_positions = normalize_lyrics(
+                    lyrics, sp_target, normalize_digits
+                )
+                units = tokenize_units(norm_text, sp_positions, weights)
+            except ValueError as e:
+                return (f"Error: {e}",)
+
+            try:
+                path = solve_alignment(track.tokens, units, weights)
+            except ValueError as e:
+                return (f"Error: {e}",)
+
+            new_tokens = rebuild_tokens(path, track.tokens, weights)
+            new_tokens = allocate_durations(
+                new_tokens, track.tokens, path, weights
+            )
+
+            result_track = Track(tokens=new_tokens, meta=dict(track.meta),
+                                 f0=track.f0)
+            result_tracks.append(result_track)
+
+            split_count = sum(1 for o in path.ops if o.kind == "SPLIT")
+            drop_count = sum(1 for o in path.ops if o.kind == "DROP")
+            if split_count > 0.4 * len(units):
+                warnings_list.append("HIGH_SPLIT_RATIO")
+            if drop_count > 0.3 * len(track.tokens):
+                warnings_list.append("HIGH_DROP_RATIO")
+
+        if speed != 1.0:
+            result_tracks = apply_speed_change(result_tracks, speed)
+
+        output_json = serialize_tracks(result_tracks)
+
+        if warnings_list:
+            print(f"[MidiLyricsAlignment] warnings: {warnings_list}")
+
+        return (output_json,)

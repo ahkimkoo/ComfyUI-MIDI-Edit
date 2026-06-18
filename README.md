@@ -2,9 +2,10 @@
 
 [ComfyUI](https://github.com/comfyanonymous/ComfyUI) 自定义节点插件，搭配 [ComfyUI_RH_SoulX-Singer](https://github.com/HM-RunningHub/ComfyUI_RH_SoulX-Singer) 实现魔改歌词——替换 MIDI JSON 中的歌词文本并自动生成拼音/音素，也可从 MIDI JSON 中提取歌词。适用于 MIDI 歌曲生成工作流，支持中文、英文及中英混合歌词。
 
-提供三个节点：
+提供四个节点：
 
 - **MIDI Edit Lyrics** — 替换歌词并自动生成音素
+- **MIDI Lyrics Alignment (DP)** — 基于联合动态规划的统一对齐算法（推荐新用户使用）
 - **MIDI Extract Lyrics** — 提取歌词文本（去空格，`<SP>` 转换行）
 - **MIDI Merge Repeated Chars** — 合并连续重复字符
 
@@ -121,6 +122,66 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 11. 变速模式下（`speed ≠ 1.0`）：所有 duration 乘以速度倍率，f0 同步线性插值重采样（帧数等比变化）
 
 **分类：** `MIDI-Edit`
+
+---
+
+### MIDI Lyrics Alignment (DP)
+
+基于**联合动态规划**的统一歌词对齐节点，是 `MIDI Edit Lyrics` 的算法升级版。用单一 DP 求解全局最优对齐，**无 `if/else` 场景分支**——不再区分 Collapse / Expand / Collapse+Distribute 三种模式，所有字数匹配/不匹配情况由加权代价函数统一处理。
+
+**算法概述：**
+
+- **联合 DP**：在新歌词单元（Unit）与原曲 token 网格上一次 Viterbi 式搜索，输出总代价最小的对齐路径
+- **加权代价函数**：`pitch` + `duration` + `structure` 三项加权，权重可在节点参数中调节
+- **5 种原子操作**：
+  - `REPLACE` — 一个 Unit 占一个 token，pitch/type 沿用原 token（最常见的字对字替换）
+  - `WORD_SPAN` — 一个英文词占多个 token，首 token `note_type=2`、延续 token `note_type=3`
+  - `SPLIT` — 一个字共享一个长 token，duration 在共享者间均分
+  - `DROP` — 丢弃多余 token，其 duration 在同 section 内重新分配（总时长守恒）
+  - `SP_ALIGN` — SP 软约束：SP 数量守恒（必须保留），位置可由代价函数最优放置
+- **中英混合粒度**：中文字 `max_occupy=1`，英文连续字母为一个词（`max_occupy ≤ K=4`）
+- **守恒不变量**：SP 数量、每个 section 的总 duration、f0 帧级数据
+
+**输入：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `midi_json` | STRING, multiline | MIDI JSON 字符串 |
+| `lyrics` | STRING, multiline | 新歌词文本（中英混合，可含标点/换行） |
+| `speed` | FLOAT | 变速倍率（0.1~3.0，默认 1.0），duration 和 f0 同步缩放 |
+| `normalize_digits` | BOOLEAN | 阿拉伯数字自动转中文（默认 ON） |
+| `force_tone4` | BOOLEAN | 高音强制第四声（默认 OFF） |
+| `w_pitch` *(optional)* | FLOAT | pitch 代价权重（0~1，默认 0.5） |
+| `w_duration` *(optional)* | FLOAT | duration 代价权重（0~1，默认 0.3） |
+| `w_structure` *(optional)* | FLOAT | 结构代价权重（0~1，默认 0.2） |
+
+**输出：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `midi_json` | STRING | 对齐后的 MIDI JSON 字符串 |
+
+**与 MIDI Edit Lyrics 的差异：**
+
+| 维度 | MIDI Edit Lyrics | MIDI Lyrics Alignment (DP) |
+|------|------------------|----------------------------|
+| 算法 | 3 模式 + 多分支（Collapse/Expand/Distribute） | 单一 DP，无场景分支 |
+| 字数匹配 | 按场景选不同策略 | 加权代价函数统一求最优 |
+| SP 处理 | 严格位置保留 | 软约束（数量守恒，位置可移） |
+| 中英混合 | 单独逻辑分支 | Unit 抽象统一处理 |
+| 适用场景 | 已稳定，老工作流兼容 | 推荐新用户使用，对齐质量更可控 |
+
+> 同一输入下两者输出可能略有差异。`MidiLyricsAlignment` 在 DROP/SPLIT 时由 DP 自动选择代价最小的位置，比基于规则的分支更鲁棒。
+
+**示例：**
+
+输入 MIDI JSON 的 text：`<SP> 你 好 <SP>` （2 token + 2 SP）
+
+输入新歌词：`天空`
+
+输出 text：`<SP> 天 空 <SP>`（SP 数量守恒，2 个字 REPLACE 原 2 个字，总时长不变）
+
+**分类：** `MIDI`
 
 ---
 
@@ -286,14 +347,22 @@ curl -s http://127.0.0.1:8188/prompt \
 ```
 ComfyUI-MIDI-Edit/
 ├── __init__.py          # ComfyUI 插件入口，导出节点映射
-├── nodes.py             # 核心逻辑与节点定义
+├── nodes.py             # 核心逻辑与节点定义（含 MidiLyricsAlignment）
+├── alignment/           # 统一对齐算法子包（DP / cost / rebuild / speed）
 ├── requirements.txt     # Python 依赖
 ├── pyproject.toml       # Comfy Registry 发布配置
 ├── CHANGELOG.md         # 更新日志
 ├── docs/
 │   ├── REQUIREMENT.md   # 原始需求文档
+│   ├── alignment-algorithm.md      # MidiLyricsAlignment 算法说明
+│   ├── midi-json-format.md         # MIDI JSON 字段说明
 │   ├── midi-edit-lyrics.json       # ComfyUI 工作流文件
 │   └── midi-edit-lyrics.json.png   # 工作流截图
+├── tests/
+│   ├── test_alignment.py            # 统一对齐算法测试套件
+│   ├── conftest.py                  # pytest 配置（slow marker）
+│   └── fixtures/
+│       └── vocal_sample.json        # 真实人声 track 回归 fixture
 ├── models/
 │   └── nltk/            # NLTK 数据（自动下载）
 └── README.md

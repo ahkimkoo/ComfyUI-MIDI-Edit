@@ -48,7 +48,7 @@ models.py ← parser.py ← preprocess.py ← cost.py ← dp.py ← rebuild.py �
 - Create: `alignment/models.py`
 - Test: `tests/test_alignment.py`
 
-- [ ] **Step 1: 创建 alignment 子包骨架**
+- [x] **Step 1: 创建 alignment 子包骨架**
 
 ```python
 # alignment/__init__.py
@@ -74,7 +74,7 @@ __all__ = [
 ]
 ```
 
-- [ ] **Step 2: 实现 models.py（完整数据结构）**
+- [x] **Step 2: 实现 models.py（完整数据结构）**
 
 ```python
 # alignment/models.py
@@ -146,7 +146,7 @@ class CostWeights:
     max_word_occupy: int = 4
 ```
 
-- [ ] **Step 3: 写基础测试**
+- [x] **Step 3: 写基础测试**
 
 ```python
 # tests/test_alignment.py
@@ -180,14 +180,14 @@ class TestModels:
             op.kind = "DROP"  # frozen
 ```
 
-- [ ] **Step 4: 运行测试（预期 FAIL——模块未实现）**
+- [x] **Step 4: 运行测试（预期 FAIL——模块未实现）**
 
 Run: `pytest tests/test_alignment.py::TestModels -v`
 Expected: FAIL（ImportError，parser/cost/dp 等模块尚未实现）
 
 > 注：`__init__.py` 导入了所有子模块，Task 1 阶段会因 import 失败而报错。**临时方案**：先注释掉 `__init__.py` 中未实现模块的导入，仅保留 `models`，后续 Task 逐步解除注释。或直接跑 `pytest tests/test_alignment.py::TestModels -v` 时测试本身从 `alignment.models` 导入（不经过 `__init__`）。
 
-- [ ] **Step 5: 调整 __init__.py（仅导出已实现部分）**
+- [x] **Step 5: 调整 __init__.py（仅导出已实现部分）**
 
 将 `__init__.py` 暂时改为：
 ```python
@@ -199,12 +199,12 @@ __all__ = ["Token", "Track", "Unit", "AlignmentOp", "AlignmentPath", "CostWeight
 ```
 后续每完成一个 Task，解除对应导入。
 
-- [ ] **Step 6: 运行测试（预期 PASS）**
+- [x] **Step 6: 运行测试（预期 PASS）**
 
 Run: `pytest tests/test_alignment.py::TestModels -v`
 Expected: PASS（5 passed）
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add alignment/__init__.py alignment/models.py tests/test_alignment.py
@@ -219,7 +219,7 @@ git commit -m "feat(alignment): add data structures (Token/Unit/AlignmentOp/Cost
 - Create: `alignment/parser.py`
 - Modify: `alignment/__init__.py`（解除 parser 导入）
 
-- [ ] **Step 1: 实现 parser.py**
+- [x] **Step 1: 实现 parser.py**
 
 ```python
 # alignment/parser.py
@@ -305,7 +305,7 @@ def serialize_tracks(tracks: list[Track]) -> str:
                       ensure_ascii=False, indent=2)
 ```
 
-- [ ] **Step 2: 写测试**
+- [x] **Step 2: 写测试**
 
 ```python
 # tests/test_alignment.py（追加到文件末尾）
@@ -360,7 +360,7 @@ class TestParser:
         assert again[0].tokens[1].text == "你"
 ```
 
-- [ ] **Step 3: 解除 __init__.py 的 parser 导入，运行测试**
+- [x] **Step 3: 解除 __init__.py 的 parser 导入，运行测试**
 
 ```bash
 # 编辑 __init__.py 解除 parser 两行注释
@@ -368,21 +368,25 @@ pytest tests/test_alignment.py::TestParser -v
 ```
 Expected: PASS（5 passed）
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add alignment/parser.py alignment/__init__.py tests/test_alignment.py
 git commit -m "feat(alignment): add JSON ↔ Token/Track parser"
 ```
 
+> **Deviation note (2026-06-18):** Spec test `test_parse_single_track` had `assert t.tokens[1].duration == 0.30`, but fixture data is `duration: "0.30 0.40 0.40 0.30"` where `tokens[1]` is `你` (zh_ni3) → 0.40. Other field assertions in same test (`phoneme=zh_ni3`, `note_pitch=60`) match the fixture; only the duration assertion contradicted it. Fixed assertion to `0.40` to match fixture (semantically correct: SP=0.30 boundaries, content words=0.40 middle).
+
 ---
 
 ## Task 3: CostFunction（cost.py）—— 核心
 
+> **Deviation note (PM-authorized 2026-06-18):** 原计划 `split_cost` 使用 `q = current_share_count + 1`，与测试期望（`0.4/2=0.2`、`1.0/2=0.5`，即 `current_share_count=0` 时 divisor=2）矛盾。修正为 `q = current_share_count + 2`，依据：SPLIT 触发时 host 已被前序操作消费（DP `c==1` 守卫），含 1 个初始消费者，故总 unit 数 = 1（初始）+ N（prior splits）+ 1（本次）= `current_share_count + 2`。与 spec §6.5 `d_host/(q+1)`（q=已存在 unit 数，含初始消费者）一致。Task 6 DP 调用 `split_cost()` 用默认 `current_share_count=0` → divisor=2。
+
 **Files:**
 - Create: `alignment/cost.py`
 
-- [ ] **Step 1: 实现 cost.py（5 个操作代价纯函数）**
+- [x] **Step 1: 实现 cost.py（5 个操作代价纯函数）**
 
 ```python
 # alignment/cost.py
@@ -414,9 +418,11 @@ def split_cost(host: Token, unit: Unit, w: CostWeights,
                current_share_count: int = 0) -> float:
     """SPLIT: zh 单元共享宿主 token。duration 被切细 → min_duration 惩罚.
 
-    current_share_count: 宿主已被几个单元共享（含本次则为 +1 后的总数）。
+    宿主已被前序操作（REPLACE/WORD_SPAN/SP_ALIGN）消费，含 1 个初始消费者。
+    current_share_count: 宿主上 prior SPLIT 次数（不含初始消费者）。
+    本次 SPLIT 后总 unit 数 = current_share_count + 2。
     """
-    q = current_share_count + 1  # 本次后总共享数
+    q = current_share_count + 2  # 1 初始消费者 + current_share_count prior + 1 本次
     est_dur = host.duration / q
     D = w.lambda_min_dur * max(0.0, w.min_duration - est_dur)
     return w.w_duration * D
@@ -452,7 +458,7 @@ def sp_align_cost(token: Token, unit: Unit, new_pos: int,
     return w.w_structure * S + w.w_pitch * P
 ```
 
-- [ ] **Step 2: 写测试**
+- [x] **Step 2: 写测试**
 
 ```python
 # tests/test_alignment.py（追加）
@@ -515,12 +521,12 @@ class TestCost:
         assert c == self.w.w_structure * 4 + self.w.w_pitch * 60
 ```
 
-- [ ] **Step 3: 解除 __init__.py 的 cost 导入，运行测试**
+- [x] **Step 3: 解除 __init__.py 的 cost 导入，运行测试**
 
 Run: `pytest tests/test_alignment.py::TestCost -v`
 Expected: PASS（8 passed）
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add alignment/cost.py alignment/__init__.py tests/test_alignment.py

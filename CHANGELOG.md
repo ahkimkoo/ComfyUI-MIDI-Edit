@@ -2,6 +2,28 @@
 
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **MidiLyricsAlignment 节点**：基于联合动态规划的统一歌词对齐算法。
+  - 单一 DP 处理所有字数匹配/不匹配情况，无 `if/else` 场景分支
+  - 加权代价函数（`pitch` / `duration` / `structure`）求全局最优对齐
+  - SP 软约束（数量守恒，位置可由 DP 最优放置）
+  - 中英混合粒度（中文字 `max_occupy=1`，英文词 `max_occupy ≤ K=4`）
+  - 5 种原子操作：`REPLACE` / `WORD_SPAN` / `SPLIT` / `DROP` / `SP_ALIGN`
+  - 总 duration 与 SP 数量守恒（含多 section DROP 重分配）
+  - 新增 `alignment/` 子包：`models` / `parser` / `cost` / `preprocess` / `dp` / `rebuild` / `speed`
+- **回归测试**：基于真实人声 track（`docs/midi-edit-lyrics.json` 的 `vocal_0_15000`，42 token / 4 SP / 14.99s）的不变量测试
+- **性能测试**：150 token track 在 3s 内完成对齐（纯 Python DP），`@pytest.mark.slow` 标记
+- **`tests/conftest.py`**：注册 `slow` pytest marker
+- **`docs/alignment-algorithm.md`** / **`docs/midi-json-format.md`**：算法与格式说明文档
+
+### Changed
+
+- README 节点列表从 3 个升级为 4 个，新增 `MidiLyricsAlignment (DP)` 章节（含参数表、与 `MIDIEditLyrics` 的差异对比、示例）
+- 项目结构说明同步加入 `alignment/` 子包与 `tests/` 目录
+
 ## [2026-06-16] v1.8.0
 
 ### Added
