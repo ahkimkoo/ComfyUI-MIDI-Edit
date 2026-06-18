@@ -219,7 +219,7 @@ git commit -m "feat(alignment): add data structures (Token/Unit/AlignmentOp/Cost
 - Create: `alignment/parser.py`
 - Modify: `alignment/__init__.py`（解除 parser 导入）
 
-- [ ] **Step 1: 实现 parser.py**
+- [x] **Step 1: 实现 parser.py**
 
 ```python
 # alignment/parser.py
@@ -305,7 +305,7 @@ def serialize_tracks(tracks: list[Track]) -> str:
                       ensure_ascii=False, indent=2)
 ```
 
-- [ ] **Step 2: 写测试**
+- [x] **Step 2: 写测试**
 
 ```python
 # tests/test_alignment.py（追加到文件末尾）
@@ -360,7 +360,7 @@ class TestParser:
         assert again[0].tokens[1].text == "你"
 ```
 
-- [ ] **Step 3: 解除 __init__.py 的 parser 导入，运行测试**
+- [x] **Step 3: 解除 __init__.py 的 parser 导入，运行测试**
 
 ```bash
 # 编辑 __init__.py 解除 parser 两行注释
@@ -368,12 +368,14 @@ pytest tests/test_alignment.py::TestParser -v
 ```
 Expected: PASS（5 passed）
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add alignment/parser.py alignment/__init__.py tests/test_alignment.py
 git commit -m "feat(alignment): add JSON ↔ Token/Track parser"
 ```
+
+> **Deviation note (2026-06-18):** Spec test `test_parse_single_track` had `assert t.tokens[1].duration == 0.30`, but fixture data is `duration: "0.30 0.40 0.40 0.30"` where `tokens[1]` is `你` (zh_ni3) → 0.40. Other field assertions in same test (`phoneme=zh_ni3`, `note_pitch=60`) match the fixture; only the duration assertion contradicted it. Fixed assertion to `0.40` to match fixture (semantically correct: SP=0.30 boundaries, content words=0.40 middle).
 
 ---
 
