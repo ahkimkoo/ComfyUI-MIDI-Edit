@@ -186,35 +186,38 @@ def _collect_drops(path: AlignmentPath, original_tokens: list[Token]) -> list[fl
 
 def _redistribute_drops(tokens: list[Token], drop_durations: list[float],
                         weights: CostWeights) -> None:
-    """把 DROP 的 duration 按比例分配给同 section 已填 token（原地修改）.
+    """把 DROP 的 duration 按比例分配给所有已填 token（原地修改）.
 
-    每个 section 内，非 SP token 按其现有 duration 占比吸收 DROP 时长。
-    若 section 内现有 duration 之和为 0，则均分。
+    全局按比例分配：每个非 SP token 分到
+    ``total_drop * (token.dur / sum_all_non_sp_dur)``。
+    保证总 duration 守恒（总和 = total_drop 恰好一次）。
+
+    .. note::
+        早期实现按 section 逐段分配，会把完整的 ``total_drop`` 在每个
+        section 重复施加一次，导致多 section 轨道的 DROP 时长被放大、
+        总 duration 守恒被破坏（回归 bug，见 Task 10 E2E 测试）。
     """
     if not drop_durations or not tokens:
         return
     total_drop = sum(drop_durations)
-    sections = _find_sections(tokens)
-    for start, end in sections:
-        section_tokens = [(i, tokens[i]) for i in range(start, end)
-                          if not tokens[i].is_sp]
-        if not section_tokens:
-            continue
-        total_existing = sum(t.duration for _, t in section_tokens)
-        if total_existing <= 0:
-            # 现有时长为 0：均分
-            per = total_drop / len(section_tokens)
-            for i, _ in section_tokens:
-                tokens[i] = Token(tokens[i].text, tokens[i].phoneme,
-                                  tokens[i].duration + per,
-                                  tokens[i].note_pitch, tokens[i].note_type,
-                                  tokens[i].index)
-        else:
-            # 按现有 duration 占比分配
-            for i, t in section_tokens:
-                share = total_drop * (t.duration / total_existing)
-                tokens[i] = Token(t.text, t.phoneme, t.duration + share,
-                                  t.note_pitch, t.note_type, t.index)
+    # 收集所有非 SP token（跨所有 section）
+    filled = [(i, tokens[i]) for i in range(len(tokens)) if not tokens[i].is_sp]
+    if not filled:
+        return
+    total_existing = sum(t.duration for _, t in filled)
+    if total_existing <= 0:
+        # 现有时长为 0：均分
+        per = total_drop / len(filled)
+        for i, _ in filled:
+            t = tokens[i]
+            tokens[i] = Token(t.text, t.phoneme, t.duration + per,
+                              t.note_pitch, t.note_type, t.index)
+    else:
+        # 全局按现有 duration 占比分配
+        for i, t in filled:
+            share = total_drop * (t.duration / total_existing)
+            tokens[i] = Token(t.text, t.phoneme, t.duration + share,
+                              t.note_pitch, t.note_type, t.index)
 
 
 def _enforce_min_duration(tokens: list[Token], weights: CostWeights) -> None:

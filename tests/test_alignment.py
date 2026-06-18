@@ -446,6 +446,39 @@ class TestDurationAllocator:
         new_sum = sum(t.duration for t in result)
         assert abs(orig_sum - new_sum) < 0.01
 
+    def test_drop_redistribution_multi_section_conserved(self):
+        """多 section + DROP 时，总 duration 仍守恒（回归 bug 修复）."""
+        # 2 sections, 中间有 DROP
+        orig = _make_tokens([
+            ("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.5), ("好", 62, 2, 0.5),
+            ("<SP>", 0, 1, 0.3), ("世", 64, 2, 0.4), ("界", 65, 2, 0.4),
+            ("<SP>", 0, 1, 0.3),
+        ])
+        # 新序列：DROP 掉 "好"（token idx=2）
+        new = [
+            Token("<SP>", "<SP>", 0.3, 0, 1, 0),
+            Token("呀", "zh_ya1", 0.5, 60, 2, 1),
+            # DROP: 好 消失
+            Token("<SP>", "<SP>", 0.3, 0, 1, 2),
+            Token("哎", "zh_ai1", 0.4, 64, 2, 3),
+            Token("哎", "zh_ai1", 0.4, 65, 2, 4),
+            Token("<SP>", "<SP>", 0.3, 0, 1, 5),
+        ]
+        path = AlignmentPath(ops=[
+            AlignmentOp("SP_ALIGN", None, (0,), 0.0),
+            AlignmentOp("REPLACE", None, (1,), 0.0),
+            AlignmentOp("DROP", None, (2,), 0.0),       # 好 被丢弃，duration=0.5 转移
+            AlignmentOp("SP_ALIGN", None, (3,), 0.0),
+            AlignmentOp("REPLACE", None, (4,), 0.0),
+            AlignmentOp("REPLACE", None, (5,), 0.0),
+            AlignmentOp("SP_ALIGN", None, (6,), 0.0),
+        ], total_cost=0.0)
+        result = allocate_durations(new, orig, path, self.w)
+        orig_sum = sum(t.duration for t in orig)   # 0.3+0.5+0.5+0.3+0.4+0.4+0.3 = 2.7
+        new_sum = sum(t.duration for t in result)
+        assert abs(orig_sum - new_sum) < 0.01, (
+            f"orig={orig_sum}, new={new_sum} (DROP duration lost/duplicated)")
+
 
 from alignment.speed import apply_speed_change
 
