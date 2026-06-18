@@ -213,6 +213,43 @@ class TestNormalizer:
         assert len(sp) == 5, f"expected 5 (physical max), got {len(sp)}: {sp}"
         assert len(sp) == len(set(sp)), f"duplicates in {sp}"
 
+    def test_english_word_interiors_helper(self):
+        """_english_word_interiors 正确识别词内部（场景 E 修复核心）."""
+        from alignment.preprocess import _english_word_interiors
+        # "beautiful" 占 0-8, 内部 = (0, 8] = {1..8}
+        inv = _english_word_interiors("beautiful")
+        assert inv == {1, 2, 3, 4, 5, 6, 7, 8}
+        assert 0 not in inv  # 词首之前合法
+        assert 9 not in inv  # 词末之后合法
+        # 混合: "ab CD" → "ab"(0-1) 内部={2}? 不对：内部=(0,1]={1}, " "(2), "CD"(3-4) 内部=(3,4]={4}
+        inv2 = _english_word_interiors("ab CD")
+        assert inv2 == {1, 4}, f"got {inv2}"  # 注意空格在位置2, 不算词内部
+        # 单字母词无内部
+        assert _english_word_interiors("a") == set()
+        # 纯中文/标点无内部
+        assert _english_word_interiors("你好世界") == set()
+
+    def test_sp_candidate_not_inside_english_word(self):
+        """SP 候选不落在英文词内部（场景 E 回归）.
+
+        失败场景: "beautiful day" 等英文词组在均匀填充时，会把 SP 位置
+        放在词内部（如 "beautiful" 的某个字母上）。tokenizer 的 en-分支
+        扫描整个词，会跳过该位置 —— SP 候选被静默吞掉，导致最终 SP 数
+        少于 target。
+        """
+        lyrics = "hello world\n你好\nI love you\n天空\nbeautiful day\n再见\n"
+        text, sp = normalize_lyrics(lyrics, sp_target=8)
+        # 计算所有落在词内部的位置
+        from alignment.preprocess import _english_word_interiors
+        invalid = _english_word_interiors(text)
+        offenders = [p for p in sp if p in invalid]
+        assert not offenders, (
+            f"SP candidates inside English words: {offenders}; "
+            f"text={text!r}, sp={sp}, invalid={sorted(invalid)}"
+        )
+        # 应该仍然有 8 个（文本足够长，边界位置充足）
+        assert len(sp) == 8, f"expected 8 SP candidates, got {len(sp)}: {sp}"
+
 
 from alignment.preprocess import tokenize_units
 

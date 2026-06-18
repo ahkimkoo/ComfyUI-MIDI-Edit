@@ -79,22 +79,59 @@ def normalize_lyrics(text: str, sp_target: int,
         cleaned = _normalize_digits(cleaned)
 
     sp_positions = _select_sp_candidates(
-        strong_pos, median_pos, sp_target, len(cleaned)
+        strong_pos, median_pos, sp_target, cleaned
     )
 
     return cleaned, sp_positions
 
 
-def _select_sp_candidates(strong: list[int], median: list[int],
-                          target: int, text_len: int) -> list[int]:
+def _english_word_interiors(text: str) -> "set[int]":
+    """Return the set of SP-candidate positions that fall INSIDE an English word.
+
+    A position ``p`` is "inside" if it would split a maximal run of ASCII
+    letters — i.e. ``p`` is in ``(word_start, word_end]`` for some word
+    spanning ``[word_start, word_end]`` (word_end is the inclusive index of
+    the last letter). Positions at word boundaries (``p == word_start`` or
+    ``p == word_end + 1``) are VALID and not returned.
+
+    Rationale: the tokenizer's en-branch scans a full maximal run of ASCII
+    letters as one Unit, advancing ``char_offset`` past every interior
+    index. Any SP candidate placed on an interior index is silently
+    skipped → SP conservation breaks. Pre-filtering these positions in the
+    normalizer avoids the loss.
+    """
+    invalid: "set[int]" = set()
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i].isascii() and text[i].isalpha():
+            word_start = i
+            while i < n and text[i].isascii() and text[i].isalpha():
+                i += 1
+            word_end = i - 1  # inclusive last-letter index
+            # Interior positions: (word_start, word_end] = word_start+1 .. word_end
+            for p in range(word_start + 1, word_end + 1):
+                invalid.add(p)
+        else:
+            i += 1
+    return invalid
+
+
+def _select_sp_candidates(strong: "list[int]", median: "list[int]",
+                          target: int, text: str) -> "list[int]":
     """按强度筛选 SP 候选到 target 个。不足则均匀补充，避免位置冲突.
 
-    优先级：强标点 > 中标点 > 均匀填充。使用 set 去重，并通过 _uniform_sp_fill
-    的 exclude 参数防止填充位置与已有候选重合导致最终数量不足 target。
+    优先级：强标点 > 中标点 > 均匀填充。使用 set 去重，并通过
+    ``_uniform_sp_fill`` 的 exclude 参数防止填充位置与已有候选重合导致
+    最终数量不足 target。
+
+    额外排除：``text`` 中落在英文词内部的位置（见
+    ``_english_word_interiors``），防止 tokenizer 的 en-分支扫描整个词
+    时静默吞掉 SP 候选（场景 E）。
     """
     if target <= 0:
         return []
-    candidates: set[int] = set()
+    candidates: "set[int]" = set()
     for p in sorted(strong):
         if len(candidates) >= target:
             break
@@ -104,8 +141,11 @@ def _select_sp_candidates(strong: list[int], median: list[int],
             break
         candidates.add(p)
     if len(candidates) < target:
+        # 合并已有候选 + 英文词内部位置作为排除集，
+        # 防止均匀填充与候选重合或落在词内部。
+        exclude = _english_word_interiors(text) | candidates
         candidates.update(
-            _uniform_sp_fill(text_len, target - len(candidates), candidates)
+            _uniform_sp_fill(len(text), target - len(candidates), exclude)
         )
     return sorted(candidates)[:target]
 
