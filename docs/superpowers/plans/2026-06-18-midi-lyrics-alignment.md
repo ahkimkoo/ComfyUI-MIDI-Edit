@@ -48,7 +48,7 @@ models.py ← parser.py ← preprocess.py ← cost.py ← dp.py ← rebuild.py �
 - Create: `alignment/models.py`
 - Test: `tests/test_alignment.py`
 
-- [ ] **Step 1: 创建 alignment 子包骨架**
+- [x] **Step 1: 创建 alignment 子包骨架**
 
 ```python
 # alignment/__init__.py
@@ -74,7 +74,7 @@ __all__ = [
 ]
 ```
 
-- [ ] **Step 2: 实现 models.py（完整数据结构）**
+- [x] **Step 2: 实现 models.py（完整数据结构）**
 
 ```python
 # alignment/models.py
@@ -146,7 +146,7 @@ class CostWeights:
     max_word_occupy: int = 4
 ```
 
-- [ ] **Step 3: 写基础测试**
+- [x] **Step 3: 写基础测试**
 
 ```python
 # tests/test_alignment.py
@@ -180,14 +180,14 @@ class TestModels:
             op.kind = "DROP"  # frozen
 ```
 
-- [ ] **Step 4: 运行测试（预期 FAIL——模块未实现）**
+- [x] **Step 4: 运行测试（预期 FAIL——模块未实现）**
 
 Run: `pytest tests/test_alignment.py::TestModels -v`
 Expected: FAIL（ImportError，parser/cost/dp 等模块尚未实现）
 
 > 注：`__init__.py` 导入了所有子模块，Task 1 阶段会因 import 失败而报错。**临时方案**：先注释掉 `__init__.py` 中未实现模块的导入，仅保留 `models`，后续 Task 逐步解除注释。或直接跑 `pytest tests/test_alignment.py::TestModels -v` 时测试本身从 `alignment.models` 导入（不经过 `__init__`）。
 
-- [ ] **Step 5: 调整 __init__.py（仅导出已实现部分）**
+- [x] **Step 5: 调整 __init__.py（仅导出已实现部分）**
 
 将 `__init__.py` 暂时改为：
 ```python
@@ -199,12 +199,12 @@ __all__ = ["Token", "Track", "Unit", "AlignmentOp", "AlignmentPath", "CostWeight
 ```
 后续每完成一个 Task，解除对应导入。
 
-- [ ] **Step 6: 运行测试（预期 PASS）**
+- [x] **Step 6: 运行测试（预期 PASS）**
 
 Run: `pytest tests/test_alignment.py::TestModels -v`
 Expected: PASS（5 passed）
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add alignment/__init__.py alignment/models.py tests/test_alignment.py
