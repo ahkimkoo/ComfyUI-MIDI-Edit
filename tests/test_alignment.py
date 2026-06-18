@@ -445,3 +445,20 @@ class TestDurationAllocator:
         orig_sum = sum(t.duration for t in orig)
         new_sum = sum(t.duration for t in result)
         assert abs(orig_sum - new_sum) < 0.01
+
+
+from alignment.speed import apply_speed_change
+
+
+class TestSpeedAdapter:
+    def test_no_change_when_speed_1(self):
+        tokens = _make_tokens([("你", 60, 2, 0.4), ("好", 62, 2, 0.4)])
+        track = Track(tokens=tokens, meta={}, f0="261.6 293.7")
+        result = apply_speed_change([track], 1.0)
+        assert result[0].tokens[0].duration == 0.4
+
+    def test_speedup_halves_duration(self):
+        tokens = _make_tokens([("你", 60, 2, 0.8)])
+        track = Track(tokens=tokens, meta={}, f0="261.6 261.6 261.6 261.6")
+        result = apply_speed_change([track], 2.0)
+        assert abs(result[0].tokens[0].duration - 0.4) < 0.01
