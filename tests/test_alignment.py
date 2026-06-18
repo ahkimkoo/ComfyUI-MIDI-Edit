@@ -368,3 +368,80 @@ class TestRebuilder:
     def test_find_sections(self):
         sections = _find_sections(self.tokens)
         assert sections == [(1, 3)]
+
+
+from alignment.rebuild import allocate_durations
+from alignment.models import AlignmentOp, AlignmentPath, Unit
+
+
+class TestDurationAllocator:
+    def setup_method(self):
+        self.w = CostWeights()
+
+    def test_total_duration_conserved(self):
+        orig = _make_tokens([
+            ("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.5), ("<SP>", 0, 1, 0.3),
+        ])
+        new = [
+            Token("<SP>", "<SP>", 0.3, 0, 1, 0),
+            Token("呀", "zh_ya1", 0.5, 60, 2, 1),
+            Token("<SP>", "<SP>", 0.3, 0, 1, 2),
+        ]
+        path = AlignmentPath(ops=[
+            AlignmentOp("SP_ALIGN", None, (0,), 0.0),
+            AlignmentOp("REPLACE", None, (1,), 0.0),
+            AlignmentOp("SP_ALIGN", None, (2,), 0.0),
+        ], total_cost=0.0)
+        result = allocate_durations(new, orig, path, self.w)
+        orig_sum = sum(t.duration for t in orig)
+        new_sum = sum(t.duration for t in result)
+        assert abs(orig_sum - new_sum) < 0.01
+
+    def test_min_duration_enforced(self):
+        orig = _make_tokens([("长", 60, 2, 1.0), ("短", 62, 2, 0.1)])
+        new = [
+            Token("长", "zh_chang2", 1.0, 60, 2, 0),
+            Token("短", "zh_duan3", 0.1, 62, 2, 1),
+        ]
+        path = AlignmentPath(ops=[
+            AlignmentOp("REPLACE", None, (0,), 0.0),
+            AlignmentOp("REPLACE", None, (1,), 0.0),
+        ], total_cost=0.0)
+        result = allocate_durations(new, orig, path, self.w)
+        non_sp = [t for t in result if not t.is_sp]
+        assert all(t.duration >= 0.30 - 0.01 for t in non_sp)
+
+    def test_float_cleanup(self):
+        orig = _make_tokens([("你", 60, 2, 0.333333)])
+        new = [Token("呀", "zh_ya1", 0.333333, 60, 2, 0)]
+        path = AlignmentPath(ops=[AlignmentOp("REPLACE", None, (0,), 0.0)], total_cost=0.0)
+        result = allocate_durations(new, orig, path, self.w)
+        assert result[0].duration == 0.33
+
+    def test_split_shares_host_duration(self):
+        """SPLIT 场景：2 个 unit 共享 1 个 host token，duration 均分."""
+        # host token "啊" 时长 1.0s，被 2 个字共享（REPLACE + 1 SPLIT）
+        orig = _make_tokens([("<SP>", 0, 1, 0.3), ("啊", 60, 2, 1.0), ("<SP>", 0, 1, 0.3)])
+        # rebuild_tokens 已经给两个新 token 都填了 host.duration=1.0（未均分）
+        new = [
+            Token("<SP>", "<SP>", 0.3, 0, 1, 0),
+            Token("天", "zh_tian1", 1.0, 60, 2, 1),   # REPLACE 消费 host_idx=1
+            Token("气", "zh_qi4", 1.0, 60, 2, 2),    # SPLIT 消费 host_idx=1
+            Token("<SP>", "<SP>", 0.3, 0, 1, 3),
+        ]
+        path = AlignmentPath(ops=[
+            AlignmentOp("SP_ALIGN", None, (0,), 0.0),
+            AlignmentOp("REPLACE", None, (1,), 0.0),
+            AlignmentOp("SPLIT", None, (1,), 0.0),
+            AlignmentOp("SP_ALIGN", None, (2,), 0.0),
+        ], total_cost=0.0)
+        result = allocate_durations(new, orig, path, self.w)
+        # 两个非 SP token 应均分 1.0s → 各 0.5s
+        non_sp = [t for t in result if not t.is_sp]
+        assert len(non_sp) == 2
+        assert abs(non_sp[0].duration - 0.5) < 0.01
+        assert abs(non_sp[1].duration - 0.5) < 0.01
+        # 总时长守恒
+        orig_sum = sum(t.duration for t in orig)
+        new_sum = sum(t.duration for t in result)
+        assert abs(orig_sum - new_sum) < 0.01
