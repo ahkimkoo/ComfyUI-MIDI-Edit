@@ -178,3 +178,51 @@ class TestNormalizer:
         assert len(sp) == 3
         diffs = [sp[i+1] - sp[i] for i in range(len(sp)-1)]
         assert max(diffs) - min(diffs) <= 2
+
+
+from alignment.preprocess import tokenize_units
+
+
+class TestTokenizer:
+    def setup_method(self):
+        self.w = CostWeights()
+
+    def test_pure_chinese(self):
+        units = tokenize_units("你好", [], self.w)
+        assert len(units) == 2
+        assert all(u.kind == "zh" for u in units)
+        assert units[0].text == "你"
+        assert units[0].phoneme == "zh_ni3"
+        assert units[0].max_occupy == 1
+
+    def test_english_word(self):
+        units = tokenize_units("love", [], self.w)
+        assert len(units) == 1
+        assert units[0].kind == "en"
+        assert units[0].text == "love"
+        assert units[0].phoneme.startswith("en_")
+        assert units[0].max_occupy == min(4, 4)
+
+    def test_mixed(self):
+        units = tokenize_units("你love好", [], self.w)
+        assert len(units) == 3
+        assert units[0].kind == "zh"
+        assert units[1].kind == "en"
+        assert units[2].kind == "zh"
+
+    def test_sp_insertion(self):
+        units = tokenize_units("你好", [1], self.w)
+        assert len(units) == 3
+        assert units[0].text == "你"
+        assert units[1].kind == "sp"
+        assert units[2].text == "好"
+
+    def test_long_english_word_max_occupy_capped(self):
+        units = tokenize_units("extraordinarily", [], self.w)
+        assert units[0].max_occupy == 4  # capped
+
+    def test_spaces_ignored(self):
+        units = tokenize_units("hello world", [], self.w)
+        assert len(units) == 2
+        assert units[0].text == "hello"
+        assert units[1].text == "world"

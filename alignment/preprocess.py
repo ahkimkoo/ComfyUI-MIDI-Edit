@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from alignment.models import Unit, CostWeights
+
 try:
     # 复用 nodes.py 的 _normalize_digits（数字转中文）。
     # 注意：nodes.py 顶层 import g2pM，未安装该依赖时会 ModuleNotFoundError，
@@ -19,6 +21,11 @@ except ImportError:
         if not text:
             return text
         return text.translate(_DIGIT_TO_ZH)
+
+
+# tokenize_units 依赖 nodes.py 的拼音/英文音素函数（g2pM + g2p_en）。
+# 这两个函数无法内联（依赖模型权重），必须在 comfyui 环境运行。
+from nodes import char_to_phoneme, _word_to_phoneme
 
 
 # 标点强度分类
@@ -131,3 +138,87 @@ def _uniform_sp_fill(text_len: int, count: int,
         result.append(pos)
         exclude.add(pos)
     return result
+
+
+# CJK Unicode 范围（中日韩统一表意文字 + 扩展 A）
+_CJK_RANGES = (
+    (0x4E00, 0x9FFF),    # CJK Unified Ideographs
+    (0x3400, 0x4DBF),    # CJK Extension A
+)
+
+
+def _is_cjk(ch: str) -> bool:
+    """字符是否属于 CJK 统一表意文字范围."""
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _CJK_RANGES)
+
+
+def _is_ascii_letter(ch: str) -> bool:
+    """字符是否为 ASCII 字母（用于英文单词边界判定）."""
+    return ch.isascii() and ch.isalpha()
+
+
+def tokenize_units(text: str, sp_positions: list[int],
+                   weights: CostWeights) -> list[Unit]:
+    """把归一化文本切分为 Unit 列表.
+
+    中文一字一 zh 单元，英文连续字母一 en 单元，SP 位置插入 sp 单元。
+    保持文本顺序，SP 单元穿插在对应字符位置。
+
+    Args:
+        text: normalize_lyrics 返回的归一化文本
+        sp_positions: SP 候选位置（归一化文本中的字符索引）
+        weights: 代价权重（用 weights.max_word_occupy 截断英文词长度）
+
+    Returns:
+        按文本顺序排列的 Unit 列表（zh / en / sp 穿插）
+    """
+    units: list[Unit] = []
+    sp_set = set(sp_positions)
+    char_offset = 0
+
+    while char_offset < len(text):
+        # 当前位置需要插入 SP：先消费所有连续 SP（按 sp_positions 顺序）
+        while char_offset in sp_set:
+            units.append(Unit(
+                text="<SP>", phoneme="<SP>", kind="sp",
+                max_occupy=1, source="punct",
+            ))
+            sp_set.discard(char_offset)
+
+        if char_offset >= len(text):
+            break
+
+        ch = text[char_offset]
+        if ch == " ":
+            char_offset += 1
+            continue
+
+        if _is_cjk(ch):
+            units.append(Unit(
+                text=ch, phoneme=char_to_phoneme(ch), kind="zh", max_occupy=1,
+            ))
+            char_offset += 1
+        elif _is_ascii_letter(ch):
+            word_start = char_offset
+            while char_offset < len(text) and _is_ascii_letter(text[char_offset]):
+                char_offset += 1
+            word = text[word_start:char_offset]
+            ph = _word_to_phoneme(word)
+            max_occ = max(1, min(len(word), weights.max_word_occupy))
+            units.append(Unit(
+                text=word, phoneme=ph, kind="en", max_occupy=max_occ,
+            ))
+        else:
+            # 其他字符（理论上 normalize_lyrics 已过滤，保险起见跳过）
+            char_offset += 1
+
+    # 文本末尾的 SP（sp_positions 可包含 == len(text) 的位置）
+    while char_offset in sp_set:
+        units.append(Unit(
+            text="<SP>", phoneme="<SP>", kind="sp",
+            max_occupy=1, source="punct",
+        ))
+        char_offset += 1
+
+    return units
