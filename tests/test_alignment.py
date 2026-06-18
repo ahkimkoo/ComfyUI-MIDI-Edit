@@ -179,6 +179,40 @@ class TestNormalizer:
         diffs = [sp[i+1] - sp[i] for i in range(len(sp)-1)]
         assert max(diffs) - min(diffs) <= 2
 
+    def test_uniform_fill_short_text_fills_all_gaps(self):
+        """短文本 + 大 count 时，填充所有可用间隙，不丢位置.
+
+        Regression：旧 _uniform_sp_fill 在 count > text_len 时，
+        ``step = text_len / (count + 1)`` 让多个 i 映射到同一 base，
+        碰撞回退最终产生重复位置；上层 ``sorted(set(...))`` 去重后
+        数量不可预测。新实现显式返回所有可用位置（物理上限）。
+        """
+        # 4 字文本，要求 8 个 SP → 物理上限 5 个位置 (0..4)
+        text, sp = normalize_lyrics("你好世界", sp_target=8)
+        # 应该返回所有 5 个位置 [0,1,2,3,4]，而非去重后的更少
+        assert len(sp) == 5, f"expected 5 (all gaps filled), got {len(sp)}: {sp}"
+        # 顺序且覆盖整个范围
+        assert sp == sorted(sp)
+        assert sp[0] == 0
+        assert sp[-1] == len(text)
+
+    def test_uniform_fill_no_duplicates(self):
+        """均匀填补不产生重复位置（即使 count > text_len）."""
+        # 6 字文本要求 10 个 SP → 物理上限 7 个位置
+        text, sp = normalize_lyrics("一二三四五六", sp_target=10)
+        assert len(sp) == len(set(sp)), f"duplicates in {sp}"
+        # 物理上限 = text_len + 1 = 7
+        assert len(sp) == 7, f"expected 7 (all gaps), got {len(sp)}: {sp}"
+
+    def test_uniform_fill_stress_scenario(self):
+        """原始压力场景：4 字文本 + sp_target=8 不再静默丢 SP."""
+        # "你好\\n世界" 归一化后为 "你好世界"（4 字），newline 落在 offset=2
+        # 但 strong_pos 收集的位置不在归一化文本中产生额外字符。
+        text, sp = normalize_lyrics("你好\n世界", 8)
+        # 4 字文本最多 5 个 SP 位置 (0..4)
+        assert len(sp) == 5, f"expected 5 (physical max), got {len(sp)}: {sp}"
+        assert len(sp) == len(set(sp)), f"duplicates in {sp}"
+
 
 from alignment.preprocess import tokenize_units
 

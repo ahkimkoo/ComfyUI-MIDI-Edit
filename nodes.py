@@ -1720,6 +1720,20 @@ class MidiLyricsAlignment:
                 norm_text, sp_positions = normalize_lyrics(
                     track_lyrics, sp_target, normalize_digits
                 )
+            except ValueError as e:
+                return (f"Error: {e}",)
+
+            # SP 守恒检查：当歌词文本短到无法容纳 sp_target 个 SP 时，
+            # normalize_lyrics 会返回物理上限（text_len+1 个位置）。这里
+            # 显式提示 shortfall，避免 DP 静默使用更少的 SP_ALIGN，
+            # 让下游发现 SP 数量少于原轨道时能定位原因。
+            actual_sp = len(sp_positions)
+            if actual_sp < sp_target:
+                warnings_list.append(
+                    f"SP_COUNT_REDUCED(t{track_idx}:{sp_target}->{actual_sp})"
+                )
+
+            try:
                 units = tokenize_units(norm_text, sp_positions, weights)
             except ValueError as e:
                 return (f"Error: {e}",)

@@ -114,30 +114,27 @@ def _uniform_sp_fill(text_len: int, count: int,
                      exclude: "set[int] | None" = None) -> list[int]:
     """在文本中均匀分布 count 个 SP 位置，避开 exclude 中已占用的位置.
 
-    当均匀分布点与 exclude 冲突时，向两侧寻找最近可用位置，保证返回
-    恰好 count 个不重复位置（只要 text_len + 1 个槽位足够）。
+    当 count > 可用槽数（= text_len + 1 - len(exclude)）时（文本太短），
+    填充所有可用间隙（物理上限），由调用方决定是否触发 SP_COUNT_REDUCED
+    警告。返回的位置绝不与 exclude 重合，且彼此不重复。
+
+    旧实现的 bug：当 count >= text_len 时，``step = text_len / (count + 1)``
+    会让多个 i 映射到同一 base，碰撞搜索在槽位耗尽后回退到 base 自身，
+    产生重复位置；上层 ``sorted(set(candidates))`` 再去重，导致最终 SP
+    数量少于 target 且无任何信号 —— SP 守恒被悄悄打破。
     """
-    if count <= 0 or text_len <= 0:
+    if count <= 0 or text_len < 0:
         return []
     exclude = set(exclude) if exclude else set()
-    result: list[int] = []
-    step = text_len / (count + 1)
-    for i in range(count):
-        base = int(step * (i + 1))
-        pos = base
-        if pos in exclude or pos in result:
-            for delta in range(text_len + 1):
-                picked = None
-                for cand in (base + delta, base - delta):
-                    if 0 <= cand <= text_len and cand not in exclude and cand not in result:
-                        picked = cand
-                        break
-                if picked is not None:
-                    pos = picked
-                    break
-        result.append(pos)
-        exclude.add(pos)
-    return result
+    # 可用位置范围 [0, text_len]，扣除 exclude
+    all_positions = [p for p in range(text_len + 1) if p not in exclude]
+    if len(all_positions) <= count:
+        # 槽位不够：返回全部可用位置（物理上限）。
+        # 调用方据此判断是否需要 SP_COUNT_REDUCED 警告。
+        return all_positions
+    # 槽位充足：在 all_positions 上均匀采样，索引严格递增故无重复
+    step = len(all_positions) / (count + 1)
+    return [all_positions[int(step * (i + 1))] for i in range(count)]
 
 
 # CJK Unicode 范围（中日韩统一表意文字 + 扩展 A）
