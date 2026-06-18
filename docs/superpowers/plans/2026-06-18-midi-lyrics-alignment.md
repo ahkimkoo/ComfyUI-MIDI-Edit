@@ -1988,3 +1988,31 @@ git commit -m "test: add regression tests + docs for MidiLyricsAlignment"
 **2. Inline Execution** - 在当前会话中使用 executing-plans 执行任务，进行批量执行并设置检查点。
 
 请问选择哪种方案？
+
+---
+
+## Implementation Status: DONE (merged to dev)
+
+**执行方式**: Subagent-Driven Development（方案 1）
+**完成日期**: 2026-06-18
+**合并 commit**: merge to `dev` (no-ff)，feature 分支 `feature/midi-lyrics-alignment` 保留
+**测试**: 55 passing（comfyui conda 环境）
+**QC 决策**: APPROVE_WITH_RESIDUALS
+
+---
+
+## Residual Findings（留档，非阻断）
+
+实现期间发现并修复 2 个真实 bug。最终 QC 审查发现以下残留问题，登记备查：
+
+| ID | 标题 | 严重度 | Source | 位置 | Decision | Owner | Target |
+|----|------|--------|--------|------|----------|-------|--------|
+| RF-1 | `speed.py` sys.path 操纵（fragile import 策略） | Important | QC 综合审查 | `alignment/speed.py:7-8` | defer | @fullstack-dev | follow-up commit（改 package-relative import） |
+| RF-2 | warning 用 print（spec §7.1 要求 ComfyUI UI 反馈） | Important | QC 综合审查 | `nodes.py:1657` | defer | @fullstack-dev | follow-up（ComfyUI logging 集成） |
+| RF-3 | `force_tone4` 参数存在但未接线 | Important | QC 综合审查 | `nodes.py:1573` | defer | @fullstack-dev | follow-up（接线 or 移除） |
+| RF-4 | `split_cost` 固定 divisor=2（不追踪多次共享） | Minor | commit `7463baf` | `alignment/cost.py:34` | accept | — | 风险接受（保守估计，不影响最优路径） |
+| RF-5 | normalizer SP 均匀填补可能非最优位置 | Minor | spec §6.1 | `alignment/preprocess.py:113-140` | accept | — | 风险接受（DP 位置惩罚缓解） |
+
+**已修复的 bug（实现期）**:
+- `split_cost` off-by-one（commit `7463baf`，公式 `+1` → `+2`）
+- `_redistribute_drops` 多 section 重复分配（commit `ace4165`，改全局按比例分配）
