@@ -137,3 +137,44 @@ class TestCost:
         c = sp_align_cost(lyric_token, self.unit_sp, 3, [7], self.w)
         # min_dist = |3-7| = 4, P = 60
         assert c == self.w.w_structure * 4 + self.w.w_pitch * 60
+
+
+from alignment.preprocess import normalize_lyrics
+
+
+class TestNormalizer:
+    def test_basic_chinese(self):
+        text, sp = normalize_lyrics("你好世界", sp_target=1)
+        assert text == "你好世界"
+        assert len(sp) == 1
+
+    def test_strong_punct_used_first(self):
+        text, sp = normalize_lyrics("你好。世界！", sp_target=2)
+        assert len(sp) == 2
+
+    def test_median_punct_fallback(self):
+        text, sp = normalize_lyrics("你好，世界", sp_target=2)
+        assert len(sp) == 2
+
+    def test_digit_normalization(self):
+        text, sp = normalize_lyrics("123", sp_target=0, normalize_digits=True)
+        assert text == "一二三"
+
+    def test_digit_normalization_disabled(self):
+        text, sp = normalize_lyrics("123", sp_target=0, normalize_digits=False)
+        assert "1" in text
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="empty"):
+            normalize_lyrics("", sp_target=0)
+
+    def test_delete_quotes(self):
+        text, sp = normalize_lyrics('"你好"世界', sp_target=0)
+        assert '"' not in text
+        assert text == "你好世界"
+
+    def test_uniform_fill_distribution(self):
+        text, sp = normalize_lyrics("一二三四五六七八九十", sp_target=3)
+        assert len(sp) == 3
+        diffs = [sp[i+1] - sp[i] for i in range(len(sp)-1)]
+        assert max(diffs) - min(diffs) <= 2
