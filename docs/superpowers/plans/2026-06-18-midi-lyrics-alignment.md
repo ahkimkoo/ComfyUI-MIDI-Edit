@@ -381,10 +381,12 @@ git commit -m "feat(alignment): add JSON ↔ Token/Track parser"
 
 ## Task 3: CostFunction（cost.py）—— 核心
 
+> **Deviation note (PM-authorized 2026-06-18):** 原计划 `split_cost` 使用 `q = current_share_count + 1`，与测试期望（`0.4/2=0.2`、`1.0/2=0.5`，即 `current_share_count=0` 时 divisor=2）矛盾。修正为 `q = current_share_count + 2`，依据：SPLIT 触发时 host 已被前序操作消费（DP `c==1` 守卫），含 1 个初始消费者，故总 unit 数 = 1（初始）+ N（prior splits）+ 1（本次）= `current_share_count + 2`。与 spec §6.5 `d_host/(q+1)`（q=已存在 unit 数，含初始消费者）一致。Task 6 DP 调用 `split_cost()` 用默认 `current_share_count=0` → divisor=2。
+
 **Files:**
 - Create: `alignment/cost.py`
 
-- [ ] **Step 1: 实现 cost.py（5 个操作代价纯函数）**
+- [x] **Step 1: 实现 cost.py（5 个操作代价纯函数）**
 
 ```python
 # alignment/cost.py
@@ -416,9 +418,11 @@ def split_cost(host: Token, unit: Unit, w: CostWeights,
                current_share_count: int = 0) -> float:
     """SPLIT: zh 单元共享宿主 token。duration 被切细 → min_duration 惩罚.
 
-    current_share_count: 宿主已被几个单元共享（含本次则为 +1 后的总数）。
+    宿主已被前序操作（REPLACE/WORD_SPAN/SP_ALIGN）消费，含 1 个初始消费者。
+    current_share_count: 宿主上 prior SPLIT 次数（不含初始消费者）。
+    本次 SPLIT 后总 unit 数 = current_share_count + 2。
     """
-    q = current_share_count + 1  # 本次后总共享数
+    q = current_share_count + 2  # 1 初始消费者 + current_share_count prior + 1 本次
     est_dur = host.duration / q
     D = w.lambda_min_dur * max(0.0, w.min_duration - est_dur)
     return w.w_duration * D
@@ -454,7 +458,7 @@ def sp_align_cost(token: Token, unit: Unit, new_pos: int,
     return w.w_structure * S + w.w_pitch * P
 ```
 
-- [ ] **Step 2: 写测试**
+- [x] **Step 2: 写测试**
 
 ```python
 # tests/test_alignment.py（追加）
@@ -517,12 +521,12 @@ class TestCost:
         assert c == self.w.w_structure * 4 + self.w.w_pitch * 60
 ```
 
-- [ ] **Step 3: 解除 __init__.py 的 cost 导入，运行测试**
+- [x] **Step 3: 解除 __init__.py 的 cost 导入，运行测试**
 
 Run: `pytest tests/test_alignment.py::TestCost -v`
 Expected: PASS（8 passed）
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add alignment/cost.py alignment/__init__.py tests/test_alignment.py

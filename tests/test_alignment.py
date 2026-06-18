@@ -78,3 +78,62 @@ class TestParser:
         again = parse_tracks(s)
         assert len(again[0].tokens) == 4
         assert again[0].tokens[1].text == "你"
+
+
+from alignment.cost import (
+    replace_cost, word_span_cost, split_cost, drop_cost, sp_align_cost,
+)
+
+
+class TestCost:
+    def setup_method(self):
+        self.w = CostWeights()
+        self.token = Token("你", "zh_ni3", 0.4, 60, 2, 1)
+        self.unit_zh = Unit("好", "zh_hao3", "zh", 1)
+        self.unit_en = Unit("love", "en_L-AH1-V", "en", 3)
+        self.unit_sp = Unit("<SP>", "<SP>", "sp", 1, "punct")
+
+    def test_replace_cost_zero(self):
+        assert replace_cost(self.token, self.unit_zh, self.w) == 0.0
+
+    def test_word_span_balanced_low_cost(self):
+        span = [self.token, self.token, self.token]  # k=3 = ideal
+        c = word_span_cost(span, self.unit_en, self.w)
+        assert c == 0.0  # k==ideal → imbalance=0
+
+    def test_word_span_imbalanced(self):
+        span = [self.token]  # k=1, ideal=3
+        c = word_span_cost(span, self.unit_en, self.w)
+        assert c > 0.0
+
+    def test_split_cost_below_min_duration(self):
+        # host.duration=0.4, 共享后 est=0.2 < 0.30 → 惩罚
+        c = split_cost(self.token, self.unit_zh, self.w, current_share_count=0)
+        assert c > 0.0
+
+    def test_split_cost_above_min_duration(self):
+        long_token = Token("啊", "zh_a1", 1.0, 60, 2, 0)
+        c = split_cost(long_token, self.unit_zh, self.w, current_share_count=0)
+        assert c == 0.0  # 1.0/2=0.5 > 0.30
+
+    def test_drop_cost_pitch_loss(self):
+        tokens = [
+            Token("<SP>", "<SP>", 0.3, 0, 1, 0),
+            self.token,  # idx=1, pitch=60
+            Token("好", "zh_hao3", 0.4, 62, 2, 2),  # idx=2
+        ]
+        c = drop_cost(tokens[1], tokens, 1, self.w)
+        # nearest = idx=2 pitch=62, loss = |60-62| = 2
+        assert c == self.w.w_pitch * 2
+
+    def test_sp_align_at_orig_position_zero_structure(self):
+        sp_token = Token("<SP>", "<SP>", 0.3, 0, 1, 5)
+        c = sp_align_cost(sp_token, self.unit_sp, 5, [5], self.w)
+        # min_dist=0, is_sp → P=0
+        assert c == 0.0
+
+    def test_sp_align_moved(self):
+        lyric_token = Token("你", "zh_ni3", 0.4, 60, 2, 3)
+        c = sp_align_cost(lyric_token, self.unit_sp, 3, [7], self.w)
+        # min_dist = |3-7| = 4, P = 60
+        assert c == self.w.w_structure * 4 + self.w.w_pitch * 60
