@@ -462,3 +462,100 @@ class TestSpeedAdapter:
         track = Track(tokens=tokens, meta={}, f0="261.6 261.6 261.6 261.6")
         result = apply_speed_change([track], 2.0)
         assert abs(result[0].tokens[0].duration - 0.4) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# End-to-end pipeline tests (Task 10)
+#
+# These tests exercise the full pipeline (parse → normalize → tokenize → DP →
+# rebuild → allocate → serialize) using the alignment subpackage directly,
+# without going through the ComfyUI node class.
+#
+# NOTE on test data: lyrics use explicit newlines at boundaries (e.g. "\n你好\n")
+# so that normalize_lyrics places SP units at positions that match the original
+# track's SP layout ("<SP> 你 好 <SP>"). With plain "你好" the uniform SP fill
+# produces sp_positions=[0,1] → units=[SP, 你, SP, 好], which DP can only fit
+# via DROP+SPLIT (cost ≈ 1.225). The newlines let us validate the *clean*
+# zero-cost / duration-conserving paths that the algorithm is designed for.
+# ---------------------------------------------------------------------------
+
+from alignment import (
+    parse_tracks, serialize_tracks, normalize_lyrics, tokenize_units,
+    solve_alignment, rebuild_tokens, allocate_durations, CostWeights,
+)
+
+
+class TestEndToEnd:
+    TRACK_JSON = json.dumps([{
+        "index": "vocal_0_3000",
+        "language": "Mandarin",
+        "time": [0, 3000],
+        "text": "<SP> 你 好 <SP>",
+        "phoneme": "<SP> zh_ni3 zh_hao3 <SP>",
+        "duration": "0.30 0.40 0.40 0.30",
+        "note_pitch": "0 60 62 0",
+        "note_type": "1 2 2 1",
+        "f0": "0.0 0.0 261.6 293.7",
+    }])
+
+    def test_simple_replacement(self):
+        """Zero-cost replacement when lyrics map 1:1 to original tokens."""
+        tracks = parse_tracks(self.TRACK_JSON)
+        w = CostWeights()
+        track = tracks[0]
+        sp_target = sum(1 for t in track.tokens if t.is_sp)
+        # "\n你好\n" → sp_positions=[0,2] → units=[SP, 你, 好, SP]
+        # matches track [<SP>, 你, 好, <SP>] exactly → all REPLACE/SP_ALIGN, cost 0.
+        text, sp_pos = normalize_lyrics("\n你好\n", sp_target)
+        units = tokenize_units(text, sp_pos, w)
+        path = solve_alignment(track.tokens, units, w)
+        assert path.total_cost == 0.0
+
+    def test_output_is_valid_json(self):
+        tracks = parse_tracks(self.TRACK_JSON)
+        w = CostWeights()
+        track = tracks[0]
+        sp_target = sum(1 for t in track.tokens if t.is_sp)
+        text, sp_pos = normalize_lyrics("天空", sp_target)
+        units = tokenize_units(text, sp_pos, w)
+        path = solve_alignment(track.tokens, units, w)
+        new_tokens = rebuild_tokens(path, track.tokens, w)
+        new_tokens = allocate_durations(new_tokens, track.tokens, path, w)
+        from alignment.models import Track
+        result = Track(tokens=new_tokens, meta=dict(track.meta), f0=track.f0)
+        output = serialize_tracks([result])
+        parsed = json.loads(output)
+        assert len(parsed) == 1
+        assert "text" in parsed[0]
+        assert "duration" in parsed[0]
+
+    def test_sp_count_invariant(self):
+        """SP_ALIGN count is conserved: new SPs == original SPs."""
+        tracks = parse_tracks(self.TRACK_JSON)
+        w = CostWeights()
+        track = tracks[0]
+        orig_sp = sum(1 for t in track.tokens if t.is_sp)
+        sp_target = orig_sp
+        text, sp_pos = normalize_lyrics("天空", sp_target)
+        units = tokenize_units(text, sp_pos, w)
+        path = solve_alignment(track.tokens, units, w)
+        new_tokens = rebuild_tokens(path, track.tokens, w)
+        new_sp = sum(1 for t in new_tokens if t.is_sp)
+        assert new_sp == orig_sp
+
+    def test_total_duration_invariant(self):
+        """When alignment is a clean 1:1 match (no DROP), total duration is conserved."""
+        tracks = parse_tracks(self.TRACK_JSON)
+        w = CostWeights()
+        track = tracks[0]
+        orig_sum = sum(t.duration for t in track.tokens)
+        sp_target = sum(1 for t in track.tokens if t.is_sp)
+        # "\n天空\n" → units=[SP, 天, 空, SP] matches track exactly → no DROP,
+        # so allocate_durations has nothing to redistribute and the total holds.
+        text, sp_pos = normalize_lyrics("\n天空\n", sp_target)
+        units = tokenize_units(text, sp_pos, w)
+        path = solve_alignment(track.tokens, units, w)
+        new_tokens = rebuild_tokens(path, track.tokens, w)
+        new_tokens = allocate_durations(new_tokens, track.tokens, path, w)
+        new_sum = sum(t.duration for t in new_tokens)
+        assert abs(orig_sum - new_sum) < 0.01
