@@ -315,3 +315,56 @@ class TestDP:
         path = solve_alignment(tokens, units, self.w)
         kinds = [o.kind for o in path.ops]
         assert "WORD_SPAN" in kinds
+
+
+from alignment.rebuild import rebuild_tokens, _find_sections
+
+
+class TestRebuilder:
+    def setup_method(self):
+        self.w = CostWeights()
+        self.tokens = _make_tokens([
+            ("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.4),
+            ("好", 62, 2, 0.4), ("<SP>", 0, 1, 0.3),
+        ])
+
+    def test_replace_keeps_pitch_type(self):
+        from alignment.models import AlignmentOp, AlignmentPath, Unit
+        ops = [
+            AlignmentOp("SP_ALIGN", Unit("<SP>", "<SP>", "sp", 1), (0,), 0.0),
+            AlignmentOp("REPLACE", Unit("呀", "zh_ya1", "zh", 1), (1,), 0.0),
+            AlignmentOp("REPLACE", Unit("哎", "zh_ai1", "zh", 1), (2,), 0.0),
+            AlignmentOp("SP_ALIGN", Unit("<SP>", "<SP>", "sp", 1), (3,), 0.0),
+        ]
+        path = AlignmentPath(ops=ops, total_cost=0.0)
+        result = rebuild_tokens(path, self.tokens, self.w)
+        assert len(result) == 4
+        assert result[0].text == "<SP>"
+        assert result[1].text == "呀"
+        assert result[1].note_pitch == 60
+        assert result[1].note_type == 2
+
+    def test_word_span_sets_note_type(self):
+        from alignment.models import AlignmentOp, AlignmentPath, Unit
+        tokens = _make_tokens([
+            ("la", 60, 2, 0.3), ("la", 62, 2, 0.3), ("la", 64, 2, 0.3),
+        ])
+        ops = [AlignmentOp("WORD_SPAN", Unit("love", "en_L-AH1-V", "en", 3), (0, 1, 2), 0.0)]
+        path = AlignmentPath(ops=ops, total_cost=0.0)
+        result = rebuild_tokens(path, tokens, self.w)
+        assert len(result) == 3
+        assert all(r.text == "love" for r in result)
+        assert result[0].note_type == 2
+        assert result[1].note_type == 3
+        assert result[2].note_type == 3
+
+    def test_drop_produces_nothing(self):
+        from alignment.models import AlignmentOp, AlignmentPath, Unit
+        ops = [AlignmentOp("DROP", None, (1,), 0.0)]
+        path = AlignmentPath(ops=ops, total_cost=0.0)
+        result = rebuild_tokens(path, self.tokens, self.w)
+        assert len(result) == 0
+
+    def test_find_sections(self):
+        sections = _find_sections(self.tokens)
+        assert sections == [(1, 3)]
