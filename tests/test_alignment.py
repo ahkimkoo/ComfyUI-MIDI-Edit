@@ -250,6 +250,24 @@ class TestNormalizer:
         # 应该仍然有 8 个（文本足够长，边界位置充足）
         assert len(sp) == 8, f"expected 8 SP candidates, got {len(sp)}: {sp}"
 
+    def test_sp_candidate_strong_punct_inside_merged_word(self):
+        """RF-8: \\n 连接两英文词时，强标点位置在合并词内部 → 过滤掉.
+
+        失败场景: ``"hello\\nworld"`` 归一化后为 ``"helloworld"``，\\n 的
+        强标点位置 5 落在合并词内部。旧实现只对 ``_uniform_sp_fill`` 的
+        填充位置过滤，strong/median 位置直接进入候选 → 被 tokenizer 的
+        en-分支吞掉，SP 静默丢失。
+        """
+        # "hello\nworld" → cleaned "helloworld", \n 位置 5 在词内部
+        text, sp = normalize_lyrics("hello\nworld", sp_target=2)
+        from alignment.preprocess import _english_word_interiors
+        invalid = _english_word_interiors(text)
+        offenders = [p for p in sp if p in invalid]
+        assert not offenders, (
+            f"strong punct inside merged word: {offenders}; "
+            f"text={text!r}, sp={sp}, invalid={sorted(invalid)}"
+        )
+
 
 from alignment.preprocess import tokenize_units
 
@@ -738,6 +756,81 @@ class TestEndToEnd:
                 f"tracks share chars {common!r} - lyrics not partitioned; "
                 f"track0={track0_chars!r}, track1={track1_chars!r}"
             )
+
+    def test_warnings_output(self):
+        """RF-2: warnings 通过第二个返回值输出（替代 print）.
+
+        旧实现 warnings 仅 print()，ComfyUI Web UI 看不到。现在通过
+        RETURN_TYPES 第二个 STRING 输出。现有调用方取 result[0] 不变。
+        """
+        from nodes import MidiLyricsAlignment
+        node = MidiLyricsAlignment()
+        # 200 字塞进 2 token 槽 → 极端 SPLIT/HIGH_SPLIT 或
+        # MIN_DURATION_UNRESOLVED 警告。
+        result = node.align_lyrics(self.TRACK_JSON, "我" * 200)
+        assert len(result) == 2, (
+            f"expected 2-tuple (midi_json, warnings), got {len(result)} elements"
+        )
+        assert isinstance(result[1], str), (
+            f"warnings output must be str, got {type(result[1])}"
+        )
+        # 非 Error 输出时，200 字对 2 槽必然触发质量警告。
+        if "Error" not in result[0]:
+            assert result[1], (
+                "expected non-empty warnings for 200-char lyric in 2 slots"
+            )
+            assert (
+                "MIN_DURATION_UNRESOLVED" in result[1]
+                or "HIGH_SPLIT" in result[1]
+            ), f"unexpected warnings: {result[1]!r}"
+
+    def test_warnings_empty_on_clean_alignment(self):
+        """RF-2: 干净对齐时 warnings 返回空字符串（仍为 str 类型）."""
+        from nodes import MidiLyricsAlignment
+        node = MidiLyricsAlignment()
+        # "\n你好\n" → units=[SP, 你, 好, SP] 完美匹配 track → 无警告
+        result = node.align_lyrics(self.TRACK_JSON, "\n你好\n")
+        assert len(result) == 2
+        assert result[1] == "", f"expected empty warnings, got {result[1]!r}"
+
+    def test_force_tone4_applied(self):
+        """RF-3: force_tone4 把高音中文音素改四声.
+
+        Helper ``_apply_force_tone4`` 对 note_pitch >= threshold（默认 79=G5）
+        且以 ``zh_`` 开头、末位为声调数字的 phoneme，把末位改 4。
+        SP 与低音 token 不受影响。
+        """
+        from nodes import _apply_force_tone4
+        # pitch=80 (>79=G5), phoneme=zh_ni3 → zh_ni4
+        tokens = [Token("你", "zh_ni3", 0.4, 80, 2, 0)]
+        result = _apply_force_tone4(tokens, threshold=79)
+        assert result[0].phoneme == "zh_ni4", (
+            f"high-pitch zh phoneme should be forced to tone 4, got {result[0].phoneme}"
+        )
+        # pitch=60 (<79), 不改
+        tokens2 = [Token("你", "zh_ni3", 0.4, 60, 2, 0)]
+        result2 = _apply_force_tone4(tokens2, threshold=79)
+        assert result2[0].phoneme == "zh_ni3", (
+            f"low-pitch zh phoneme should be unchanged, got {result2[0].phoneme}"
+        )
+        # SP token, 不改（即使 pitch 高）
+        tokens3 = [Token("<SP>", "<SP>", 0.3, 80, 1, 0)]
+        result3 = _apply_force_tone4(tokens3, threshold=79)
+        assert result3[0].phoneme == "<SP>", (
+            f"SP phoneme should be unchanged, got {result3[0].phoneme}"
+        )
+
+    def test_force_tone4_boundary_threshold(self):
+        """RF-3: threshold 边界 — pitch == threshold 也改（>= 语义）."""
+        from nodes import _apply_force_tone4
+        # pitch == 79 (exactly G5), >= threshold → 改
+        tokens = [Token("啊", "zh_a1", 0.4, 79, 2, 0)]
+        result = _apply_force_tone4(tokens, threshold=79)
+        assert result[0].phoneme == "zh_a4"
+        # pitch == 78 (< threshold), 不改
+        tokens2 = [Token("啊", "zh_a1", 0.4, 78, 2, 0)]
+        result2 = _apply_force_tone4(tokens2, threshold=79)
+        assert result2[0].phoneme == "zh_a1"
 
 
 # ---------------------------------------------------------------------------

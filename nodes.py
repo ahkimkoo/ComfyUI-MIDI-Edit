@@ -1636,6 +1636,29 @@ def _distribute_lyrics(lyrics: str, tracks: list) -> list[str]:
     return result
 
 
+def _apply_force_tone4(tokens: list, threshold: int = 79) -> list:
+    """高音中文音素强制改四声（复用现有 force_tone4 逻辑）.
+
+    RF-3: 当 token 的 note_pitch >= threshold（默认 79=G5）且 phoneme
+    以 ``zh_`` 开头、末位为声调数字时，把末位改 4。SP 与非中文音素
+    不受影响。threshold 与 nodes.py:803-806 的 ``_apply_char`` 内联逻辑
+    保持一致。
+    """
+    from alignment.models import Token
+    result = []
+    for t in tokens:
+        if (not t.is_sp
+                and t.note_pitch >= threshold
+                and t.phoneme.startswith(ZH_FLAG)
+                and t.phoneme[-1].isdigit()):
+            new_phoneme = re.sub(r"(\d)$", "4", t.phoneme)
+            result.append(Token(t.text, new_phoneme, t.duration,
+                                t.note_pitch, t.note_type, t.index))
+        else:
+            result.append(t)
+    return result
+
+
 class MidiLyricsAlignment:
     """统一对齐算法节点（基于联合 DP）.
 
@@ -1659,8 +1682,8 @@ class MidiLyricsAlignment:
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("midi_json",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("midi_json", "warnings")
     FUNCTION = "align_lyrics"
     CATEGORY = "MIDI"
 
@@ -1688,7 +1711,7 @@ class MidiLyricsAlignment:
         try:
             tracks = parse_tracks(midi_json)
         except ValueError as e:
-            return (f"Error: {e}",)
+            return (f"Error: {e}", "")
 
         weights = CostWeights(
             w_pitch=w_pitch, w_duration=w_duration, w_structure=w_structure,
@@ -1721,7 +1744,7 @@ class MidiLyricsAlignment:
                     track_lyrics, sp_target, normalize_digits
                 )
             except ValueError as e:
-                return (f"Error: {e}",)
+                return (f"Error: {e}", "")
 
             # SP 守恒检查：当歌词文本短到无法容纳 sp_target 个 SP 时，
             # normalize_lyrics 会返回物理上限（text_len+1 个位置）。这里
@@ -1736,17 +1759,22 @@ class MidiLyricsAlignment:
             try:
                 units = tokenize_units(norm_text, sp_positions, weights)
             except ValueError as e:
-                return (f"Error: {e}",)
+                return (f"Error: {e}", "")
 
             try:
                 path = solve_alignment(track.tokens, units, weights)
             except ValueError as e:
-                return (f"Error: {e}",)
+                return (f"Error: {e}", "")
 
             new_tokens = rebuild_tokens(path, track.tokens, weights)
             new_tokens = allocate_durations(
                 new_tokens, track.tokens, path, weights
             )
+
+            # RF-3: force_tone4 — 高音（>=G5=79）中文音素强制改四声。
+            # 接线之前该参数仅存在于 INPUT_TYPES，从未生效。
+            if force_tone4:
+                new_tokens = _apply_force_tone4(new_tokens, threshold=79)
 
             # P2: surface min_duration violations that allocate_durations
             # could not resolve (no in-section lender available). rebuild.py
@@ -1780,7 +1808,7 @@ class MidiLyricsAlignment:
 
         output_json = serialize_tracks(result_tracks)
 
-        if warnings_list:
-            print(f"[MidiLyricsAlignment] warnings: {warnings_list}")
-
-        return (output_json,)
+        # RF-2: warnings 通过 RETURN_TYPES 的第二个输出返回，供 ComfyUI
+        # Web UI 反馈（spec §7.1）。替代原来的 print() 静默输出。
+        warnings_str = "; ".join(warnings_list) if warnings_list else ""
+        return (output_json, warnings_str)

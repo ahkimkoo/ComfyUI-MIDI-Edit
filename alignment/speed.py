@@ -1,11 +1,6 @@
 # alignment/speed.py
 """变速适配器（薄封装 nodes._apply_speed）."""
 from __future__ import annotations
-import sys
-import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from nodes import _apply_speed
 
 from alignment.models import Track
 from alignment.parser import serialize_track
@@ -15,9 +10,15 @@ def apply_speed_change(tracks: list[Track], speed: float) -> list[Track]:
     """对 tracks 应用变速（speed≠1 时）.
 
     复用 nodes._apply_speed：duration 乘 1/speed，f0 线性插值重采样。
+
+    RF-1: 延迟 import nodes._apply_speed 到函数内，避免模块加载时触发
+    nodes.py 的 g2pM 依赖及模块级 sys.path 操纵在不同运行时环境
+    （pytest/ComfyUI/直接 import）造成副作用。
     """
     if speed == 1.0:
         return tracks
+    # 延迟 import：避免模块加载时触发 nodes.py 的 g2pM 依赖
+    from nodes import _apply_speed
     track_dicts = [serialize_track(t) for t in tracks]
     result_dicts = _apply_speed(track_dicts, speed)
     return _parse_tracks_from_dicts(result_dicts)

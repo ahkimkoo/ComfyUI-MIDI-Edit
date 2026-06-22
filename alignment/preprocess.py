@@ -127,23 +127,32 @@ def _select_sp_candidates(strong: "list[int]", median: "list[int]",
 
     额外排除：``text`` 中落在英文词内部的位置（见
     ``_english_word_interiors``），防止 tokenizer 的 en-分支扫描整个词
-    时静默吞掉 SP 候选（场景 E）。
+    时静默吞掉 SP 候选。
+
+    RF-8: 该过滤同时应用于 strong/median/uniform 三类候选。场景：
+    ``"hello\\nworld"`` 归一化后为 ``"helloworld"``，\\n 的位置 5 落在
+    合并词内部，若不过滤会被 tokenizer 的 en-分支吞掉。过滤后若候选
+    不足 target，上层 SP_COUNT_REDUCED 警告会触发（比静默丢失好）。
     """
     if target <= 0:
         return []
+    # RF-8: 过滤掉落在英文词内部的位置（三类候选统一过滤）。
+    invalid = _english_word_interiors(text)
+    valid_strong = [p for p in strong if p not in invalid]
+    valid_median = [p for p in median if p not in invalid]
     candidates: "set[int]" = set()
-    for p in sorted(strong):
+    for p in sorted(valid_strong):
         if len(candidates) >= target:
             break
         candidates.add(p)
-    for p in sorted(median):
+    for p in sorted(valid_median):
         if len(candidates) >= target:
             break
         candidates.add(p)
     if len(candidates) < target:
         # 合并已有候选 + 英文词内部位置作为排除集，
         # 防止均匀填充与候选重合或落在词内部。
-        exclude = _english_word_interiors(text) | candidates
+        exclude = invalid | candidates
         candidates.update(
             _uniform_sp_fill(len(text), target - len(candidates), exclude)
         )
