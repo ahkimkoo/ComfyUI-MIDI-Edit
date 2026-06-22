@@ -1,7 +1,30 @@
 # alignment/rebuild.py
 """对齐路径 → 新 token 序列 + duration 分配."""
 from __future__ import annotations
-from alignment.models import Token, AlignmentPath, CostWeights
+from alignment.models import Token, Unit, AlignmentPath, CostWeights
+
+
+def _note_type(unit: Unit, is_continuation: bool = False) -> int:
+    """根据单元在乐句与词中的角色，决定 note_type。
+
+    定义：
+      1 = 段落/乐句收尾音（SP 位置或长音结尾）
+      2 = 普通音符 / 词首音符
+      3 = 延续音符（英文词跨多音符时的后续，共享同一音素）
+
+    判断依据是 token 的**实际角色**，不是继承原值也不是写死：
+    - SP 单元 → 1（段尾标记）
+    - 英文词 + 非首音符 → 3（延续，与前序音符共享同一词的音素）
+    - 其他（中文字、英文词首）→ 2（独立普通音符）
+
+    中文字即使是 SPLIT（共享宿主 token），各字 phoneme 不同，
+    不满足 type=3 的"共享同一音素"前提，故为 2。
+    """
+    if unit.kind == "sp":
+        return 1
+    if unit.kind == "en" and is_continuation:
+        return 3
+    return 2
 
 
 def rebuild_tokens(path: AlignmentPath, original_tokens: list[Token],
@@ -24,13 +47,13 @@ def rebuild_tokens(path: AlignmentPath, original_tokens: list[Token],
                 phoneme=op.unit.phoneme,
                 duration=orig.duration,
                 note_pitch=orig.note_pitch,
-                note_type=2,  # 中文字总是普通音符，不继承原 type=1(段尾)/3(延续)
+                note_type=_note_type(op.unit),
                 index=next_index,
             ))
             next_index += 1
 
         elif op.kind == "WORD_SPAN":
-            # 一个英文词横跨多个 token：首 token 词首(type=2)，其余词内(type=3)
+            # 英文词横跨 k 个 token：首音符 = 词首(2)，后续 = 延续(3)
             for k_pos, tidx in enumerate(op.token_indices):
                 orig = original_tokens[tidx]
                 new_tokens.append(Token(
@@ -38,7 +61,7 @@ def rebuild_tokens(path: AlignmentPath, original_tokens: list[Token],
                     phoneme=op.unit.phoneme,
                     duration=orig.duration,
                     note_pitch=orig.note_pitch,
-                    note_type=2 if k_pos == 0 else 3,
+                    note_type=_note_type(op.unit, is_continuation=(k_pos > 0)),
                     index=next_index,
                 ))
                 next_index += 1
@@ -51,7 +74,7 @@ def rebuild_tokens(path: AlignmentPath, original_tokens: list[Token],
                 phoneme=op.unit.phoneme,
                 duration=host.duration,
                 note_pitch=host.note_pitch,
-                note_type=2,  # 中文字总是普通音符，不继承宿主 type=1/3
+                note_type=_note_type(op.unit),
                 index=next_index,
             ))
             next_index += 1
@@ -61,14 +84,14 @@ def rebuild_tokens(path: AlignmentPath, original_tokens: list[Token],
             pass
 
         elif op.kind == "SP_ALIGN":
-            # 休止对齐：生成 <SP> token，音高 0、类型 1（段尾）
+            # 休止对齐：生成 <SP> token
             orig = original_tokens[op.token_indices[0]]
             new_tokens.append(Token(
                 text="<SP>",
                 phoneme="<SP>",
                 duration=orig.duration,
                 note_pitch=0,
-                note_type=1,
+                note_type=_note_type(op.unit),
                 index=next_index,
             ))
             next_index += 1
