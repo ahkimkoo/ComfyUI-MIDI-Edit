@@ -160,6 +160,7 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `midi_json` | STRING | 对齐后的 MIDI JSON 字符串 |
+| `warnings` | STRING | 警告信息（见下方"警告类型"；无警告时为空串） |
 
 **与 MIDI Edit Lyrics 的差异：**
 
@@ -172,6 +173,23 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 | 适用场景 | 已稳定，老工作流兼容 | 推荐新用户使用，对齐质量更可控 |
 
 > 同一输入下两者输出可能略有差异。`MidiLyricsAlignment` 在 DROP/SPLIT 时由 DP 自动选择代价最小的位置，比基于规则的分支更鲁棒。
+
+**多 track 行为：**
+
+输入含多个 track 时，整段歌词按各 track 的非 SP duration 比例自动分配——长 track 分到更多歌词，短 track 分到更少。分到空歌词的 track 原样保留（不替换）。例如：track0=30s + track1=1.5s 时，track1 只分到约 5% 的歌词。
+
+**警告类型（通过 `warnings` 输出）：**
+
+算法在物理限制或极端不匹配场景下会发出警告（分号分隔），用户可在 ComfyUI 中通过 `warnings` 输出查看：
+
+| 警告 | 含义 |
+|------|------|
+| `SP_COUNT_REDUCED(t{idx}:{orig}→{actual})` | SP 数受物理限制减少（如 4 字歌词无法容纳 8 个停顿，最多 5 个位置） |
+| `MIN_DURATION_UNRESOLVED(t{idx}:{count})` | 有 `{count}` 个 token 短于 0.30s 且无法从同 section 借时间（字数极端多） |
+| `HIGH_SPLIT_RATIO(t{idx})` | SPLIT 操作占比 > 40%（字数远多于原 token） |
+| `HIGH_DROP_RATIO(t{idx})` | DROP 操作占比 > 30%（字数远少于原 token） |
+
+> 这些警告表示输入的歌词与原曲 token 数严重不匹配，输出虽在算法层面最优，但演唱效果可能受限。建议调整歌词字数或选择更匹配的原曲。
 
 **示例：**
 

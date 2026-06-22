@@ -136,6 +136,12 @@ $$
 
 **关键性质**：步骤 6（AlignmentDP）是管线中唯一的决策点。所有"字数多 / 字数少 / 等长"的差异，都收敛到这**同一次 DP 求解**——前 5 步预处理与后 3 步重建都不含基于字数匹配情况的 `if` 分支。这是本算法"统一性"的工程体现。
 
+### 5.1 多 track 歌词分配
+
+当输入含多个 track 时，`MidiLyricsAlignment` 节点在进入单 track 对齐管线之前，会先做一次**歌词跨 track 分配**：按各 track 的非 SP duration 比例，把整段歌词切分到各 track（优先在换行边界切分）。每个 track 随后独立走 §5 的 9 步管线。分到空歌词的 track 原样保留。
+
+这一步是节点层（`nodes.py`）的预处理，不属于 `alignment/` 子包的核心算法。它的目的是避免短 track 被塞入与自身容量严重不匹配的歌词。
+
 ---
 
 ## 6. 联合动态规划
@@ -382,14 +388,16 @@ $$
 | 降级 | 算法自动处理，无需用户介入 | 原 track 无 SP（$S^{\star}=0$）；新歌词标点少于 $S^{\star}$（均匀补 SP 候选）或多于 $S^{\star}$（按强度筛选）；单 token track（$m=1$）；英文词长 $> K$（动态放宽 $K_{\text{eff}}$，见 8.1）；浮点精度清理 |
 | 降级 + 警告 | 算法尽力处理并通过警告反馈 | 字数远多于原 token（$> 2\times$，SPLIT 大量触发）；字数远少于原 token（$< 0.5\times$，DROP 大量触发）；`min_duration` 不可解 |
 
-**警告机制**：节点除输出 JSON 外，还返回一个警告列表，通过 ComfyUI UI 反馈展示。警告类型有四种：
+**警告机制**：节点除输出 JSON 外，还通过第二个返回值 `warnings` 输出警告（分号分隔），供 ComfyUI UI 展示。警告类型有四种：
 
 | 警告类型 | 触发条件 |
 |----------|----------|
-| `HIGH_SPLIT_RATIO` | SPLIT 产生的 token 占比 > 40% |
-| `HIGH_DROP_RATIO` | DROP 产生的 duration 占比 > 30% |
-| `MIN_DURATION_UNRESOLVED` | 存在无法满足 0.30 s 下限的 token |
-| `SP_REDISTRIBUTED` | SP 位置偏离原位平均 > 3 token |
+| `SP_COUNT_REDUCED(t{idx}:{orig}→{actual})` | SP 数受物理限制减少。当歌词文本长度小于原 track 的 SP 数时，可用的 SP 候选位置不足，实际 SP 数低于原 track |
+| `MIN_DURATION_UNRESOLVED(t{idx}:{count})` | {count} 个 token 短于 0.30s 且同 section 内无可借时间的长 token。通常发生在字数远多于原 token 的极端扩容场景 |
+| `HIGH_SPLIT_RATIO(t{idx})` | SPLIT 产生的 token 占比 > 40%（字数远多于原 token） |
+| `HIGH_DROP_RATIO(t{idx})` | DROP 产生的 duration 占比 > 30%（字数远少于原 token） |
+
+这些警告不影响输出 JSON 的生成（算法仍产出守恒的结果），但提示用户演唱效果可能受限。
 
 ### 8.1 英文超长词处理
 
