@@ -1798,8 +1798,14 @@ class MidiLyricsAlignment:
                     f"MIN_DURATION_UNRESOLVED(t{track_idx}:{short_count})"
                 )
 
+            # f0 重建：DP 重排 token 后原 f0 与 note_pitch 不再对应，
+            # 需按新 token 的 note_pitch 重新生成（否则 SoulX-Singer 合成冲突）
+            from alignment.rebuild import rebuild_f0
+            orig_f0_count = len(track.f0.split()) if track.f0 else 0
+            orig_total_dur = sum(t.duration for t in track.tokens)
+            new_f0 = rebuild_f0(new_tokens, orig_f0_count, orig_total_dur)
             result_track = Track(tokens=new_tokens, meta=dict(track.meta),
-                                 f0=track.f0)
+                                 f0=new_f0)
             result_tracks.append(result_track)
 
             # Existing quality warnings, now tagged with the track index so

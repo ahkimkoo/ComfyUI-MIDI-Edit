@@ -276,3 +276,42 @@ def _fmt_durs_inline(durations: list[float]) -> list[str]:
     if diff != 0 and rounded:
         rounded[-1] = round(rounded[-1] + diff, 2)
     return [f"{d:.2f}" for d in rounded]
+
+
+def rebuild_f0(new_tokens: list[Token], orig_f0_frame_count: int,
+               orig_total_duration: float) -> str:
+    """根据新 token 的 note_pitch 重建 f0 序列。
+
+    当 DP 重排了 token（REPLACE 继承不同原 token 的 pitch，DROP/SPLIT 改变
+    duration 分配），原 f0 序列与新 token 的 note_pitch 不再对应。如果原样
+    保留 f0，SoulX-Singer 合成时 pitch 与 f0 冲突 → 唱不出来。
+
+    重建策略：每个新 token 的 f0 段为其 note_pitch 对应的平直频率
+    （MIDI → Hz）。帧率与原 f0 一致，总帧数 ≈ 原 f0 帧数（总时长守恒）。
+
+    这丢失了原 f0 的颤音/滑音等表现力，但保证 pitch 与 f0 一致。
+    后续可用原 f0 重采样方案恢复表现力。
+    """
+    if orig_f0_frame_count <= 0 or orig_total_duration <= 0:
+        return ""
+
+    fps = orig_f0_frame_count / orig_total_duration
+    new_total_dur = sum(t.duration for t in new_tokens)
+    target_frames = max(1, round(new_total_dur * fps))
+
+    f0_vals: list[float] = []
+    for t in new_tokens:
+        n = max(1, round(t.duration * fps))
+        if t.note_pitch > 0:
+            freq = 440.0 * (2.0 ** ((t.note_pitch - 69) / 12.0))
+        else:
+            freq = 0.0
+        f0_vals.extend([round(freq, 1)] * n)
+
+    # 末尾校正：确保总帧数与 target 一致（round 误差补偿）
+    while len(f0_vals) < target_frames:
+        f0_vals.append(f0_vals[-1] if f0_vals else 0.0)
+    while len(f0_vals) > target_frames:
+        f0_vals.pop()
+
+    return " ".join(f"{v:.1f}" for v in f0_vals)
