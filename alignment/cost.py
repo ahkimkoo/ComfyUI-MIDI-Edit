@@ -8,8 +8,20 @@ from __future__ import annotations
 from alignment.models import Token, Unit, CostWeights
 
 
-def replace_cost(token: Token, unit: Unit, w: CostWeights) -> float:
-    """REPLACE: 1 zh 单元 ↔ 1 token。pitch/duration 全继承，代价 0."""
+def replace_cost(token: Token, unit: Unit, w: CostWeights,
+                 prev_token: Token | None = None) -> float:
+    """REPLACE: 1 zh 单元 ↔ 1 token。
+
+    pitch 连贯性代价：如果前一 token 的 pitch 与当前 token 差异大，
+    加惩罚。这让 DP 倾向于让字占据 pitch 连贯的连续 token（原曲旋律
+    天然连贯），而非跳跃式分配（中间穿插 DROP 打断旋律线条）。
+
+    prev_token 是 DP 传来的 tokens[i-1]（近似前一字的 pitch 来源）。
+    """
+    if (prev_token is not None
+            and not prev_token.is_sp and not token.is_sp
+            and prev_token.note_pitch > 0 and token.note_pitch > 0):
+        return abs(token.note_pitch - prev_token.note_pitch) * w.w_pitch_cont
     return 0.0
 
 

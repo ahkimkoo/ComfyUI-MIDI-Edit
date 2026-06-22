@@ -80,7 +80,8 @@ def solve_alignment(tokens: list[Token], units: list[Unit],
 
                     # --- REPLACE (zh 占 1 token) ---
                     if u.kind == "zh" and i < m:
-                        cost_r = replace_cost(tokens[i], u, weights)
+                        prev_tok = tokens[i - 1] if i > 0 else None
+                        cost_r = replace_cost(tokens[i], u, weights, prev_tok)
                         _relax(dp, i + 1, j + 1, s, 1, C + cost_r,
                                (i, j, s, c),
                                AlignmentOp("REPLACE", u, (i,), cost_r))

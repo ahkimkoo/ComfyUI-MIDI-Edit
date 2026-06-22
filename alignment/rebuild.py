@@ -209,38 +209,22 @@ def _collect_drops(path: AlignmentPath, original_tokens: list[Token]) -> list[fl
 
 def _redistribute_drops(tokens: list[Token], drop_durations: list[float],
                         weights: CostWeights) -> None:
-    """把 DROP 的 duration 按比例分配给所有已填 token（原地修改）.
+    """把 DROP 的 duration 均匀分配给所有已填 token（原地修改）.
 
-    全局按比例分配：每个非 SP token 分到
-    ``total_drop * (token.dur / sum_all_non_sp_dur)``。
-    保证总 duration 守恒（总和 = total_drop 恰好一次）。
-
-    .. note::
-        早期实现按 section 逐段分配，会把完整的 ``total_drop`` 在每个
-        section 重复施加一次，导致多 section 轨道的 DROP 时长被放大、
-        总 duration 守恒被破坏（回归 bug，见 Task 10 E2E 测试）。
+    均匀分配：每个非 SP token 分到 ``total_drop / 字数``。
+    保证总 duration 守恒，且避免"富者愈富"（按比例分配时原 duration
+    长的 token 分到更多，短的仍短）。
     """
     if not drop_durations or not tokens:
         return
     total_drop = sum(drop_durations)
-    # 收集所有非 SP token（跨所有 section）
     filled = [(i, tokens[i]) for i in range(len(tokens)) if not tokens[i].is_sp]
     if not filled:
         return
-    total_existing = sum(t.duration for _, t in filled)
-    if total_existing <= 0:
-        # 现有时长为 0：均分
-        per = total_drop / len(filled)
-        for i, _ in filled:
-            t = tokens[i]
-            tokens[i] = Token(t.text, t.phoneme, t.duration + per,
-                              t.note_pitch, t.note_type, t.index)
-    else:
-        # 全局按现有 duration 占比分配
-        for i, t in filled:
-            share = total_drop * (t.duration / total_existing)
-            tokens[i] = Token(t.text, t.phoneme, t.duration + share,
-                              t.note_pitch, t.note_type, t.index)
+    per = total_drop / len(filled)
+    for i, t in filled:
+        tokens[i] = Token(t.text, t.phoneme, t.duration + per,
+                          t.note_pitch, t.note_type, t.index)
 
 
 def _enforce_min_duration(tokens: list[Token], weights: CostWeights) -> None:

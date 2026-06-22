@@ -343,7 +343,8 @@ class TestDP:
             Unit("<SP>", "<SP>", "sp", 1, "punct"),
         ]
         path = solve_alignment(tokens, units, self.w)
-        assert path.total_cost == 0.0
+        # pitch 连贯性代价可能 > 0（相邻 token pitch 差异），但应很小
+        assert path.total_cost < 1.0
         assert len(path.ops) == 4
         assert all(o.kind == "REPLACE" or o.kind == "SP_ALIGN"
                    for o in path.ops)
@@ -631,7 +632,7 @@ class TestEndToEnd:
         text, sp_pos = normalize_lyrics("\n你好\n", sp_target)
         units = tokenize_units(text, sp_pos, w)
         path = solve_alignment(track.tokens, units, w)
-        assert path.total_cost == 0.0
+        assert path.total_cost < 1.0  # pitch 连贯性代价可能 > 0
 
     def test_output_is_valid_json(self):
         tracks = parse_tracks(self.TRACK_JSON)

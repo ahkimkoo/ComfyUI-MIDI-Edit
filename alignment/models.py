@@ -65,3 +65,4 @@ class CostWeights:
     lambda_min_dur: float = 5.0
     mu_word_boundary: float = 10.0
     max_word_occupy: int = 4
+    w_pitch_cont: float = 0.05  # pitch 连贯性：相邻字 pitch 差异惩罚
