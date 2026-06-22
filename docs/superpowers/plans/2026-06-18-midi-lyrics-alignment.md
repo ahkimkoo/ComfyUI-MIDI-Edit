@@ -1996,23 +1996,40 @@ git commit -m "test: add regression tests + docs for MidiLyricsAlignment"
 **执行方式**: Subagent-Driven Development（方案 1）
 **完成日期**: 2026-06-18
 **合并 commit**: merge to `dev` (no-ff)，feature 分支 `feature/midi-lyrics-alignment` 保留
-**测试**: 55 passing（comfyui conda 环境）
-**QC 决策**: APPROVE_WITH_RESIDUALS
+**测试**: 66 passing（comfyui conda 环境，含回归测试）
+**QC 决策**: APPROVE_WITH_RESIDUALS（后续 RF-1/2/3/8 已修复）
 
 ---
 
-## Residual Findings（留档，非阻断）
+## Residual Findings（留档）
 
-实现期间发现并修复 2 个真实 bug。最终 QC 审查发现以下残留问题，登记备查：
+实现期间发现并修复多个真实 bug。最终 QC 审查 + 真实数据压力测试发现以下问题，已处理如下：
 
-| ID | 标题 | 严重度 | Source | 位置 | Decision | Owner | Target |
-|----|------|--------|--------|------|----------|-------|--------|
-| RF-1 | `speed.py` sys.path 操纵（fragile import 策略） | Important | QC 综合审查 | `alignment/speed.py:7-8` | defer | @fullstack-dev | follow-up commit（改 package-relative import） |
-| RF-2 | warning 用 print（spec §7.1 要求 ComfyUI UI 反馈） | Important | QC 综合审查 | `nodes.py:1657` | defer | @fullstack-dev | follow-up（ComfyUI logging 集成） |
-| RF-3 | `force_tone4` 参数存在但未接线 | Important | QC 综合审查 | `nodes.py:1573` | defer | @fullstack-dev | follow-up（接线 or 移除） |
-| RF-4 | `split_cost` 固定 divisor=2（不追踪多次共享） | Minor | commit `7463baf` | `alignment/cost.py:34` | accept | — | 风险接受（保守估计，不影响最优路径） |
-| RF-5 | normalizer SP 均匀填补可能非最优位置 | Minor | spec §6.1 | `alignment/preprocess.py:113-140` | accept | — | 风险接受（DP 位置惩罚缓解） |
+| ID | 标题 | 严重度 | 位置 | 状态 | Commit |
+|----|------|--------|------|------|--------|
+| RF-1 | `speed.py` sys.path 操纵 | Important | `alignment/speed.py` | ✅ **fixed** | `7f8a578`（改延迟 import） |
+| RF-2 | warning 用 print | Important | `nodes.py` | ✅ **fixed** | `7f8a578`（RETURN_TYPES 加 warnings 输出） |
+| RF-3 | `force_tone4` 未接线 | Important | `nodes.py` | ✅ **fixed** | `7f8a578`（复用现有逻辑做后处理） |
+| RF-4 | `split_cost` 固定 divisor=2 | Minor | `alignment/cost.py:34` | 🟡 **accept** | 风险接受（保守估计，不影响最优路径） |
+| RF-5 | normalizer SP 均匀填补策略 | Minor | `alignment/preprocess.py` | 🟡 **accept** | 风险接受（DP 位置惩罚缓解） |
+| RF-6 | 多 track 歌词分配（P1） | Critical | `nodes.py` | ✅ **fixed** | `2905924`（按 duration 比例分配） |
+| RF-7 | min_duration 保护失效（P2/P3） | Important | `nodes.py` | ✅ **fixed** | `2905924`（加 MIN_DURATION_UNRESOLVED 警告） |
+| RF-8 | `\n` 连接英文词的 SP 落在词内部 | Minor | `alignment/preprocess.py` | ✅ **fixed** | `7f8a578`（strong/median 也过滤 _english_word_interiors） |
+| RF-9 | SP 候选落在英文词内部（场景 E） | Important | `alignment/preprocess.py` | ✅ **fixed** | `e2520e7`（_uniform_sp_fill 感知词边界） |
+| RF-10 | `_uniform_sp_fill` 去重丢失 | Critical | `alignment/preprocess.py` | ✅ **fixed** | `c8467e5`（短文本填满所有间隙 + SP_COUNT_REDUCED 警告） |
 
-**已修复的 bug（实现期）**:
-- `split_cost` off-by-one（commit `7463baf`，公式 `+1` → `+2`）
-- `_redistribute_drops` 多 section 重复分配（commit `ace4165`，改全局按比例分配）
+**已修复的全部 bug**（实现期 + 压力测试期）:
+- `split_cost` off-by-one（`7463baf`）
+- `_redistribute_drops` 多 section 重复分配（`ace4165`）
+- 多 track 歌词分配（`2905924`）
+- min_duration 警告缺失（`2905924`）
+- SP 守恒：`_uniform_sp_fill` 去重丢失（`c8467e5`）
+- SP 候选落在英文词内部（`e2520e7`）
+- `\n` 连接英文词的 strong/median SP 过滤（`7f8a578`）
+- speed.py sys.path 操纵（`7f8a578`）
+- warnings 用 print（`7f8a578`）
+- force_tone4 未接线（`7f8a578`）
+
+**仍接受的风险**（RF-4/5）:
+- RF-4: split_cost 固定 divisor=2——保守估计，DP 仍选全局最优，不影响正确性
+- RF-5: normalizer SP 均匀填补——可能非最优位置，但 DP 位置惩罚缓解；物理限制场景有 SP_COUNT_REDUCED 警告
