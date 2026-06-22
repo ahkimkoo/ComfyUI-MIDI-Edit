@@ -5,27 +5,15 @@ from __future__ import annotations
 import re
 
 from alignment.models import Unit, CostWeights
-
-try:
-    # 复用 nodes.py 的 _normalize_digits（数字转中文）。
-    # 注意：nodes.py 顶层 import g2pM，未安装该依赖时会 ModuleNotFoundError，
-    # 此时回退到内联实现（_normalize_digits 是纯函数，仅依赖 _DIGIT_TO_ZH）。
-    from nodes import _normalize_digits
-except ImportError:
-    # g2pM 未安装时回退到内联实现（_normalize_digits 是纯函数）。
-    # 内联自 nodes.py:84-91，保持映射完全一致。
-    _DIGIT_TO_ZH = str.maketrans("0123456789", "零一二三四五六七八九")
-
-    def _normalize_digits(text: str) -> str:
-        """Convert Arabic digits to Chinese number chars so they get proper phonemes."""
-        if not text:
-            return text
-        return text.translate(_DIGIT_TO_ZH)
-
-
-# tokenize_units 依赖 nodes.py 的拼音/英文音素函数（g2pM + g2p_en）。
-# 这两个函数无法内联（依赖模型权重），必须在 comfyui 环境运行。
-from nodes import char_to_phoneme, _word_to_phoneme
+# Self-contained phoneme helpers (g2pM + g2p_en). Imported from the alignment
+# subpackage itself rather than the top-level nodes.py to avoid the ComfyUI
+# ``sys.modules['nodes']`` naming conflict (ComfyUI core ships its own
+# nodes.py without these functions).
+from alignment.phoneme import (
+    _normalize_digits,
+    char_to_phoneme,
+    word_to_phoneme as _word_to_phoneme,
+)
 
 
 # 标点强度分类
