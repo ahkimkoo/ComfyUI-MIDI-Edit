@@ -7,7 +7,15 @@ import json
 import math
 import os
 import re
+import sys
 import warnings
+
+# Ensure the alignment/ subpackage is importable under ComfyUI's loader
+# (ComfyUI imports this module dynamically; the extension dir may not be
+# on sys.path, so `from alignment import ...` in MidiLyricsAlignment would fail).
+_EXT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _EXT_DIR not in sys.path:
+    sys.path.insert(0, _EXT_DIR)
 
 # --- NLTK data directory ---
 # Use a local models/nltk directory under the project so data stays
