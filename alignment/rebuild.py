@@ -24,7 +24,7 @@ def rebuild_tokens(path: AlignmentPath, original_tokens: list[Token],
                 phoneme=op.unit.phoneme,
                 duration=orig.duration,
                 note_pitch=orig.note_pitch,
-                note_type=orig.note_type,
+                note_type=2,  # 中文字总是普通音符，不继承原 type=1(段尾)/3(延续)
                 index=next_index,
             ))
             next_index += 1
@@ -44,14 +44,14 @@ def rebuild_tokens(path: AlignmentPath, original_tokens: list[Token],
                 next_index += 1
 
         elif op.kind == "SPLIT":
-            # 一个原 token 容纳多个字：每个字复用宿主 token 的音高/类型
+            # 一个原 token 容纳多个字：每个字复用宿主 token 的音高
             host = original_tokens[op.token_indices[0]]
             new_tokens.append(Token(
                 text=op.unit.text,
                 phoneme=op.unit.phoneme,
                 duration=host.duration,
                 note_pitch=host.note_pitch,
-                note_type=host.note_type,
+                note_type=2,  # 中文字总是普通音符，不继承宿主 type=1/3
                 index=next_index,
             ))
             next_index += 1
