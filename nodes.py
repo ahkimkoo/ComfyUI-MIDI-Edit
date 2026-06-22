@@ -1667,6 +1667,70 @@ def _apply_force_tone4(tokens: list, threshold: int = 79) -> list:
     return result
 
 
+def _split_by_sp(tokens: list) -> list[tuple[list, list]]:
+    """把 token 序列按 SP 切分成 segments.
+
+    返回 [(sp_tokens, content_tokens), ...] 列表。
+    sp_tokens 是该 segment 的前置 SP token（0~多个）。
+    content_tokens 是非 SP token（DP 对齐目标）。
+    末尾的 SP token 归入最后一个 segment 的 sp_tokens。
+    """
+    segments: list[tuple[list, list]] = []
+    current_sp: list = []
+    current_content: list = []
+
+    for t in tokens:
+        if t.is_sp:
+            if current_content:
+                segments.append((current_sp, current_content))
+                current_sp = []
+                current_content = []
+            current_sp.append(t)
+        else:
+            current_content.append(t)
+
+    if current_content or current_sp:
+        segments.append((current_sp, current_content))
+    return segments
+
+
+def _distribute_lyrics_to_segments(lyrics: str,
+                                   segments: list[tuple[list, list]]
+                                   ) -> list[str]:
+    """把歌词按 segment 的 content token 数比例分配."""
+    capacities = [len(content) for _, content in segments]
+    total_cap = sum(capacities)
+    if total_cap == 0:
+        return [""] * len(segments)
+
+    lines = [l for l in lyrics.split("\n") if l.strip()]
+    if not lines:
+        lines = [lyrics]
+
+    result: list[str] = []
+    line_idx = 0
+    for i, (_, content) in enumerate(segments):
+        cap = len(content)
+        if i == len(segments) - 1:
+            result.append("\n".join(lines[line_idx:]))
+            break
+        if cap == 0:
+            result.append("")
+            continue
+        target_chars = int(sum(len(l) for l in lines) * cap / total_cap)
+        accumulated = 0
+        end_idx = line_idx
+        while end_idx < len(lines) and accumulated < target_chars:
+            accumulated += len(lines[end_idx])
+            end_idx += 1
+        result.append("\n".join(lines[line_idx:end_idx]))
+        line_idx = end_idx
+
+    while len(result) < len(segments):
+        result.append("")
+    return result
+
+
 class MidiLyricsAlignment:
     """统一对齐算法节点（基于联合 DP）.
 
@@ -1732,90 +1796,75 @@ class MidiLyricsAlignment:
 
         result_tracks = []
         warnings_list = []
-
         for track_idx, track in enumerate(tracks):
             track_lyrics = (
                 lyrics_per_track[track_idx]
                 if track_idx < len(lyrics_per_track) else ""
             )
 
-            # Empty share → preserve the original track verbatim. Trying to
-            # normalize empty lyrics raises ValueError("empty"); preserving
-            # is the right semantic (no lyric content assigned to this track).
             if not track_lyrics or not track_lyrics.strip():
                 result_tracks.append(track)
                 continue
 
-            sp_target = sum(1 for t in track.tokens if t.is_sp)
-            try:
-                norm_text, sp_positions = normalize_lyrics(
-                    track_lyrics, sp_target, normalize_digits
+            # SP 硬保留：按 SP token 切分成 segments，每段独立 DP。
+            # SP token 原样保留（f0/pitch/duration 不动），DP 只在
+            # 非 SP token 之间对齐字。这样旋律（f0+note_pitch）与
+            # 原 track 完全对应，不会错位。
+            segments = _split_by_sp(track.tokens)
+            lyrics_per_seg = _distribute_lyrics_to_segments(
+                track_lyrics, segments)
+
+            all_new_tokens = []
+            for seg_idx, ((sp_tokens, content_tokens), seg_lyrics) in enumerate(
+                    zip(segments, lyrics_per_seg)):
+                # SP token 原样保留
+                all_new_tokens.extend(sp_tokens)
+
+                if not content_tokens or not seg_lyrics.strip():
+                    all_new_tokens.extend(content_tokens)
+                    continue
+
+                # section 内 DP 对齐（不含 SP unit → sp_target=0）
+                try:
+                    norm_text, _ = normalize_lyrics(seg_lyrics, 0, normalize_digits)
+                    seg_units = tokenize_units(norm_text, [], weights)
+                except ValueError as e:
+                    return (f"Error: {e}", "")
+
+                try:
+                    seg_path = solve_alignment(content_tokens, seg_units, weights)
+                except ValueError as e:
+                    return (f"Error: {e}", "")
+
+                seg_new = rebuild_tokens(seg_path, content_tokens, weights)
+                seg_new = allocate_durations(
+                    seg_new, content_tokens, seg_path, weights)
+
+                if force_tone4:
+                    seg_new = _apply_force_tone4(seg_new, threshold=79)
+
+                short_count = sum(
+                    1 for t in seg_new
+                    if not t.is_sp and t.duration < weights.min_duration
                 )
-            except ValueError as e:
-                return (f"Error: {e}", "")
+                if short_count > 0:
+                    warnings_list.append(
+                        f"MIN_DURATION_UNRESOLVED(t{track_idx}s{seg_idx}:{short_count})"
+                    )
 
-            # SP 守恒检查：当歌词文本短到无法容纳 sp_target 个 SP 时，
-            # normalize_lyrics 会返回物理上限（text_len+1 个位置）。这里
-            # 显式提示 shortfall，避免 DP 静默使用更少的 SP_ALIGN，
-            # 让下游发现 SP 数量少于原轨道时能定位原因。
-            actual_sp = len(sp_positions)
-            if actual_sp < sp_target:
-                warnings_list.append(
-                    f"SP_COUNT_REDUCED(t{track_idx}:{sp_target}->{actual_sp})"
-                )
+                split_count = sum(1 for o in seg_path.ops if o.kind == "SPLIT")
+                drop_count = sum(1 for o in seg_path.ops if o.kind == "DROP")
+                if split_count > 0.4 * len(seg_units):
+                    warnings_list.append(f"HIGH_SPLIT_RATIO(t{track_idx}s{seg_idx})")
+                if drop_count > 0.3 * len(content_tokens):
+                    warnings_list.append(f"HIGH_DROP_RATIO(t{track_idx}s{seg_idx})")
 
-            try:
-                units = tokenize_units(norm_text, sp_positions, weights)
-            except ValueError as e:
-                return (f"Error: {e}", "")
+                all_new_tokens.extend(seg_new)
 
-            try:
-                path = solve_alignment(track.tokens, units, weights)
-            except ValueError as e:
-                return (f"Error: {e}", "")
-
-            new_tokens = rebuild_tokens(path, track.tokens, weights)
-            new_tokens = allocate_durations(
-                new_tokens, track.tokens, path, weights
-            )
-
-            # RF-3: force_tone4 — 高音（>=G5=79）中文音素强制改四声。
-            # 接线之前该参数仅存在于 INPUT_TYPES，从未生效。
-            if force_tone4:
-                new_tokens = _apply_force_tone4(new_tokens, threshold=79)
-
-            # P2: surface min_duration violations that allocate_durations
-            # could not resolve (no in-section lender available). rebuild.py
-            # silently leaves these short; tagging them here lets users
-            # diagnose "why does this track sound cramped" without altering
-            # the alignment subpackage's public API.
-            short_count = sum(
-                1 for t in new_tokens
-                if not t.is_sp and t.duration < weights.min_duration
-            )
-            if short_count > 0:
-                warnings_list.append(
-                    f"MIN_DURATION_UNRESOLVED(t{track_idx}:{short_count})"
-                )
-
-            # f0 重建：DP 重排 token 后原 f0 与 note_pitch 不再对应，
-            # 需按新 token 的 note_pitch 重新生成（否则 SoulX-Singer 合成冲突）
-            from alignment.rebuild import rebuild_f0
-            orig_f0_count = len(track.f0.split()) if track.f0 else 0
-            orig_total_dur = sum(t.duration for t in track.tokens)
-            new_f0 = rebuild_f0(new_tokens, orig_f0_count, orig_total_dur)
-            result_track = Track(tokens=new_tokens, meta=dict(track.meta),
-                                 f0=new_f0)
+            # f0 原样保留（SP 硬保留 → token 位置/顺序与原 track 对应 → f0 对应不变）
+            result_track = Track(tokens=all_new_tokens, meta=dict(track.meta),
+                                 f0=track.f0)
             result_tracks.append(result_track)
-
-            # Existing quality warnings, now tagged with the track index so
-            # multi-track inputs can be diagnosed per-track.
-            split_count = sum(1 for o in path.ops if o.kind == "SPLIT")
-            drop_count = sum(1 for o in path.ops if o.kind == "DROP")
-            if split_count > 0.4 * len(units):
-                warnings_list.append(f"HIGH_SPLIT_RATIO(t{track_idx})")
-            if drop_count > 0.3 * len(track.tokens):
-                warnings_list.append(f"HIGH_DROP_RATIO(t{track_idx})")
 
         if speed != 1.0:
             result_tracks = apply_speed_change(result_tracks, speed)

@@ -109,7 +109,10 @@ def solve_alignment(tokens: list[Token], units: list[Unit],
                                AlignmentOp("SPLIT", u, (i - 1,), cost_sp))
 
                     # --- SP_ALIGN (sp 占 1 token，计数 +1) ---
-                    if u.kind == "sp" and i < m and s < sp_target:
+                    # SP 硬保留：只在原 SP token 位置对齐。
+                    # 不允许把非 SP token 变成 SP——否则字会落在原 SP 位置
+                    # （f0=0），SoulX-Singer 不唱 → 漏唱。
+                    if u.kind == "sp" and i < m and s < sp_target and tokens[i].is_sp:
                         cost_sa = sp_align_cost(
                             tokens[i], u, i, orig_sp_positions, weights
                         )

@@ -609,6 +609,7 @@ from alignment import (
 
 
 class TestEndToEnd:
+    TRACK_JSON_orig_tokens = "<SP> 你 好 <SP>".split()
     TRACK_JSON = json.dumps([{
         "index": "vocal_0_3000",
         "language": "Mandarin",
@@ -635,35 +636,28 @@ class TestEndToEnd:
         assert path.total_cost < 1.0  # pitch 连贯性代价可能 > 0
 
     def test_output_is_valid_json(self):
-        tracks = parse_tracks(self.TRACK_JSON)
-        w = CostWeights()
-        track = tracks[0]
-        sp_target = sum(1 for t in track.tokens if t.is_sp)
-        text, sp_pos = normalize_lyrics("天空", sp_target)
-        units = tokenize_units(text, sp_pos, w)
-        path = solve_alignment(track.tokens, units, w)
-        new_tokens = rebuild_tokens(path, track.tokens, w)
-        new_tokens = allocate_durations(new_tokens, track.tokens, path, w)
-        from alignment.models import Track
-        result = Track(tokens=new_tokens, meta=dict(track.meta), f0=track.f0)
-        output = serialize_tracks([result])
-        parsed = json.loads(output)
+        """Output is valid JSON with required fields."""
+        from nodes import MidiLyricsAlignment
+        node = MidiLyricsAlignment()
+        result = node.align_lyrics(self.TRACK_JSON, "\n天空\n")
+        out = result[0]
+        assert not out.startswith("Error"), f"Node error: {out[:100]}"
+        parsed = json.loads(out)
         assert len(parsed) == 1
         assert "text" in parsed[0]
         assert "duration" in parsed[0]
 
     def test_sp_count_invariant(self):
-        """SP_ALIGN count is conserved: new SPs == original SPs."""
-        tracks = parse_tracks(self.TRACK_JSON)
-        w = CostWeights()
-        track = tracks[0]
-        orig_sp = sum(1 for t in track.tokens if t.is_sp)
-        sp_target = orig_sp
-        text, sp_pos = normalize_lyrics("天空", sp_target)
-        units = tokenize_units(text, sp_pos, w)
-        path = solve_alignment(track.tokens, units, w)
-        new_tokens = rebuild_tokens(path, track.tokens, w)
-        new_sp = sum(1 for t in new_tokens if t.is_sp)
+        """SP 硬保留：输出 SP 数 = 输入 SP 数（天然保证，SP 原样保留）。"""
+        from nodes import MidiLyricsAlignment
+        node = MidiLyricsAlignment()
+        result = node.align_lyrics(self.TRACK_JSON, "\n天空\n")
+        out = result[0]
+        assert not out.startswith("Error"), f"Node error: {out[:100]}"
+        parsed = json.loads(out)
+        new_tokens = parsed[0]["text"].split()
+        orig_sp = sum(1 for t in self.TRACK_JSON_orig_tokens if t == "<SP>")
+        new_sp = sum(1 for t in new_tokens if t == "<SP>")
         assert new_sp == orig_sp
 
     def test_total_duration_invariant(self):
@@ -866,25 +860,20 @@ class TestRegression:
         """Real 42-token vocal track: SP count and total duration conserved."""
         with open(self.FIXTURE_PATH) as f:
             track_json = f.read()
-        tracks = parse_tracks(track_json)
-        w = CostWeights()
-        track = tracks[0]
-        orig_sp = sum(1 for t in track.tokens if t.is_sp)
-        text, sp_pos = normalize_lyrics(
-            "我是一只小小鸟想要飞呀飞", orig_sp
-        )
-        units = tokenize_units(text, sp_pos, w)
-        path = solve_alignment(track.tokens, units, w)
-        new_tokens = rebuild_tokens(path, track.tokens, w)
-        new_tokens = allocate_durations(new_tokens, track.tokens, path, w)
-        # Invariant 1: SP count is conserved by soft SP placement.
-        new_sp = sum(1 for t in new_tokens if t.is_sp)
+        from nodes import MidiLyricsAlignment
+        node = MidiLyricsAlignment()
+        result = node.align_lyrics(track_json, "我是一只小小鸟想要飞呀飞")
+        out = result[0]
+        assert not out.startswith("Error"), f"Node error: {out[:100]}"
+        parsed = json.loads(out)
+        track = parsed[0]
+        new_tokens = track["text"].split()
+        orig_tokens = json.loads(track_json)[0]["text"].split()
+        orig_sp = sum(1 for t in orig_tokens if t == "<SP>")
+        new_sp = sum(1 for t in new_tokens if t == "<SP>")
         assert new_sp == orig_sp
-        # Invariant 2: total duration is conserved (multi-section aware).
-        # Tolerance slightly wider than the synthetic-track tests because
-        # this fixture exercises several sections with mixed DROP/SPLIT.
-        orig_sum = sum(t.duration for t in track.tokens)
-        new_sum = sum(t.duration for t in new_tokens)
+        orig_sum = sum(float(d) for d in json.loads(track_json)[0]["duration"].split())
+        new_sum = sum(float(d) for d in track["duration"].split())
         assert abs(orig_sum - new_sum) < 0.1
 
     def test_melody_direction_weak_assertion(self):
