@@ -2,6 +2,39 @@
 
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **MidiLyricsAlignment 节点**：基于联合动态规划的统一歌词对齐算法。
+  - 单一 DP 处理所有字数匹配/不匹配情况，无 `if/else` 场景分支
+  - 加权代价函数（`pitch` / `duration` / `structure`）求全局最优对齐
+  - SP 软约束（数量守恒，位置可由 DP 最优放置）
+  - 中英混合粒度（中文字 `max_occupy=1`，英文词 `max_occupy ≤ K=4`）
+  - 5 种原子操作：`REPLACE` / `WORD_SPAN` / `SPLIT` / `DROP` / `SP_ALIGN`
+  - 总 duration 与 SP 数量守恒（含多 section DROP 重分配）
+  - 新增 `alignment/` 子包：`models` / `parser` / `cost` / `preprocess` / `dp` / `rebuild` / `speed`
+- **回归测试**：基于真实人声 track（`docs/midi-edit-lyrics.json` 的 `vocal_0_15000`，42 token / 4 SP / 14.99s）的不变量测试
+- **性能测试**：150 token track 在 3s 内完成对齐（纯 Python DP），`@pytest.mark.slow` 标记
+- **`tests/conftest.py`**：注册 `slow` pytest marker
+- **`docs/alignment-algorithm.md`** / **`docs/midi-json-format.md`**：算法与格式说明文档
+
+### Fixed
+
+- **多 track 歌词分配**：输入含多 track 时，整段歌词按各 track 的非 SP duration 比例自动分配（之前每个 track 都被塞入完整歌词，导致短 track 灾难性 SPLIT）
+- **`_redistribute_drops` 多 section 守恒**：DROP 的 duration 改为全局按比例分配（之前每个 section 重复应用 `total_drop`，导致总时长膨胀）
+- **`split_cost` off-by-one**：divisor 从 `current_share_count + 1` 改为 `+2`（SPLIT 的宿主已被前序操作消费，含 1 个初始消费者）
+- **SP 守恒：`_uniform_sp_fill` 去重丢失**：当 `sp_target` 大于文本长度时，改为填满所有可用间隙并触发 `SP_COUNT_REDUCED` 警告（之前均匀填补产生重复位置，`set()` 去重后 SP 数静默减少）
+- **SP 候选避开英文词内部**：新增 `_english_word_interiors(text)` 过滤，SP 候选位置不落在英文词内部（之前 tokenizer 的 en 分支词扫描吞掉词内 SP 候选）
+- **`speed.py` 延迟 import**：移除模块级 `sys.path` 操纵，`from nodes import _apply_speed` 改为函数内延迟 import（避免模块加载副作用）
+- **warnings 作为节点输出**：`RETURN_TYPES` 从 `("STRING",)` 改为 `("STRING", "STRING")`，增加 `warnings` 输出（之前仅 `print`，ComfyUI UI 看不到）
+- **`force_tone4` 接线**：参数实际生效——高音（≥ G5）中文音素强制改四声（之前参数存在但 `align_lyrics` 内未使用）
+
+### Changed
+
+- README 节点列表从 3 个升级为 4 个，新增 `MidiLyricsAlignment (DP)` 章节（含参数表、与 `MIDIEditLyrics` 的差异对比、示例）
+- 项目结构说明同步加入 `alignment/` 子包与 `tests/` 目录
+
 ## [2026-06-16] v1.8.0
 
 ### Added
