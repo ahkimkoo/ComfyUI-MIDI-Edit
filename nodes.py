@@ -1713,24 +1713,27 @@ def _split_by_sp(tokens: list) -> list[tuple[list, list]]:
 def _distribute_lyrics_to_segments(lyrics: str,
                                    segments: list[tuple[list, list]]
                                    ) -> list[str]:
-    """把歌词按 section 容量比例分配，字级切分（不依赖换行）。
+    """把歌词按 section 容量比例分配（jieba 分词，不拆词）。
 
-    每个 section 分到约 `总字数 × token占比` 个字，
-    上限 `2 × token数`（DP SPLIT 限制）。超出部分留给后续 section。
+    用 jieba 分词，按词数比例分配。多字词不跨 section 拆分。
     """
-    # 去除换行，得到连续字串
+    import jieba
+
     flat = lyrics.replace("\n", "").replace(" ", "").strip()
     if not flat:
         return [""] * len(segments)
+
+    # jieba 分词
+    words = [w for w in jieba.cut(flat) if w.strip()]
+    total_words = len(words)
 
     capacities = [len(content) for _, content in segments]
     total_cap = sum(capacities)
     if total_cap == 0:
         return [""] * len(segments)
 
-    total_chars = len(flat)
     result: list[str] = []
-    pos = 0  # flat 字符指针
+    word_idx = 0
 
     for i, (_, content) in enumerate(segments):
         cap = len(content)
@@ -1739,15 +1742,15 @@ def _distribute_lyrics_to_segments(lyrics: str,
             continue
 
         if i == len(segments) - 1:
-            # 最后 section 拿剩余
-            result.append(flat[pos:])
+            result.append("".join(words[word_idx:]))
             break
 
-        # 按比例分配，上限 2×token
-        target = round(total_chars * cap / total_cap)
-        target = min(target, cap * 2, total_chars - pos)
-        result.append(flat[pos:pos + target])
-        pos += target
+        # 按比例分配词数，上限 2×token（SPLIT 限制）
+        target = round(total_words * cap / total_cap)
+        target = min(target, cap * 2, total_words - word_idx)
+        end_idx = min(word_idx + target, len(words))
+        result.append("".join(words[word_idx:end_idx]))
+        word_idx = end_idx
 
     while len(result) < len(segments):
         result.append("")
