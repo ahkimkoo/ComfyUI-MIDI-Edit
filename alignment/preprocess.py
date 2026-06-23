@@ -194,17 +194,14 @@ def _is_ascii_letter(ch: str) -> bool:
 
 def tokenize_units(text: str, sp_positions: list[int],
                    weights: CostWeights) -> list[Unit]:
-    """把归一化文本切分为 Unit 列表（jieba 分词）.
+    """把归一化文本切分为 Unit 列表.
 
-    中文用 jieba 分词：多字词（如"全程"）作为一个 Unit，
-    text=完整词、phoneme=组合拼音（zh_quan2-cheng2）。
-    单字仍为独立 Unit。这样当词数 ≤ token 数时每词占一 token（自然），
-    词数 > token 数时 SPLIT 只发生在单字词上。
+    中文一字一 zh 单元（一字一 phoneme，SoulX-Singer 格式要求）。
+    英文连续字母一 en 单元，SP 位置插入 sp 单元。
 
-    英文连续字母一词，SP 位置插入 sp 单元。
+    jieba 分词在 section 分配阶段（_distribute_lyrics_to_segments）使用，
+    这里保持逐字 token 化——因为 SoulX-Singer 的 phone2idx 只认单字音素。
     """
-    import jieba
-
     units: list[Unit] = []
     sp_set = set(sp_positions)
     char_offset = 0
@@ -226,31 +223,10 @@ def tokenize_units(text: str, sp_positions: list[int],
             continue
 
         if _is_cjk(ch):
-            # 收集连续 CJK 字符段，jieba 整体分词
-            cjk_start = char_offset
-            while char_offset < len(text) and _is_cjk(text[char_offset]) and char_offset not in sp_set:
-                char_offset += 1
-            cjk_text = text[cjk_start:char_offset]
-
-            for word in jieba.cut(cjk_text):
-                if not word or word.strip() == "":
-                    continue
-                if len(word) == 1:
-                    units.append(Unit(
-                        text=word, phoneme=char_to_phoneme(word),
-                        kind="zh", max_occupy=1,
-                    ))
-                else:
-                    # 多字词：组合拼音，压缩到一 token
-                    parts = []
-                    for c in word:
-                        p = char_to_phoneme(c)
-                        parts.append(p.replace("zh_", "") if p.startswith("zh_") else p)
-                    combined = "zh_" + "-".join(parts)
-                    units.append(Unit(
-                        text=word, phoneme=combined,
-                        kind="zh", max_occupy=1,
-                    ))
+            units.append(Unit(
+                text=ch, phoneme=char_to_phoneme(ch), kind="zh", max_occupy=1,
+            ))
+            char_offset += 1
         elif _is_ascii_letter(ch):
             word_start = char_offset
             while char_offset < len(text) and _is_ascii_letter(text[char_offset]):

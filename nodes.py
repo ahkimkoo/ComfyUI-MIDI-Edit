@@ -1745,9 +1745,9 @@ def _distribute_lyrics_to_segments(lyrics: str,
             result.append("".join(words[word_idx:]))
             break
 
-        # 按比例分配词数，上限 2×token（SPLIT 限制）
+        # 按比例分配词数（不再限制 2×token，SPLIT 会均分 duration）
         target = round(total_words * cap / total_cap)
-        target = min(target, cap * 2, total_words - word_idx)
+        target = min(target, total_words - word_idx)
         end_idx = min(word_idx + target, len(words))
         result.append("".join(words[word_idx:end_idx]))
         word_idx = end_idx
