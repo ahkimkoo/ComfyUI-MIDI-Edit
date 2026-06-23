@@ -820,14 +820,17 @@ def _apply_char(tokens: list[dict], idx: int, char: str,
         tokens[idx]["note_type"] = 3
     else:
         # 连续重复字检测：当前字与前一个非空非SP token 相同 → type=3
-        # （如"完完"的第二个"完"，与原 MIDI 数据的 note_type=3 规律一致）
+        # 但排除叠词（哥哥/妹妹等独立词汇，两字都独立演唱）
         is_repeat = False
         if char and char != "<SP>":
             for prev_idx in range(idx - 1, -1, -1):
                 prev_text = tokens[prev_idx].get("text", "")
                 if prev_text == "<SP>" or not prev_text:
                     continue
-                is_repeat = (prev_text == char)
+                if prev_text == char:
+                    # 检查是否叠词
+                    from alignment.phoneme import is_reduplication
+                    is_repeat = not is_reduplication(char, prev_text)
                 break
         if is_repeat:
             tokens[idx]["note_type"] = 3

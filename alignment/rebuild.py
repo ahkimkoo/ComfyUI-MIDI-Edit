@@ -2,6 +2,7 @@
 """对齐路径 → 新 token 序列 + duration 分配."""
 from __future__ import annotations
 from alignment.models import Token, Unit, AlignmentPath, CostWeights
+from alignment.phoneme import is_reduplication
 
 
 def _note_type(unit: Unit, is_continuation: bool = False) -> int:
@@ -45,11 +46,19 @@ def rebuild_tokens(path: AlignmentPath, original_tokens: list[Token],
             return new_tokens[-1].text
         return ""
 
+    def _is_repeat_continuation(unit_text: str) -> bool:
+        """连续相同字且非叠词 → type=3（延续音）。
+
+        叠词（哥哥/妹妹等）不算延续，两字都独立演唱（type=2）。
+        """
+        prev = _prev_non_sp_text()
+        return (prev == unit_text and not is_reduplication(unit_text, prev))
+
     for op in path.ops:
         if op.kind == "REPLACE":
             orig = original_tokens[op.token_indices[0]]
             # 连续相同字的第二个 → type=3（共享同一字/音素，是延续音）
-            is_repeat = (_prev_non_sp_text() == op.unit.text)
+            is_repeat = _is_repeat_continuation(op.unit.text)
             new_tokens.append(Token(
                 text=op.unit.text,
                 phoneme=op.unit.phoneme,
@@ -77,7 +86,7 @@ def rebuild_tokens(path: AlignmentPath, original_tokens: list[Token],
         elif op.kind == "SPLIT":
             # 一个原 token 容纳多个字：每个字复用宿主 token 的音高
             host = original_tokens[op.token_indices[0]]
-            is_repeat = (_prev_non_sp_text() == op.unit.text)
+            is_repeat = _is_repeat_continuation(op.unit.text)
             new_tokens.append(Token(
                 text=op.unit.text,
                 phoneme=op.unit.phoneme,
