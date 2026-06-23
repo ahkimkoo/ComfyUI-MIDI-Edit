@@ -52,7 +52,11 @@ def solve_alignment(tokens: list[Token], units: list[Unit],
     orig_sp_positions = [i for i, t in enumerate(tokens) if t.is_sp]
 
     # DP 表：dp[i][j][s][c]
-    dp = [[[[_DPCell() for _ in range(2)]
+    # c ∈ {0, 1, 2}：
+    #   0 = 初始或刚 DROP（禁止 SPLIT）
+    #   1 = REPLACE/WORD_SPAN/SP_ALIGN 过（允许 SPLIT 1 次）
+    #   2 = 已 SPLIT 过（禁止再 SPLIT — 每 token 最多容纳 2 字）
+    dp = [[[[_DPCell() for _ in range(3)]
             for _ in range(sp_target + 1)]
            for _ in range(n + 1)]
           for _ in range(m + 1)]
@@ -61,7 +65,7 @@ def solve_alignment(tokens: list[Token], units: list[Unit],
     for i in range(m + 1):
         for j in range(n + 1):
             for s in range(sp_target + 1):
-                for c in range(2):
+                for c in range(3):
                     cur = dp[i][j][s][c]
                     if cur.cost == math.inf:
                         continue
@@ -87,8 +91,6 @@ def solve_alignment(tokens: list[Token], units: list[Unit],
                                AlignmentOp("REPLACE", u, (i,), cost_r))
 
                     # --- WORD_SPAN (en 占 k token) ---
-                    # Guard `i < m`: en 词至少占 1 token；i==m 时无 token 可占，
-                    # 且 _effective_k 会因 remaining=0 仍返回 1 导致越界 (dp[m+1]).
                     if u.kind == "en" and i < m:
                         k_max = _effective_k(u, m - i, weights)
                         for k in range(1, k_max + 1):
@@ -102,9 +104,10 @@ def solve_alignment(tokens: list[Token], units: list[Unit],
                                                tuple(range(i, i + k)), cost_w))
 
                     # --- SPLIT (zh 共享 t_{i-1}) ---
+                    # 限制：每 token 最多 SPLIT 1 次（c==1 → c==2，c==2 禁止）
                     if u.kind == "zh" and c == 1 and i >= 1:
                         cost_sp = split_cost(tokens[i - 1], u, weights)
-                        _relax(dp, i, j + 1, s, 1, C + cost_sp,
+                        _relax(dp, i, j + 1, s, 2, C + cost_sp,
                                (i, j, s, c),
                                AlignmentOp("SPLIT", u, (i - 1,), cost_sp))
 
@@ -121,7 +124,7 @@ def solve_alignment(tokens: list[Token], units: list[Unit],
                                AlignmentOp("SP_ALIGN", u, (i,), cost_sa))
 
     # --- 找终态 ---
-    best_c = min(range(2), key=lambda c: dp[m][n][sp_target][c].cost)
+    best_c = min(range(3), key=lambda c: dp[m][n][sp_target][c].cost)
     final = dp[m][n][sp_target][best_c]
     if final.cost == math.inf:
         raise ValueError(

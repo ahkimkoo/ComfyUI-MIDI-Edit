@@ -1713,34 +1713,41 @@ def _split_by_sp(tokens: list) -> list[tuple[list, list]]:
 def _distribute_lyrics_to_segments(lyrics: str,
                                    segments: list[tuple[list, list]]
                                    ) -> list[str]:
-    """把歌词按 segment 的 content token 数比例分配."""
+    """把歌词按 section 容量比例分配，字级切分（不依赖换行）。
+
+    每个 section 分到约 `总字数 × token占比` 个字，
+    上限 `2 × token数`（DP SPLIT 限制）。超出部分留给后续 section。
+    """
+    # 去除换行，得到连续字串
+    flat = lyrics.replace("\n", "").replace(" ", "").strip()
+    if not flat:
+        return [""] * len(segments)
+
     capacities = [len(content) for _, content in segments]
     total_cap = sum(capacities)
     if total_cap == 0:
         return [""] * len(segments)
 
-    lines = [l for l in lyrics.split("\n") if l.strip()]
-    if not lines:
-        lines = [lyrics]
-
+    total_chars = len(flat)
     result: list[str] = []
-    line_idx = 0
+    pos = 0  # flat 字符指针
+
     for i, (_, content) in enumerate(segments):
         cap = len(content)
-        if i == len(segments) - 1:
-            result.append("\n".join(lines[line_idx:]))
-            break
         if cap == 0:
             result.append("")
             continue
-        target_chars = int(sum(len(l) for l in lines) * cap / total_cap)
-        accumulated = 0
-        end_idx = line_idx
-        while end_idx < len(lines) and accumulated < target_chars:
-            accumulated += len(lines[end_idx])
-            end_idx += 1
-        result.append("\n".join(lines[line_idx:end_idx]))
-        line_idx = end_idx
+
+        if i == len(segments) - 1:
+            # 最后 section 拿剩余
+            result.append(flat[pos:])
+            break
+
+        # 按比例分配，上限 2×token
+        target = round(total_chars * cap / total_cap)
+        target = min(target, cap * 2, total_chars - pos)
+        result.append(flat[pos:pos + target])
+        pos += target
 
     while len(result) < len(segments):
         result.append("")
