@@ -39,15 +39,23 @@ def rebuild_tokens(path: AlignmentPath, original_tokens: list[Token],
     new_tokens: list[Token] = []
     next_index = 0
 
+    def _prev_non_sp_text() -> str:
+        """返回前一个非 SP 输出 token 的 text（用于重复字检测）。"""
+        if new_tokens and not new_tokens[-1].is_sp:
+            return new_tokens[-1].text
+        return ""
+
     for op in path.ops:
         if op.kind == "REPLACE":
             orig = original_tokens[op.token_indices[0]]
+            # 连续相同字的第二个 → type=3（共享同一字/音素，是延续音）
+            is_repeat = (_prev_non_sp_text() == op.unit.text)
             new_tokens.append(Token(
                 text=op.unit.text,
                 phoneme=op.unit.phoneme,
                 duration=orig.duration,
                 note_pitch=orig.note_pitch,
-                note_type=_note_type(op.unit),
+                note_type=_note_type(op.unit, is_continuation=is_repeat),
                 index=next_index,
             ))
             next_index += 1
@@ -69,12 +77,13 @@ def rebuild_tokens(path: AlignmentPath, original_tokens: list[Token],
         elif op.kind == "SPLIT":
             # 一个原 token 容纳多个字：每个字复用宿主 token 的音高
             host = original_tokens[op.token_indices[0]]
+            is_repeat = (_prev_non_sp_text() == op.unit.text)
             new_tokens.append(Token(
                 text=op.unit.text,
                 phoneme=op.unit.phoneme,
                 duration=host.duration,
                 note_pitch=host.note_pitch,
-                note_type=_note_type(op.unit),
+                note_type=_note_type(op.unit, is_continuation=is_repeat),
                 index=next_index,
             ))
             next_index += 1
