@@ -2,6 +2,16 @@
 
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
+
+## [2026-06-23] v2.1.0
+
+### Added
+
+- **jieba 中文分词**：歌词先用 jieba 分词，多字词作为一个 Unit 映射到一 token
+  - 多字词（全程/跟着/跑毒）不被拆散
+  - section 分配按词数比例，不拆词
+  - SPLIT 只发生在单字词上，大幅减少 SPLIT 次数
+  - 14 字歌词从 ~14 SPLIT 降到 ~4 SPLIT
 ## [2026-06-23] v2.0.0
 
 ### Added
