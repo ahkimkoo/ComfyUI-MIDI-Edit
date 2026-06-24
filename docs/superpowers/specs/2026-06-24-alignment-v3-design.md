@@ -91,14 +91,14 @@ SPD = AVG(原 SP 的 duration) × (M / N)
 
 ### 3.5 分配
 
-#### Case 1: 新字数（不含 SP）≤ 原 token 数（不含 SP）
+#### Case 1: 新字数（含 SP）≤ 原 token 数（含 SP）
 
-新字按顺序 1:1 映射到原非 SP token：
+新单元（字 + SP）按顺序 1:1 映射到原 token（含原 SP）：
 - 字继承原 token 的 duration、pitch、f0 段
+- SP 替换原 token（duration=SPD，pitch=0，f0=0）
 - 多余的原 token 丢弃
-- SP 插入句间，duration = SPD
 
-#### Case 2: 新字数（不含 SP）> 原 token 数（不含 SP）
+#### Case 2: 新字数（含 SP）> 原 token 数（含 SP）
 
 初始：前 M 个字 1:1 映射。剩余字需要共享 token。
 
