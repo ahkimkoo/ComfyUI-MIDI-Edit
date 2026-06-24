@@ -3,6 +3,21 @@
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
 
+## [2026-06-24] v3.0.0
+
+### Added
+
+- **v3 对齐算法**：彻底重写 MidiLyricsAlignment，放弃 DP
+  - 顺序映射 + 贪心压缩（jieba 辅助）
+  - 原始 SP 移除，按新歌词断句重建 SP
+  - f0 按 token duration 切段重建（50fps，源码确认）
+  - SPD 公式计算 SP 时长
+  - 断句：标点优先，不足参照原 SP 数切最长句
+
+### Removed
+
+- DP 相关代码全部删除（cost.py / dp.py / rebuild.py / preprocess.py）
+
 ## [2026-06-23] v2.1.0
 
 ### Added
