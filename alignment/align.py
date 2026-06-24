@@ -220,9 +220,11 @@ def align_track(track, lyrics_text: str, weights, normalize_digits: bool,
         new_tokens = _apply_force_tone4(new_tokens, TONE4_THRESHOLD)
 
     # ---- 10. 组装 Track(更新 time) ----
-    new_total = sum(t.duration for t in new_tokens)
+    # time 必须与 f0 帧数精确对齐：SoulX-Singer 按 time 预分配音频缓冲区，
+    # 按帧数生成音频。两者不匹配会导致 "could not broadcast" 错误。
+    # 用实际 f0 帧数反算 time，消除 sum(round(d*50)) ≠ round(sum(d)*50) 的累积误差。
     meta = dict(track.meta)
-    meta["time"] = [0, round(new_total * 1000)]
+    meta["time"] = [0, round(len(new_f0) / FPS * 1000)]
     result_track = type(track)(
         tokens=new_tokens, meta=meta, f0=_format_f0(new_f0),
     )
