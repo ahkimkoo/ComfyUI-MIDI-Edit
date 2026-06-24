@@ -77,21 +77,28 @@ SP 数 = K + 1
 
 ### 3.4 SPD 计算
 
+SP 的 duration 是固定计算值（不从 DROP pool 匀出，由公式决定）：
+
 ```
+M = 原 track 总 token 数（含 SP）
+N = 新歌词总 unit 数（含 SP）
+
 SPD = AVG(原 SP 的 duration) × (M / N)
 限制: 0.1 ≤ SPD ≤ MAX(原 SP 的 duration)
 ```
 
+原 SP token 的 duration 在移除后丢弃（不重分配给字）。
+
 ### 3.5 分配
 
-#### Case 1: 新字数 ≤ 原 token 数
+#### Case 1: 新字数（不含 SP）≤ 原 token 数（不含 SP）
 
 新字按顺序 1:1 映射到原非 SP token：
 - 字继承原 token 的 duration、pitch、f0 段
 - 多余的原 token 丢弃
 - SP 插入句间，duration = SPD
 
-#### Case 2: 新字数 > 原 token 数
+#### Case 2: 新字数（不含 SP）> 原 token 数（不含 SP）
 
 初始：前 M 个字 1:1 映射。剩余字需要共享 token。
 
