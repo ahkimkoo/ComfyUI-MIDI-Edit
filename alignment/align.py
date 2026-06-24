@@ -40,36 +40,42 @@ _SENTENCE_PUNCT_RE = re.compile(r"[。！？，、；：\n]")
 # ---------------------------------------------------------------------------
 
 
-def segment_sentences(lyrics: str, target_count: int) -> list[str]:
-    """断句：先按标点，不足 target_count 时对最长句用 jieba 在词边界切分。
+def segment_sentences(lyrics: str, target_count: int = 0) -> list[str]:
+    """断句：先按标点，超过 10 字的句子再用 jieba 在词边界切分。
 
-    Step 1: 按标点(。！？，、；：\\n)断句。
-    Step 2: 句数 >= target_count 即返回。
-    Step 3: 否则取最长句，在中间附近的 jieba 词边界切分；最长句 <= 3 字不再切。
+    不参照原 track 的句数。该有多少句就多少句。
+    target_count 参数保留但不使用（向后兼容）。
     """
     parts = _SENTENCE_PUNCT_RE.split(lyrics or "")
     sentences = [s.strip() for s in parts if s.strip()]
-    if target_count <= 0:
-        return sentences if sentences else (
-            [lyrics.strip()] if (lyrics and lyrics.strip()) else []
-        )
+    if not sentences:
+        return [lyrics.strip()] if (lyrics and lyrics.strip()) else []
 
-    while len(sentences) < target_count:
-        if not sentences:
-            break
-        longest_idx = max(range(len(sentences)), key=lambda i: len(sentences[i]))
-        longest = sentences[longest_idx]
-        if len(longest) <= 3:
-            break
-        left, right = _split_at_word_boundary(longest)
-        # 必须真的切出两段非空且与原句不同，否则停止避免死循环。
-        if left and right and (left + right) == longest and left != longest:
-            sentences = (
-                sentences[:longest_idx] + [left, right] + sentences[longest_idx + 1:]
-            )
+    # 对超过 10 字的句子用 jieba 在词边界切分
+    MAX_SENTENCE_LEN = 10
+    result = []
+    for s in sentences:
+        if len(s) <= MAX_SENTENCE_LEN:
+            result.append(s)
         else:
-            break
-    return sentences
+            result.extend(_split_long_sentence(s, MAX_SENTENCE_LEN))
+    return result
+
+
+def _split_long_sentence(text: str, max_len: int) -> list[str]:
+    """把超过 max_len 字的句子用 jieba 词边界切成 <= max_len 的小句。"""
+    words = [w for w in jieba.cut(text) if w]
+    result = []
+    current = ""
+    for w in words:
+        if len(current) + len(w) > max_len and current:
+            result.append(current)
+            current = w
+        else:
+            current += w
+    if current:
+        result.append(current)
+    return result
 
 
 def calculate_spd(orig_sp_durations: list[float], orig_total: int,
@@ -115,8 +121,7 @@ def align_track(track, lyrics_text: str, weights, normalize_digits: bool,
     text = lyrics_text or ""
     if normalize_digits:
         text = _normalize_digits(text)
-    target_count = len(orig_sp_tokens)
-    sentences = segment_sentences(text, target_count)
+    sentences = segment_sentences(text)
     sentences = [s for s in sentences if s.strip()]
     if not sentences:
         raise ValueError("empty lyrics after normalization")
