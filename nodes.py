@@ -1754,6 +1754,7 @@ class MidiLyricsAlignment:
                 new_track, warns = align_track(
                     track, track_lyrics, weights,
                     normalize_digits, force_tone4,
+                    punctuate_fn=_restore_punctuation,
                 )
             except ValueError as e:
                 return (f"Error: {e}", "")

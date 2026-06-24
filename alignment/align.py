@@ -40,42 +40,69 @@ _SENTENCE_PUNCT_RE = re.compile(r"[。！？，、；：\n]")
 # ---------------------------------------------------------------------------
 
 
-def segment_sentences(lyrics: str, target_count: int = 0) -> list[str]:
-    """断句：先按标点，超过 10 字的句子再用 jieba 在词边界切分。
+def segment_sentences(lyrics: str, target_count: int = 0,
+                      punctuate_fn=None) -> list[str]:
+    """智能断句：先按标点，超过 10 字的用 CT-Transformer 标点模型找切分点。
 
-    不参照原 track 的句数。该有多少句就多少句。
-    target_count 参数保留但不使用（向后兼容）。
+    Args:
+        punctuate_fn: 可选，接收纯文本返回带标点的文本（CT-Transformer）。
+                      若为 None 则退化为在中间硬切。
     """
     parts = _SENTENCE_PUNCT_RE.split(lyrics or "")
     sentences = [s.strip() for s in parts if s.strip()]
     if not sentences:
         return [lyrics.strip()] if (lyrics and lyrics.strip()) else []
 
-    # 对超过 10 字的句子用 jieba 在词边界切分
     MAX_SENTENCE_LEN = 10
     result = []
     for s in sentences:
         if len(s) <= MAX_SENTENCE_LEN:
             result.append(s)
         else:
-            result.extend(_split_long_sentence(s, MAX_SENTENCE_LEN))
+            result.extend(_split_long_sentence(s, MAX_SENTENCE_LEN, punctuate_fn))
     return result
 
 
-def _split_long_sentence(text: str, max_len: int) -> list[str]:
-    """把超过 max_len 字的句子用 jieba 词边界切成 <= max_len 的小句。"""
-    words = [w for w in jieba.cut(text) if w]
-    result = []
-    current = ""
-    for w in words:
-        if len(current) + len(w) > max_len and current:
-            result.append(current)
-            current = w
-        else:
-            current += w
-    if current:
-        result.append(current)
-    return result
+def _split_long_sentence(text: str, max_len: int,
+                          punctuate_fn=None) -> list[str]:
+    """递归切分：超过 max_len 时用 CT-Transformer 找标点切分。"""
+    if len(text) <= max_len:
+        return [text]
+
+    # 尝试用 CT-Transformer 加标点，在标点处切
+    if punctuate_fn is not None:
+        try:
+            punctuated = punctuate_fn(text)
+            cut = _cut_at_punctuation(punctuated)
+            if cut and len(cut) == 2:
+                return (_split_long_sentence(cut[0], max_len, punctuate_fn)
+                        + _split_long_sentence(cut[1], max_len, punctuate_fn))
+        except Exception:
+            pass
+
+    # 退化为中间硬切
+    mid = len(text) // 2
+    return (_split_long_sentence(text[:mid], max_len, punctuate_fn)
+            + _split_long_sentence(text[mid:], max_len, punctuate_fn))
+
+
+def _cut_at_punctuation(text: str) -> list[str] | None:
+    """在标点处切成两段，优先句号 > 逗号。"""
+    mid = len(text) / 2.0
+    for pattern in (re.compile(r'[。！？]'), re.compile(r'[，、；]')):
+        best_pos = None
+        best_dist = float('inf')
+        for m in pattern.finditer(text):
+            d = abs(m.start() - mid)
+            if d < best_dist:
+                best_dist = d
+                best_pos = m.start()
+        if best_pos is not None:
+            left = re.sub(r'[，。！？；：、,.!?;:]', '', text[:best_pos]).strip()
+            right = re.sub(r'[，。！？；：、,.!?;:]', '', text[best_pos+1:]).strip()
+            if left and right:
+                return [left, right]
+    return None
 
 
 def calculate_spd(orig_sp_durations: list[float], orig_total: int,
@@ -96,7 +123,7 @@ def calculate_spd(orig_sp_durations: list[float], orig_total: int,
 
 
 def align_track(track, lyrics_text: str, weights, normalize_digits: bool,
-                force_tone4: bool) -> tuple:
+                force_tone4: bool, punctuate_fn=None) -> tuple:
     """主入口：把新歌词对齐到单个 track。
 
     Args:
@@ -105,6 +132,7 @@ def align_track(track, lyrics_text: str, weights, normalize_digits: bool,
         weights: CostWeights(v3 基本不用，保留入参以稳定 API)。
         normalize_digits: 是否把阿拉伯数字转中文数字字。
         force_tone4: 是否对高音中文音素强制改四声。
+        punctuate_fn: 可选的 CT-Transformer 标点函数，用于智能断句。
 
     Returns:
         (新 Track, warnings: list[str])。
@@ -121,7 +149,7 @@ def align_track(track, lyrics_text: str, weights, normalize_digits: bool,
     text = lyrics_text or ""
     if normalize_digits:
         text = _normalize_digits(text)
-    sentences = segment_sentences(text)
+    sentences = segment_sentences(text, punctuate_fn=punctuate_fn)
     sentences = [s for s in sentences if s.strip()]
     if not sentences:
         raise ValueError("empty lyrics after normalization")
