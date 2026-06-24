@@ -339,51 +339,48 @@ def _compute_pack(char_units: list[dict],
                   nonsl_tokens: list) -> list[int]:
     """决定每个非 SP token 承载多少字。pack[t] = 字数，sum(pack) = len(char_units)。
 
-    - 字数 <= 非 SP token 数：前 C 个 token 各 1 字，其余丢弃(pack=0)。
-    - 字数 > 非 SP token 数：
-        * 无多字词 -> 把超出部分匀给最长 token(单字+相邻字)。
-        * 有多字词 -> 正向遍历，压力下把整个多字词压到一个 token。
+    分配原则（效果优先）：
+    - 字数 <= 非 SP token 数：前 C 个 token 各 1 字，其余丢弃。
+    - 字数 > 非 SP token 数：按 duration 比例分配。
+      每 token 承载 round(D / target_per_char) 字，其中 target = ΣD / C。
+      长 token 多分（它们分得起），短 token 少分（不低于 1 字）。
+      这样每字至少 ~target 秒，不会出现 0.03s 的灾难。
     """
     nonsl = len(nonsl_tokens)
     C = len(char_units)
     if C <= nonsl:
         return [1] * C + [0] * (nonsl - C)
 
-    spans = _unit_spans(char_units)
-    has_multi = any(length > 1 for _, length in spans)
+    total_dur = sum(t.duration for t in nonsl_tokens)
+    target = total_dur / C  # 每字目标 duration
 
-    if not has_multi:
-        # 全单字：超出部分匀给最长 duration 的 token(任意组合都保持连续性)。
-        pack = [1] * nonsl
-        excess = C - nonsl
-        order = sorted(
-            range(nonsl), key=lambda k: nonsl_tokens[k].duration, reverse=True,
-        )
-        for k in range(excess):
+    # 初始分配：每 token round(D/target) 字，至少 1
+    pack = []
+    for t in nonsl_tokens:
+        n = max(1, round(t.duration / target))
+        pack.append(n)
+
+    # 调整：sum(pack) 可能 != C，需要增减
+    diff = C - sum(pack)
+    if diff > 0:
+        # 需要增加：给 duration 最长的 token 加（它们分得起）
+        order = sorted(range(nonsl),
+                       key=lambda k: nonsl_tokens[k].duration / pack[k],
+                       reverse=True)
+        for k in range(diff):
             pack[order[k % nonsl]] += 1
-        return pack
+    elif diff < 0:
+        # 需要减少：从 duration 最短的 token 减（保持至少 1）
+        order = sorted(range(nonsl),
+                       key=lambda k: nonsl_tokens[k].duration / pack[k])
+        remaining = -diff
+        for k in range(nonsl):
+            if remaining <= 0:
+                break
+            reduce = min(pack[order[k]] - 1, remaining)
+            pack[order[k]] -= reduce
+            remaining -= reduce
 
-    # 有多字词：正向遍历，压力下整词压缩。
-    pack: list[int] = []
-    i = 0  # 当前字(单元)位置
-    for t in range(nonsl):
-        rem_chars = C - i
-        rem_toks = nonsl - t
-        if rem_chars <= 0:
-            pack.append(0)
-            continue
-        if rem_toks == 1:
-            # 最后一个 token 吃掉剩余全部。
-            take = rem_chars
-        else:
-            wl = _word_len_at(spans, i)
-            if rem_chars > rem_toks and wl > 1:
-                take = wl
-            else:
-                take = 1
-        take = max(1, min(take, rem_chars))
-        pack.append(take)
-        i += take
     return pack
 
 
