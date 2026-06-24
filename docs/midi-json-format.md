@@ -100,13 +100,47 @@ elif tokens[idx].get("note_type") == 3:
 
 ### 3.6 `f0`
 
-基频曲线（单位：Hz），是**帧级数据，不与 token 1:1 对齐**。
+基频曲线（单位：Hz），是**帧级数据**。
 
-- 采样率约 **50fps**（每帧 0.02s），代码注释见 `nodes.py:1305`：`# Resample f0 (frame-level data at ~50fps)`。
-- 帧数 ≈ `Σ(duration) × 50`。
+#### f0 与 duration 的精确对应关系
+
+从 SoulX-Singer 源码（`soulxsinger/utils/data_processor.py`）确认：
+
+```python
+hop_size = 480       # 音频帧移（采样点）
+sample_rate = 24000  # 采样率
+
+# 帧率 = sample_rate / hop_size = 24000 / 480 = 50fps（每帧 20ms）
+```
+
+**每个 token 拥有 `round(duration × 50)` 个 f0 帧**：
+
+```
+Token 序列:  [SP d=0.33]  [老 d=0.26]  [师 d=0.24]  [SP d=0.28]  ...
+帧范围:       帧 0~16       帧 17~29      帧 30~41      帧 42~55      ...
+帧数:         17 (0.33×50)  13 (0.26×50)  12 (0.24×50)  14 (0.28×50)  ...
+f0 值:        [0,0,...]     [485,511,...] [297,327,...] [0,0,...]     ...
+```
+
+`data_processor.preprocess()` 中的关键代码：
+
+```python
+# 总帧数 = Σ(duration) × sample_rate / hop_size = Σ(duration) × 50
+duration = sum(note_duration) * sample_rate / hop_size
+mel2note = torch.zeros(int(duration), dtype=torch.long)
+
+# 每个 token 的帧边界
+dur = int(np.round(dur_sum * sample_rate / hop_size))  # = round(累积duration × 50)
+```
+
+`data_processor.process()` 中 f0 被 truncate 到 `mel2note` 长度后原样使用。
+
+#### 其他 f0 要点
+
 - `0.0` 表示清音 / 无声段（通常对应 `<SP>` 或气声段）。
-- 变速时通过 `numpy.interp` 线性插值重采样：新帧数 = `round(原帧数 × 1/speed)`，音高轮廓（Hz 数值）不变，仅拉伸/压缩时间轴。参见 `nodes.py:1305-1325` 与 `CHANGELOG.md`。
-- **本插件替换歌词时完全不修改 `f0`**（参见 `README.md:280`："f0（帧级数据）完全不做修改"；代码中 `_split_into_segments` 注释亦明确 f0 不参与 token 对齐，见 `nodes.py:713-731`）。
+- 变速时通过 `numpy.interp` 线性插值重采样：新帧数 = `round(原帧数 × 1/speed)`。
+- SP token 的 f0 段**多数为 0**，但边界处可能有少量非零值（前一个音符的尾音泄漏）。
+- 歌词替换时，可按 token duration 切分 f0 段，按新结构重新拼接（保留旋律段，SP 处插 0）。
 
 ## 4. 字段对应关系
 
