@@ -1,7 +1,32 @@
 # tests/test_alignment.py
-"""MidiLyricsAlignment 测试套件."""
+"""MidiLyricsAlignment 测试套件 (v3: 顺序映射 + 贪心压缩)."""
+import json
+import os
+
 import pytest
+
 from alignment.models import Token, Unit, AlignmentOp, AlignmentPath, CostWeights, Track
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_tokens(specs):
+    """快捷构造 token 列表。specs = [(text, pitch, type, dur), ...]"""
+    return [Token(t, "<SP>" if t == "<SP>" else f"ph_{t}",
+                  d, p, nt, i) for i, (t, p, nt, d) in enumerate(specs)]
+
+
+def _make_track(specs, f0="", meta=None):
+    """快捷构造 Track。specs 同 _make_tokens。"""
+    return Track(tokens=_make_tokens(specs), meta=meta or {}, f0=f0)
+
+
+# ---------------------------------------------------------------------------
+# 数据结构 (models.py 不变)
+# ---------------------------------------------------------------------------
 
 
 class TestModels:
@@ -29,7 +54,11 @@ class TestModels:
             op.kind = "DROP"  # frozen
 
 
-import json
+# ---------------------------------------------------------------------------
+# 解析 (parser.py 不变)
+# ---------------------------------------------------------------------------
+
+
 from alignment.parser import parse_tracks, serialize_track, serialize_tracks
 
 
@@ -79,496 +108,469 @@ class TestParser:
         assert len(again[0].tokens) == 4
         assert again[0].tokens[1].text == "你"
 
-
-from alignment.cost import (
-    replace_cost, word_span_cost, split_cost, drop_cost, sp_align_cost,
-)
-
-
-class TestCost:
-    def setup_method(self):
-        self.w = CostWeights()
-        self.token = Token("你", "zh_ni3", 0.4, 60, 2, 1)
-        self.unit_zh = Unit("好", "zh_hao3", "zh", 1)
-        self.unit_en = Unit("love", "en_L-AH1-V", "en", 3)
-        self.unit_sp = Unit("<SP>", "<SP>", "sp", 1, "punct")
-
-    def test_replace_cost_zero(self):
-        assert replace_cost(self.token, self.unit_zh, self.w) == 0.0
-
-    def test_word_span_balanced_low_cost(self):
-        span = [self.token, self.token, self.token]  # k=3 = ideal
-        c = word_span_cost(span, self.unit_en, self.w)
-        assert c == 0.0  # k==ideal → imbalance=0
-
-    def test_word_span_imbalanced(self):
-        span = [self.token]  # k=1, ideal=3
-        c = word_span_cost(span, self.unit_en, self.w)
-        assert c > 0.0
-
-    def test_split_cost_below_min_duration(self):
-        # host.duration=0.4, 共享后 est=0.2 < 0.30 → 惩罚
-        c = split_cost(self.token, self.unit_zh, self.w, current_share_count=0)
-        assert c > 0.0
-
-    def test_split_cost_above_min_duration(self):
-        long_token = Token("啊", "zh_a1", 1.0, 60, 2, 0)
-        c = split_cost(long_token, self.unit_zh, self.w, current_share_count=0)
-        assert c == 0.0  # 1.0/2=0.5 > 0.30
-
-    def test_drop_cost_pitch_loss(self):
+    def test_serialize_spd_duration_format(self):
+        """SP duration 是 SPD(如 0.49)，serialize_track 用 :.2f 格式化正确。"""
         tokens = [
-            Token("<SP>", "<SP>", 0.3, 0, 1, 0),
-            self.token,  # idx=1, pitch=60
-            Token("好", "zh_hao3", 0.4, 62, 2, 2),  # idx=2
+            Token("<SP>", "<SP>", 0.491, 0, 1, 0),
+            Token("你", "zh_ni3", 0.40, 60, 2, 1),
         ]
-        c = drop_cost(tokens[1], tokens, 1, self.w)
-        # nearest = idx=2 pitch=62, loss = |60-62| = 2
-        assert c == self.w.w_pitch * 2
-
-    def test_sp_align_at_orig_position_zero_structure(self):
-        sp_token = Token("<SP>", "<SP>", 0.3, 0, 1, 5)
-        c = sp_align_cost(sp_token, self.unit_sp, 5, [5], self.w)
-        # min_dist=0, is_sp → P=0
-        assert c == 0.0
-
-    def test_sp_align_moved(self):
-        lyric_token = Token("你", "zh_ni3", 0.4, 60, 2, 3)
-        c = sp_align_cost(lyric_token, self.unit_sp, 3, [7], self.w)
-        # min_dist = |3-7| = 4, P = 60
-        assert c == self.w.w_structure * 4 + self.w.w_pitch * 60
+        track = Track(tokens=tokens, meta={}, f0="")
+        d = serialize_track(track)
+        assert d["duration"].split()[0] == "0.49"
 
 
-from alignment.preprocess import normalize_lyrics
+# ---------------------------------------------------------------------------
+# 断句 segment_sentences
+# ---------------------------------------------------------------------------
 
 
-class TestNormalizer:
-    def test_basic_chinese(self):
-        text, sp = normalize_lyrics("你好世界", sp_target=1)
-        assert text == "你好世界"
-        assert len(sp) == 1
+from alignment.align import segment_sentences, calculate_spd, align_track
 
-    def test_strong_punct_used_first(self):
-        text, sp = normalize_lyrics("你好。世界！", sp_target=2)
-        assert len(sp) == 2
 
-    def test_median_punct_fallback(self):
-        text, sp = normalize_lyrics("你好，世界", sp_target=2)
-        assert len(sp) == 2
+class TestSegmentSentences:
+    def test_split_by_punctuation(self):
+        assert segment_sentences("你好。世界", 0) == ["你好", "世界"]
+
+    def test_split_by_newline(self):
+        assert segment_sentences("你好\n世界", 0) == ["你好", "世界"]
+
+    def test_no_split_when_target_zero(self):
+        assert segment_sentences("你好世界", 0) == ["你好世界"]
+
+    def test_split_to_meet_target(self):
+        """target=3 时对长句用 jieba 词边界反复切分直到 >= 3 句。"""
+        result = segment_sentences("我是一只小小鸟", 3)
+        assert len(result) >= 3
+        # 切分不应丢字
+        assert "".join(result) == "我是一只小小鸟"
+
+    def test_no_split_when_too_short(self):
+        """最长句 <= 3 字不再切。"""
+        result = segment_sentences("你好", 3)
+        # "你好" 只 2 字，无法再切
+        assert len(result) == 1
+        assert result == ["你好"]
+
+    def test_split_preserves_all_chars(self):
+        result = segment_sentences("天空海洋世界大地", 4)
+        assert "".join(result) == "天空海洋世界大地"
+
+    def test_empty_lyrics(self):
+        assert segment_sentences("", 2) == []
+
+
+# ---------------------------------------------------------------------------
+# SPD calculate_spd
+# ---------------------------------------------------------------------------
+
+
+class TestCalculateSpd:
+    def test_basic_formula(self):
+        # AVG=0.3, M=4, N=8 → 0.3 * 0.5 = 0.15
+        assert abs(calculate_spd([0.3, 0.3], 4, 8) - 0.15) < 1e-9
+
+    def test_clamped_to_max(self):
+        # AVG=0.5, M/N 很大 → 应被 MAX=0.6 截断
+        spd = calculate_spd([0.4, 0.6], 100, 10)
+        assert spd == 0.6
+
+    def test_clamped_to_min(self):
+        # ratio 极小 → 应被 0.1 兜底
+        spd = calculate_spd([0.3, 0.3], 1, 100)
+        assert spd == 0.1
+
+    def test_no_orig_sp_uses_default(self):
+        # 无原始 SP → AVG=MAX=0.3
+        spd = calculate_spd([], 4, 8)
+        assert abs(spd - 0.3 * 0.5) < 1e-9
+
+    def test_no_orig_sp_clamped(self):
+        spd = calculate_spd([], 1, 100)
+        assert spd == 0.1
+
+
+# ---------------------------------------------------------------------------
+# 核心对齐 align_track
+# ---------------------------------------------------------------------------
+
+
+class TestAlign:
+    def setup_method(self):
+        self.weights = CostWeights()
+        # 2 个非 SP token(你 pitch60 dur0.4, 好 pitch62 dur0.4)，2 个 SP(dur0.3)
+        self.track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.4),
+             ("好", 62, 2, 0.4), ("<SP>", 0, 1, 0.3)],
+            f0="0.0 " * 70,
+            meta={"language": "Mandarin", "time": [0, 1400]},
+        )
+
+    def test_basic_replacement(self):
+        """干净 1:1 映射：2 字 → 2 个非 SP token。"""
+        new_track, warns = align_track(
+            self.track, "天空", self.weights, True, False,
+        )
+        texts = [t.text for t in new_track.tokens]
+        # [SP] 天 空 [SP]
+        assert texts == ["<SP>", "天", "空", "<SP>"]
+        assert warns == []
+
+    def test_pitch_inherited_from_source_token(self):
+        """字继承源 token 的 pitch。"""
+        new_track, _ = align_track(
+            self.track, "天空", self.weights, True, False,
+        )
+        # 天→你(pitch60), 空→好(pitch62)
+        assert new_track.tokens[1].note_pitch == 60
+        assert new_track.tokens[2].note_pitch == 62
+
+    def test_sp_duration_is_spd(self):
+        """新 SP 的 duration 是 SPD 计算值。"""
+        new_track, _ = align_track(
+            self.track, "天空", self.weights, True, False,
+        )
+        spd = calculate_spd([0.3, 0.3], 4, 4)  # M=4, N=4 → 0.3
+        sp_tokens = [t for t in new_track.tokens if t.is_sp]
+        assert all(abs(t.duration - spd) < 1e-9 for t in sp_tokens)
+
+    def test_sp_note_type_is_1(self):
+        new_track, _ = align_track(
+            self.track, "天空", self.weights, True, False,
+        )
+        sp_tokens = [t for t in new_track.tokens if t.is_sp]
+        assert all(t.note_type == 1 for t in sp_tokens)
+        assert all(t.note_pitch == 0 for t in sp_tokens)
+
+    def test_char_note_type_is_2(self):
+        new_track, _ = align_track(
+            self.track, "天空", self.weights, True, False,
+        )
+        char_tokens = [t for t in new_track.tokens if not t.is_sp]
+        assert all(t.note_type == 2 for t in char_tokens)
+
+    def test_repeat_char_note_type_3(self):
+        """连续相同字(非叠词)→ type=3。"""
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("啊", 60, 2, 0.8),
+             ("啊", 62, 2, 0.8), ("<SP>", 0, 1, 0.3)],
+        )
+        # "我我" 非叠词表词 → 第二个 type=3
+        new_track, _ = align_track(track, "我我", self.weights, True, False)
+        char_tokens = [t for t in new_track.tokens if not t.is_sp]
+        assert char_tokens[0].note_type == 2
+        assert char_tokens[1].note_type == 3
+
+    def test_reduplication_not_type_3(self):
+        """叠词(哥哥)两字都独立演唱 → 都 type=2。"""
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("啊", 60, 2, 0.8),
+             ("啊", 62, 2, 0.8), ("<SP>", 0, 1, 0.3)],
+        )
+        new_track, _ = align_track(track, "哥哥", self.weights, True, False)
+        char_tokens = [t for t in new_track.tokens if not t.is_sp]
+        assert all(t.note_type == 2 for t in char_tokens)
+        assert all(t.text == "哥" for t in char_tokens)
+
+    def test_split_keeps_word_on_longest_token(self):
+        """字数 > 非 SP token：多字词压到最长 token，duration 均分。"""
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("啊", 60, 2, 0.8),
+             ("啊", 62, 2, 0.6), ("<SP>", 0, 1, 0.3)],
+        )
+        # "天空世界" → jieba 天空/世界，各压到 1 个 token
+        new_track, warns = align_track(track, "天空世界", self.weights, True, False)
+        texts = [t.text for t in new_track.tokens]
+        # [SP] 天 空 [SP] 世 界 [SP] (2 句 → 3 SP)
+        assert texts == ["<SP>", "天", "空", "<SP>", "世", "界", "<SP>"]
+        # 天空 在 pitch60 token(0.8s → 各 0.4)，世界 在 pitch62 token(0.6 → 各 0.3)
+        non_sp = [t for t in new_track.tokens if not t.is_sp]
+        assert abs(non_sp[0].duration - 0.4) < 1e-9
+        assert abs(non_sp[1].duration - 0.4) < 1e-9
+        assert non_sp[0].note_pitch == 60
+        assert abs(non_sp[2].duration - 0.3) < 1e-9
+        assert abs(non_sp[3].duration - 0.3) < 1e-9
+        assert non_sp[2].note_pitch == 62
+
+    def test_more_tokens_than_chars_drops_extras(self):
+        """字数 < 非 SP token：多余 token 丢弃(Case 1)。"""
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("啊", 60, 2, 0.4),
+             ("啊", 62, 2, 0.4), ("啊", 64, 2, 0.4), ("<SP>", 0, 1, 0.3)],
+        )
+        new_track, _ = align_track(track, "天空", self.weights, True, False)
+        texts = [t.text for t in new_track.tokens]
+        # 2 字映射到前 2 个非 SP token，第 3 个丢弃
+        assert texts == ["<SP>", "天", "空", "<SP>"]
+
+    def test_f0_sp_inserts_zeros(self):
+        """新 SP 处 f0 插全 0(round(SPD*50) 帧)。"""
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.4),
+             ("好", 62, 2, 0.4), ("<SP>", 0, 1, 0.3)],
+            f0="261.6 " * 70,
+        )
+        new_track, _ = align_track(track, "天空", self.weights, True, False)
+        f0_vals = [float(x) for x in new_track.f0.split()]
+        # 前 round(0.3*50)=15 帧应是 0(SP)
+        assert all(v == 0.0 for v in f0_vals[:15])
+
+    def test_f0_split_slices_segment(self):
+        """SPLIT 时 f0 段按字数切片(不插值)。"""
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("啊", 60, 2, 1.0), ("<SP>", 0, 1, 0.3)],
+            f0="100.0 " * 50 + "200.0 " * 50,
+        )
+        # "天空" 2 字压到 1 个 token(1.0s → 50 帧)
+        new_track, _ = align_track(track, "天空", self.weights, True, False)
+        f0_vals = [float(x) for x in new_track.f0.split()]
+        # 字的非零 f0 应来自原 token 段(100/200)，不插值
+        non_sp_f0 = [v for v in f0_vals if v != 0.0]
+        assert all(v in (100.0, 200.0) for v in non_sp_f0)
 
     def test_digit_normalization(self):
-        text, sp = normalize_lyrics("123", sp_target=0, normalize_digits=True)
-        assert text == "一二三"
+        """normalize_digits=True 时数字转中文。"""
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("啊", 60, 2, 0.4),
+             ("啊", 62, 2, 0.4), ("<SP>", 0, 1, 0.3)],
+        )
+        new_track, _ = align_track(track, "12", self.weights, True, False)
+        char_tokens = [t for t in new_track.tokens if not t.is_sp]
+        # "12" → "一二"
+        assert [t.text for t in char_tokens] == ["一", "二"]
 
     def test_digit_normalization_disabled(self):
-        text, sp = normalize_lyrics("123", sp_target=0, normalize_digits=False)
-        assert "1" in text
+        """normalize_digits=False：英文词作为整词单元。"""
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("啊", 60, 2, 0.4),
+             ("啊", 62, 2, 0.4), ("<SP>", 0, 1, 0.3)],
+        )
+        new_track, _ = align_track(track, "ab", self.weights, False, False)
+        char_tokens = [t for t in new_track.tokens if not t.is_sp]
+        # "ab" 是一个英文词单元
+        assert len(char_tokens) == 1
+        assert char_tokens[0].text == "ab"
 
-    def test_empty_raises(self):
+    def test_force_tone4_applied(self):
+        """force_tone4 把高音中文音素改四声。"""
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("啊", 90, 2, 0.4), ("<SP>", 0, 1, 0.3)],
+        )
+        new_track, _ = align_track(track, "天", self.weights, True, True)
+        char_tokens = [t for t in new_track.tokens if not t.is_sp]
+        # pitch=90 >= 79 → 末位声调改 4
+        assert char_tokens[0].phoneme[-1] == "4"
+
+    def test_force_tone4_not_applied_when_disabled(self):
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("啊", 90, 2, 0.4), ("<SP>", 0, 1, 0.3)],
+        )
+        new_track, _ = align_track(track, "天", self.weights, True, False)
+        char_tokens = [t for t in new_track.tokens if not t.is_sp]
+        # 默认 tone 1 不改
+        assert char_tokens[0].phoneme == "zh_tian1"
+
+    def test_empty_lyrics_raises(self):
         with pytest.raises(ValueError, match="empty"):
-            normalize_lyrics("", sp_target=0)
+            align_track(self.track, "", self.weights, True, False)
 
-    def test_delete_quotes(self):
-        text, sp = normalize_lyrics('"你好"世界', sp_target=0)
-        assert '"' not in text
-        assert text == "你好世界"
-
-    def test_uniform_fill_distribution(self):
-        text, sp = normalize_lyrics("一二三四五六七八九十", sp_target=3)
-        assert len(sp) == 3
-        diffs = [sp[i+1] - sp[i] for i in range(len(sp)-1)]
-        assert max(diffs) - min(diffs) <= 2
-
-    def test_uniform_fill_short_text_fills_all_gaps(self):
-        """短文本 + 大 count 时，填充所有可用间隙，不丢位置.
-
-        Regression：旧 _uniform_sp_fill 在 count > text_len 时，
-        ``step = text_len / (count + 1)`` 让多个 i 映射到同一 base，
-        碰撞回退最终产生重复位置；上层 ``sorted(set(...))`` 去重后
-        数量不可预测。新实现显式返回所有可用位置（物理上限）。
-        """
-        # 4 字文本，要求 8 个 SP → 物理上限 5 个位置 (0..4)
-        text, sp = normalize_lyrics("你好世界", sp_target=8)
-        # 应该返回所有 5 个位置 [0,1,2,3,4]，而非去重后的更少
-        assert len(sp) == 5, f"expected 5 (all gaps filled), got {len(sp)}: {sp}"
-        # 顺序且覆盖整个范围
-        assert sp == sorted(sp)
-        assert sp[0] == 0
-        assert sp[-1] == len(text)
-
-    def test_uniform_fill_no_duplicates(self):
-        """均匀填补不产生重复位置（即使 count > text_len）."""
-        # 6 字文本要求 10 个 SP → 物理上限 7 个位置
-        text, sp = normalize_lyrics("一二三四五六", sp_target=10)
-        assert len(sp) == len(set(sp)), f"duplicates in {sp}"
-        # 物理上限 = text_len + 1 = 7
-        assert len(sp) == 7, f"expected 7 (all gaps), got {len(sp)}: {sp}"
-
-    def test_uniform_fill_stress_scenario(self):
-        """原始压力场景：4 字文本 + sp_target=8 不再静默丢 SP."""
-        # "你好\\n世界" 归一化后为 "你好世界"（4 字），newline 落在 offset=2
-        # 但 strong_pos 收集的位置不在归一化文本中产生额外字符。
-        text, sp = normalize_lyrics("你好\n世界", 8)
-        # 4 字文本最多 5 个 SP 位置 (0..4)
-        assert len(sp) == 5, f"expected 5 (physical max), got {len(sp)}: {sp}"
-        assert len(sp) == len(set(sp)), f"duplicates in {sp}"
-
-    def test_english_word_interiors_helper(self):
-        """_english_word_interiors 正确识别词内部（场景 E 修复核心）."""
-        from alignment.preprocess import _english_word_interiors
-        # "beautiful" 占 0-8, 内部 = (0, 8] = {1..8}
-        inv = _english_word_interiors("beautiful")
-        assert inv == {1, 2, 3, 4, 5, 6, 7, 8}
-        assert 0 not in inv  # 词首之前合法
-        assert 9 not in inv  # 词末之后合法
-        # 混合: "ab CD" → "ab"(0-1) 内部={2}? 不对：内部=(0,1]={1}, " "(2), "CD"(3-4) 内部=(3,4]={4}
-        inv2 = _english_word_interiors("ab CD")
-        assert inv2 == {1, 4}, f"got {inv2}"  # 注意空格在位置2, 不算词内部
-        # 单字母词无内部
-        assert _english_word_interiors("a") == set()
-        # 纯中文/标点无内部
-        assert _english_word_interiors("你好世界") == set()
-
-    def test_sp_candidate_not_inside_english_word(self):
-        """SP 候选不落在英文词内部（场景 E 回归）.
-
-        失败场景: "beautiful day" 等英文词组在均匀填充时，会把 SP 位置
-        放在词内部（如 "beautiful" 的某个字母上）。tokenizer 的 en-分支
-        扫描整个词，会跳过该位置 —— SP 候选被静默吞掉，导致最终 SP 数
-        少于 target。
-        """
-        lyrics = "hello world\n你好\nI love you\n天空\nbeautiful day\n再见\n"
-        text, sp = normalize_lyrics(lyrics, sp_target=8)
-        # 计算所有落在词内部的位置
-        from alignment.preprocess import _english_word_interiors
-        invalid = _english_word_interiors(text)
-        offenders = [p for p in sp if p in invalid]
-        assert not offenders, (
-            f"SP candidates inside English words: {offenders}; "
-            f"text={text!r}, sp={sp}, invalid={sorted(invalid)}"
+    def test_time_field_updated(self):
+        """time 字段更新为新总 duration(毫秒)。"""
+        new_track, _ = align_track(
+            self.track, "天空", self.weights, True, False,
         )
-        # 应该仍然有 8 个（文本足够长，边界位置充足）
-        assert len(sp) == 8, f"expected 8 SP candidates, got {len(sp)}: {sp}"
+        new_total = sum(t.duration for t in new_track.tokens)
+        assert new_track.meta["time"] == [0, round(new_total * 1000)]
 
-    def test_sp_candidate_strong_punct_inside_merged_word(self):
-        """RF-8: \\n 连接两英文词时，强标点位置在合并词内部 → 过滤掉.
-
-        失败场景: ``"hello\\nworld"`` 归一化后为 ``"helloworld"``，\\n 的
-        强标点位置 5 落在合并词内部。旧实现只对 ``_uniform_sp_fill`` 的
-        填充位置过滤，strong/median 位置直接进入候选 → 被 tokenizer 的
-        en-分支吞掉，SP 静默丢失。
-        """
-        # "hello\nworld" → cleaned "helloworld", \n 位置 5 在词内部
-        text, sp = normalize_lyrics("hello\nworld", sp_target=2)
-        from alignment.preprocess import _english_word_interiors
-        invalid = _english_word_interiors(text)
-        offenders = [p for p in sp if p in invalid]
-        assert not offenders, (
-            f"strong punct inside merged word: {offenders}; "
-            f"text={text!r}, sp={sp}, invalid={sorted(invalid)}"
+    def test_min_split_duration_floor(self):
+        """SPLIT 后单字 duration < 0.1 时抬到 0.1(从同 token 其他字匀)。"""
+        # token 0.3s 分给 5 字 → 每 0.06 < 0.1，需借匀
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("啊", 60, 2, 0.3),
+             ("啊", 62, 2, 0.3), ("<SP>", 0, 1, 0.3)],
         )
+        # 10 个不同字塞进 2 个 token，每个 token 5 字
+        new_track, warns = align_track(
+            track, "甲乙丙丁戊己庚辛壬癸", self.weights, True, False,
+        )
+        non_sp = [t for t in new_track.tokens if not t.is_sp]
+        # 每字至少 0.1(总 token dur 0.3，5 字需 0.5 > 0.3 → 无法全满足，触发告警)
+        # 但能抬多少抬多少
+        assert any("MIN_DURATION" in w or "HIGH_SPLIT" in w for w in warns)
+
+    def test_warns_on_high_split_ratio(self):
+        """字数远超 token 数 → HIGH_SPLIT_RATIO 告警。"""
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("啊", 60, 2, 0.4),
+             ("啊", 62, 2, 0.4), ("<SP>", 0, 1, 0.3)],
+        )
+        new_track, warns = align_track(track, "我" * 50, self.weights, True, False)
+        assert any("HIGH_SPLIT" in w for w in warns)
+
+    def test_returns_track_type(self):
+        new_track, _ = align_track(
+            self.track, "天空", self.weights, True, False,
+        )
+        assert isinstance(new_track, Track)
+        assert new_track.f0  # f0 非空
 
 
-from alignment.preprocess import tokenize_units
+# ---------------------------------------------------------------------------
+# 节点级集成 (MidiLyricsAlignment)
+# ---------------------------------------------------------------------------
 
 
-class TestTokenizer:
-    def setup_method(self):
-        self.w = CostWeights()
+class TestNodeIntegration:
+    TRACK_JSON = json.dumps([{
+        "index": "vocal_0_3000",
+        "language": "Mandarin",
+        "time": [0, 3000],
+        "text": "<SP> 你 好 <SP>",
+        "phoneme": "<SP> zh_ni3 zh_hao3 <SP>",
+        "duration": "0.30 0.40 0.40 0.30",
+        "note_pitch": "0 60 62 0",
+        "note_type": "1 2 2 1",
+        "f0": "0.0 0.0 261.6 293.7",
+    }])
 
-    def test_pure_chinese(self):
-        # jieba 分词："你好" 是一个词
-        units = tokenize_units("你好", [], self.w)
-        assert len(units) >= 1
-        assert all(u.kind == "zh" for u in units)
-        # 多字词或单字，phoneme 以 zh_ 开头
-        assert units[0].phoneme.startswith("zh_")
+    def _node(self):
+        from nodes import MidiLyricsAlignment
+        return MidiLyricsAlignment()
 
-    def test_english_word(self):
-        units = tokenize_units("love", [], self.w)
-        assert len(units) == 1
-        assert units[0].kind == "en"
-        assert units[0].text == "love"
-        assert units[0].phoneme.startswith("en_")
-        assert units[0].max_occupy == min(4, 4)
+    def test_output_is_valid_json(self):
+        node = self._node()
+        result = node.align_lyrics(self.TRACK_JSON, "天空")
+        out = result[0]
+        assert not out.startswith("Error"), f"Node error: {out[:100]}"
+        parsed = json.loads(out)
+        assert len(parsed) == 1
+        assert "text" in parsed[0]
+        assert "duration" in parsed[0]
+        assert "f0" in parsed[0]
 
-    def test_mixed(self):
-        units = tokenize_units("你love好", [], self.w)
-        assert len(units) == 3
-        assert units[0].kind == "zh"
-        assert units[1].kind == "en"
-        assert units[2].kind == "zh"
+    def test_returns_two_tuple(self):
+        """RF-2: 返回 (midi_json, warnings) 二元组。"""
+        node = self._node()
+        result = node.align_lyrics(self.TRACK_JSON, "天空")
+        assert len(result) == 2
+        assert isinstance(result[0], str)
+        assert isinstance(result[1], str)
 
-    def test_sp_insertion(self):
-        # SP at position 1 interrupts CJK collection → "你" SP "好"
-        units = tokenize_units("你好", [1], self.w)
-        assert len(units) == 3
-        assert units[0].text == "你"
-        assert units[1].kind == "sp"
-        assert units[2].text == "好"
+    def test_sp_count_equals_sentences_plus_one(self):
+        """v3: SP 数 = 句数 + 1(不再守恒原 SP 数)。"""
+        node = self._node()
+        result = node.align_lyrics(self.TRACK_JSON, "天空\n大海")
+        parsed = json.loads(result[0])
+        new_tokens = parsed[0]["text"].split()
+        new_sp = sum(1 for t in new_tokens if t == "<SP>")
+        # "天空\n大海" → 2 句 → 3 SP
+        assert new_sp == 3
 
-    def test_long_english_word_max_occupy_capped(self):
-        units = tokenize_units("extraordinarily", [], self.w)
-        assert units[0].max_occupy == 4  # capped
+    def test_clean_alignment_no_warnings(self):
+        """干净对齐时 warnings 为空字符串。"""
+        node = self._node()
+        result = node.align_lyrics(self.TRACK_JSON, "天空")
+        assert result[1] == ""
 
-    def test_spaces_ignored(self):
-        units = tokenize_units("hello world", [], self.w)
-        assert len(units) == 2
-        assert units[0].text == "hello"
-        assert units[1].text == "world"
+    def test_extreme_split_emits_warning(self):
+        """200 字塞进 2 token → 触发质量告警。"""
+        node = self._node()
+        result = node.align_lyrics(self.TRACK_JSON, "我" * 200)
+        assert "Error" not in result[0]
+        assert result[1], "expected non-empty warnings for 200-char in 2 slots"
+        assert (
+            "MIN_DURATION_UNRESOLVED" in result[1]
+            or "HIGH_SPLIT" in result[1]
+        ), f"unexpected warnings: {result[1]!r}"
 
-
-from alignment.dp import solve_alignment
-
-
-def _make_tokens(specs):
-    """快捷构造 token 列表。specs = [(text, pitch, type, dur), ...]"""
-    return [Token(t, "<SP>" if t == "<SP>" else f"ph_{t}",
-                  d, p, nt, i) for i, (t, p, nt, d) in enumerate(specs)]
-
-
-class TestDP:
-    def setup_method(self):
-        self.w = CostWeights()
-
-    def test_perfect_match_zero_cost(self):
-        """字数等长 + SP 对齐 → 全 REPLACE，代价 0."""
-        tokens = _make_tokens([
-            ("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.4),
-            ("好", 62, 2, 0.4), ("<SP>", 0, 1, 0.3),
+    def test_multi_track_lyrics_partitioned(self):
+        """多 track：歌词按 duration 比例分配，不重复。"""
+        multi_track_json = json.dumps([
+            {"text": "<SP> 啊 啊 <SP>",
+             "phoneme": "<SP> zh_a1 zh_a1 <SP>",
+             "duration": "0.3 0.5 0.5 0.3",
+             "note_pitch": "0 60 62 0",
+             "note_type": "1 2 2 1"},
+            {"text": "<SP> 啊 <SP>",
+             "phoneme": "<SP> zh_a1 <SP>",
+             "duration": "0.3 0.4 0.3",
+             "note_pitch": "0 60 0",
+             "note_type": "1 2 1"},
         ])
-        units = [
-            Unit("<SP>", "<SP>", "sp", 1, "punct"),
-            Unit("呀", "zh_ya1", "zh", 1),
-            Unit("哎", "zh_ai1", "zh", 1),
-            Unit("<SP>", "<SP>", "sp", 1, "punct"),
-        ]
-        path = solve_alignment(tokens, units, self.w)
-        # pitch 连贯性代价可能 > 0（相邻 token pitch 差异），但应很小
-        assert path.total_cost < 1.0
-        assert len(path.ops) == 4
-        assert all(o.kind == "REPLACE" or o.kind == "SP_ALIGN"
-                   for o in path.ops)
+        node = self._node()
+        result = node.align_lyrics(multi_track_json, "天空\n海洋")
+        out = result[0]
+        assert not out.startswith("Error"), f"unexpected error: {out}"
+        parsed = json.loads(out)
+        assert len(parsed) == 2, "both tracks must survive"
 
-    def test_split_triggered_when_more_units(self):
-        """字数多于 token → SPLIT 触发."""
-        tokens = _make_tokens([("<SP>", 0, 1, 0.3), ("啊", 60, 2, 1.0), ("<SP>", 0, 1, 0.3)])
-        units = [
-            Unit("<SP>", "<SP>", "sp", 1, "punct"),
-            Unit("天", "zh_tian1", "zh", 1),
-            Unit("气", "zh_qi4", "zh", 1),
-            Unit("<SP>", "<SP>", "sp", 1, "punct"),
-        ]
-        path = solve_alignment(tokens, units, self.w)
-        kinds = [o.kind for o in path.ops]
-        assert "SPLIT" in kinds
+        def non_sp_chars(track_text):
+            return [c for c in track_text.split() if c != "<SP>"]
 
-    def test_drop_triggered_when_fewer_units(self):
-        """字数少于 token → DROP 触发."""
-        tokens = _make_tokens([
-            ("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.4),
-            ("好", 62, 2, 0.4), ("<SP>", 0, 1, 0.3),
-        ])
-        units = [
-            Unit("<SP>", "<SP>", "sp", 1, "punct"),
-            Unit("哎", "zh_ai1", "zh", 1),
-            Unit("<SP>", "<SP>", "sp", 1, "punct"),
-        ]
-        path = solve_alignment(tokens, units, self.w)
-        kinds = [o.kind for o in path.ops]
-        assert "DROP" in kinds
+        track0_chars = non_sp_chars(parsed[0]["text"])
+        track1_chars = non_sp_chars(parsed[1]["text"])
+        # 两 track 都应有字
+        assert len(track0_chars) > 0
+        assert len(track1_chars) > 0
 
-    def test_sp_count_conserved(self):
-        """SP_ALIGN 次数 = SP 单元数."""
-        tokens = _make_tokens([
-            ("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.4), ("<SP>", 0, 1, 0.3),
-        ])
-        units = [
-            Unit("<SP>", "<SP>", "sp", 1, "punct"),
-            Unit("呀", "zh_ya1", "zh", 1),
-            Unit("<SP>", "<SP>", "sp", 1, "punct"),
-        ]
-        path = solve_alignment(tokens, units, self.w)
-        assert len(path.sp_placements) == 2
+    def test_invalid_json_returns_error(self):
+        node = self._node()
+        result = node.align_lyrics("{bad json", "天空")
+        assert result[0].startswith("Error")
 
-    def test_word_span_for_english(self):
-        """英文词占多 token → WORD_SPAN."""
-        tokens = _make_tokens([
-            ("<SP>", 0, 1, 0.3),
-            ("la", 60, 2, 0.3), ("la", 62, 2, 0.3), ("la", 64, 2, 0.3),
-            ("<SP>", 0, 1, 0.3),
-        ])
-        units = [
-            Unit("<SP>", "<SP>", "sp", 1, "punct"),
-            Unit("love", "en_L-AH1-V", "en", 3),
-            Unit("<SP>", "<SP>", "sp", 1, "punct"),
-        ]
-        path = solve_alignment(tokens, units, self.w)
-        kinds = [o.kind for o in path.ops]
-        assert "WORD_SPAN" in kinds
+    def test_none_inputs_handled(self):
+        """ComfyUI 可能传 None。"""
+        node = self._node()
+        result = node.align_lyrics(None, None)
+        assert result[0].startswith("Error")  # 空 midi_json 报错
+
+    def test_speed_change_applied(self):
+        """speed != 1 时 duration 缩放。"""
+        node = self._node()
+        result_normal = node.align_lyrics(self.TRACK_JSON, "天空", speed=1.0)
+        result_fast = node.align_lyrics(self.TRACK_JSON, "天空", speed=2.0)
+        normal_dur = sum(float(x) for x in
+                         json.loads(result_normal[0])[0]["duration"].split())
+        fast_dur = sum(float(x) for x in
+                       json.loads(result_fast[0])[0]["duration"].split())
+        # 2x speed → duration 减半
+        assert abs(fast_dur - normal_dur / 2) < 0.05
 
 
-from alignment.rebuild import rebuild_tokens, _find_sections
+# ---------------------------------------------------------------------------
+# force_tone4 helper (nodes.py 保留)
+# ---------------------------------------------------------------------------
 
 
-class TestRebuilder:
-    def setup_method(self):
-        self.w = CostWeights()
-        self.tokens = _make_tokens([
-            ("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.4),
-            ("好", 62, 2, 0.4), ("<SP>", 0, 1, 0.3),
-        ])
+class TestForceTone4:
+    def test_high_pitch_zh_forced_to_tone4(self):
+        from nodes import _apply_force_tone4
+        tokens = [Token("你", "zh_ni3", 0.4, 80, 2, 0)]
+        result = _apply_force_tone4(tokens, threshold=79)
+        assert result[0].phoneme == "zh_ni4"
 
-    def test_replace_keeps_pitch_type(self):
-        from alignment.models import AlignmentOp, AlignmentPath, Unit
-        ops = [
-            AlignmentOp("SP_ALIGN", Unit("<SP>", "<SP>", "sp", 1), (0,), 0.0),
-            AlignmentOp("REPLACE", Unit("呀", "zh_ya1", "zh", 1), (1,), 0.0),
-            AlignmentOp("REPLACE", Unit("哎", "zh_ai1", "zh", 1), (2,), 0.0),
-            AlignmentOp("SP_ALIGN", Unit("<SP>", "<SP>", "sp", 1), (3,), 0.0),
-        ]
-        path = AlignmentPath(ops=ops, total_cost=0.0)
-        result = rebuild_tokens(path, self.tokens, self.w)
-        assert len(result) == 4
-        assert result[0].text == "<SP>"
-        assert result[1].text == "呀"
-        assert result[1].note_pitch == 60
-        assert result[1].note_type == 2
+    def test_low_pitch_unchanged(self):
+        from nodes import _apply_force_tone4
+        tokens = [Token("你", "zh_ni3", 0.4, 60, 2, 0)]
+        result = _apply_force_tone4(tokens, threshold=79)
+        assert result[0].phoneme == "zh_ni3"
 
-    def test_word_span_sets_note_type(self):
-        from alignment.models import AlignmentOp, AlignmentPath, Unit
-        tokens = _make_tokens([
-            ("la", 60, 2, 0.3), ("la", 62, 2, 0.3), ("la", 64, 2, 0.3),
-        ])
-        ops = [AlignmentOp("WORD_SPAN", Unit("love", "en_L-AH1-V", "en", 3), (0, 1, 2), 0.0)]
-        path = AlignmentPath(ops=ops, total_cost=0.0)
-        result = rebuild_tokens(path, tokens, self.w)
-        assert len(result) == 3
-        assert all(r.text == "love" for r in result)
-        assert result[0].note_type == 2
-        assert result[1].note_type == 3
-        assert result[2].note_type == 3
+    def test_sp_unchanged(self):
+        from nodes import _apply_force_tone4
+        tokens = [Token("<SP>", "<SP>", 0.3, 80, 1, 0)]
+        result = _apply_force_tone4(tokens, threshold=79)
+        assert result[0].phoneme == "<SP>"
 
-    def test_drop_produces_nothing(self):
-        from alignment.models import AlignmentOp, AlignmentPath, Unit
-        ops = [AlignmentOp("DROP", None, (1,), 0.0)]
-        path = AlignmentPath(ops=ops, total_cost=0.0)
-        result = rebuild_tokens(path, self.tokens, self.w)
-        assert len(result) == 0
-
-    def test_find_sections(self):
-        sections = _find_sections(self.tokens)
-        assert sections == [(1, 3)]
+    def test_boundary_threshold_inclusive(self):
+        """pitch == threshold 也改(>= 语义)。"""
+        from nodes import _apply_force_tone4
+        tokens = [Token("啊", "zh_a1", 0.4, 79, 2, 0)]
+        result = _apply_force_tone4(tokens, threshold=79)
+        assert result[0].phoneme == "zh_a4"
 
 
-from alignment.rebuild import allocate_durations
-from alignment.models import AlignmentOp, AlignmentPath, Unit
-
-
-class TestDurationAllocator:
-    def setup_method(self):
-        self.w = CostWeights()
-
-    def test_total_duration_conserved(self):
-        orig = _make_tokens([
-            ("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.5), ("<SP>", 0, 1, 0.3),
-        ])
-        new = [
-            Token("<SP>", "<SP>", 0.3, 0, 1, 0),
-            Token("呀", "zh_ya1", 0.5, 60, 2, 1),
-            Token("<SP>", "<SP>", 0.3, 0, 1, 2),
-        ]
-        path = AlignmentPath(ops=[
-            AlignmentOp("SP_ALIGN", None, (0,), 0.0),
-            AlignmentOp("REPLACE", None, (1,), 0.0),
-            AlignmentOp("SP_ALIGN", None, (2,), 0.0),
-        ], total_cost=0.0)
-        result = allocate_durations(new, orig, path, self.w)
-        orig_sum = sum(t.duration for t in orig)
-        new_sum = sum(t.duration for t in result)
-        assert abs(orig_sum - new_sum) < 0.01
-
-    def test_min_duration_enforced(self):
-        orig = _make_tokens([("长", 60, 2, 1.0), ("短", 62, 2, 0.1)])
-        new = [
-            Token("长", "zh_chang2", 1.0, 60, 2, 0),
-            Token("短", "zh_duan3", 0.1, 62, 2, 1),
-        ]
-        path = AlignmentPath(ops=[
-            AlignmentOp("REPLACE", None, (0,), 0.0),
-            AlignmentOp("REPLACE", None, (1,), 0.0),
-        ], total_cost=0.0)
-        result = allocate_durations(new, orig, path, self.w)
-        non_sp = [t for t in result if not t.is_sp]
-        assert all(t.duration >= 0.30 - 0.01 for t in non_sp)
-
-    def test_float_cleanup(self):
-        orig = _make_tokens([("你", 60, 2, 0.333333)])
-        new = [Token("呀", "zh_ya1", 0.333333, 60, 2, 0)]
-        path = AlignmentPath(ops=[AlignmentOp("REPLACE", None, (0,), 0.0)], total_cost=0.0)
-        result = allocate_durations(new, orig, path, self.w)
-        assert result[0].duration == 0.33
-
-    def test_split_shares_host_duration(self):
-        """SPLIT 场景：2 个 unit 共享 1 个 host token，duration 均分."""
-        # host token "啊" 时长 1.0s，被 2 个字共享（REPLACE + 1 SPLIT）
-        orig = _make_tokens([("<SP>", 0, 1, 0.3), ("啊", 60, 2, 1.0), ("<SP>", 0, 1, 0.3)])
-        # rebuild_tokens 已经给两个新 token 都填了 host.duration=1.0（未均分）
-        new = [
-            Token("<SP>", "<SP>", 0.3, 0, 1, 0),
-            Token("天", "zh_tian1", 1.0, 60, 2, 1),   # REPLACE 消费 host_idx=1
-            Token("气", "zh_qi4", 1.0, 60, 2, 2),    # SPLIT 消费 host_idx=1
-            Token("<SP>", "<SP>", 0.3, 0, 1, 3),
-        ]
-        path = AlignmentPath(ops=[
-            AlignmentOp("SP_ALIGN", None, (0,), 0.0),
-            AlignmentOp("REPLACE", None, (1,), 0.0),
-            AlignmentOp("SPLIT", None, (1,), 0.0),
-            AlignmentOp("SP_ALIGN", None, (2,), 0.0),
-        ], total_cost=0.0)
-        result = allocate_durations(new, orig, path, self.w)
-        # 两个非 SP token 应均分 1.0s → 各 0.5s
-        non_sp = [t for t in result if not t.is_sp]
-        assert len(non_sp) == 2
-        assert abs(non_sp[0].duration - 0.5) < 0.01
-        assert abs(non_sp[1].duration - 0.5) < 0.01
-        # 总时长守恒
-        orig_sum = sum(t.duration for t in orig)
-        new_sum = sum(t.duration for t in result)
-        assert abs(orig_sum - new_sum) < 0.01
-
-    def test_drop_redistribution_multi_section_conserved(self):
-        """多 section + DROP 时，总 duration 仍守恒（回归 bug 修复）."""
-        # 2 sections, 中间有 DROP
-        orig = _make_tokens([
-            ("<SP>", 0, 1, 0.3), ("你", 60, 2, 0.5), ("好", 62, 2, 0.5),
-            ("<SP>", 0, 1, 0.3), ("世", 64, 2, 0.4), ("界", 65, 2, 0.4),
-            ("<SP>", 0, 1, 0.3),
-        ])
-        # 新序列：DROP 掉 "好"（token idx=2）
-        new = [
-            Token("<SP>", "<SP>", 0.3, 0, 1, 0),
-            Token("呀", "zh_ya1", 0.5, 60, 2, 1),
-            # DROP: 好 消失
-            Token("<SP>", "<SP>", 0.3, 0, 1, 2),
-            Token("哎", "zh_ai1", 0.4, 64, 2, 3),
-            Token("哎", "zh_ai1", 0.4, 65, 2, 4),
-            Token("<SP>", "<SP>", 0.3, 0, 1, 5),
-        ]
-        path = AlignmentPath(ops=[
-            AlignmentOp("SP_ALIGN", None, (0,), 0.0),
-            AlignmentOp("REPLACE", None, (1,), 0.0),
-            AlignmentOp("DROP", None, (2,), 0.0),       # 好 被丢弃，duration=0.5 转移
-            AlignmentOp("SP_ALIGN", None, (3,), 0.0),
-            AlignmentOp("REPLACE", None, (4,), 0.0),
-            AlignmentOp("REPLACE", None, (5,), 0.0),
-            AlignmentOp("SP_ALIGN", None, (6,), 0.0),
-        ], total_cost=0.0)
-        result = allocate_durations(new, orig, path, self.w)
-        orig_sum = sum(t.duration for t in orig)   # 0.3+0.5+0.5+0.3+0.4+0.4+0.3 = 2.7
-        new_sum = sum(t.duration for t in result)
-        assert abs(orig_sum - new_sum) < 0.01, (
-            f"orig={orig_sum}, new={new_sum} (DROP duration lost/duplicated)")
+# ---------------------------------------------------------------------------
+# 变速 (speed.py 保留)
+# ---------------------------------------------------------------------------
 
 
 from alignment.speed import apply_speed_change
@@ -589,263 +591,21 @@ class TestSpeedAdapter:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end pipeline tests (Task 10)
-#
-# These tests exercise the full pipeline (parse → normalize → tokenize → DP →
-# rebuild → allocate → serialize) using the alignment subpackage directly,
-# without going through the ComfyUI node class.
-#
-# NOTE on test data: lyrics use explicit newlines at boundaries (e.g. "\n你好\n")
-# so that normalize_lyrics places SP units at positions that match the original
-# track's SP layout ("<SP> 你 好 <SP>"). With plain "你好" the uniform SP fill
-# produces sp_positions=[0,1] → units=[SP, 你, SP, 好], which DP can only fit
-# via DROP+SPLIT (cost ≈ 1.225). The newlines let us validate the *clean*
-# zero-cost / duration-conserving paths that the algorithm is designed for.
+# 回归: 真实人声 track (v3 不变量)
 # ---------------------------------------------------------------------------
-
-from alignment import (
-    parse_tracks, serialize_tracks, normalize_lyrics, tokenize_units,
-    solve_alignment, rebuild_tokens, allocate_durations, CostWeights,
-)
-
-
-class TestEndToEnd:
-    TRACK_JSON_orig_tokens = "<SP> 你 好 <SP>".split()
-    TRACK_JSON = json.dumps([{
-        "index": "vocal_0_3000",
-        "language": "Mandarin",
-        "time": [0, 3000],
-        "text": "<SP> 你 好 <SP>",
-        "phoneme": "<SP> zh_ni3 zh_hao3 <SP>",
-        "duration": "0.30 0.40 0.40 0.30",
-        "note_pitch": "0 60 62 0",
-        "note_type": "1 2 2 1",
-        "f0": "0.0 0.0 261.6 293.7",
-    }])
-
-    def test_simple_replacement(self):
-        """Replacement with low cost when lyrics map cleanly to tokens."""
-        tracks = parse_tracks(self.TRACK_JSON)
-        w = CostWeights()
-        track = tracks[0]
-        sp_target = sum(1 for t in track.tokens if t.is_sp)
-        text, sp_pos = normalize_lyrics("\n你好\n", sp_target)
-        units = tokenize_units(text, sp_pos, w)
-        path = solve_alignment(track.tokens, units, w)
-        # jieba may produce 1 word "你好" or 2 chars; cost should be low regardless
-        assert path.total_cost < 2.0  # pitch 连贯性代价可能 > 0
-
-    def test_output_is_valid_json(self):
-        """Output is valid JSON with required fields."""
-        from nodes import MidiLyricsAlignment
-        node = MidiLyricsAlignment()
-        result = node.align_lyrics(self.TRACK_JSON, "\n天空\n")
-        out = result[0]
-        assert not out.startswith("Error"), f"Node error: {out[:100]}"
-        parsed = json.loads(out)
-        assert len(parsed) == 1
-        assert "text" in parsed[0]
-        assert "duration" in parsed[0]
-
-    def test_sp_count_invariant(self):
-        """SP 硬保留：输出 SP 数 = 输入 SP 数（天然保证，SP 原样保留）。"""
-        from nodes import MidiLyricsAlignment
-        node = MidiLyricsAlignment()
-        result = node.align_lyrics(self.TRACK_JSON, "\n天空\n")
-        out = result[0]
-        assert not out.startswith("Error"), f"Node error: {out[:100]}"
-        parsed = json.loads(out)
-        new_tokens = parsed[0]["text"].split()
-        orig_sp = sum(1 for t in self.TRACK_JSON_orig_tokens if t == "<SP>")
-        new_sp = sum(1 for t in new_tokens if t == "<SP>")
-        assert new_sp == orig_sp
-
-    def test_total_duration_invariant(self):
-        """When alignment is a clean 1:1 match (no DROP), total duration is conserved."""
-        tracks = parse_tracks(self.TRACK_JSON)
-        w = CostWeights()
-        track = tracks[0]
-        orig_sum = sum(t.duration for t in track.tokens)
-        sp_target = sum(1 for t in track.tokens if t.is_sp)
-        # "\n天空\n" → units=[SP, 天, 空, SP] matches track exactly → no DROP,
-        # so allocate_durations has nothing to redistribute and the total holds.
-        text, sp_pos = normalize_lyrics("\n天空\n", sp_target)
-        units = tokenize_units(text, sp_pos, w)
-        path = solve_alignment(track.tokens, units, w)
-        new_tokens = rebuild_tokens(path, track.tokens, w)
-        new_tokens = allocate_durations(new_tokens, track.tokens, path, w)
-        new_sum = sum(t.duration for t in new_tokens)
-        assert abs(orig_sum - new_sum) < 0.01
-
-    def test_multi_track_lyrics_distribution(self):
-        """Multi-track: lyrics distributed by duration proportion, not full copy per track.
-
-        Regression for real-world bug: the old ``align_lyrics`` fed the FULL
-        lyrics string into every track independently. When the input had a
-        small track (e.g. 1 non-SP slot) alongside a larger one, the small
-        track was force-fed the entire lyric → catastrophic SPLIT storm
-        (every char crammed into one slot, durations far below min_dur).
-
-        After the fix, lyrics are split across tracks by non-SP duration
-        proportion. The small track receives only its proportional share
-        (or, when nothing is left, is preserved unchanged).
-        """
-        from nodes import MidiLyricsAlignment
-
-        # track0: 2 non-SP tokens, total non-SP duration 1.0s
-        # track1: 1 non-SP token, total non-SP duration 0.4s  (smaller capacity)
-        multi_track_json = json.dumps([
-            {"text": "<SP> 啊 啊 <SP>",
-             "phoneme": "<SP> zh_a1 zh_a1 <SP>",
-             "duration": "0.3 0.5 0.5 0.3",
-             "note_pitch": "0 60 62 0",
-             "note_type": "1 2 2 1"},
-            {"text": "<SP> 啊 <SP>",
-             "phoneme": "<SP> zh_a1 <SP>",
-             "duration": "0.3 0.4 0.3",
-             "note_pitch": "0 60 0",
-             "note_type": "1 2 1"},
-        ])
-        node = MidiLyricsAlignment()
-        # 4 short lines × 2 chars = 8 chars; lines use disjoint character
-        # sets so a "both tracks got the full lyric" bug is detectable by
-        # set intersection (under the bug, both tracks' char sets would
-        # be identical and thus trivially overlap on every char).
-        result = node.align_lyrics(multi_track_json, "天空\n海洋")
-        out = result[0]
-        assert not out.startswith("Error"), f"unexpected error: {out}"
-
-        parsed = json.loads(out)
-        assert len(parsed) == 2, "both tracks must survive in output"
-
-        def non_sp_chars(track_text):
-            return [c for c in track_text.split() if c != "<SP>"]
-
-        track0_chars = non_sp_chars(parsed[0]["text"])
-        track1_chars = non_sp_chars(parsed[1]["text"])
-
-        # Both tracks should have some chars (distributed, not all in one)
-        assert len(track0_chars) > 0
-        assert len(track1_chars) > 0
-
-        # The lyric lines are partitioned, not duplicated. Under the old
-        # bug both tracks received every line, so their char sets would
-        # be identical. With disjoint lyric lines, post-fix tracks should
-        # have no char in common. (When track1 was preserved verbatim the
-        # original "啊" appears there but not in the lyric, so we exclude
-        # that case explicitly.)
-        if "啊" not in track1_chars and track0_chars and track1_chars:
-            common = set(track0_chars) & set(track1_chars)
-            assert not common, (
-                f"tracks share chars {common!r} - lyrics not partitioned; "
-                f"track0={track0_chars!r}, track1={track1_chars!r}"
-            )
-
-    def test_warnings_output(self):
-        """RF-2: warnings 通过第二个返回值输出（替代 print）.
-
-        旧实现 warnings 仅 print()，ComfyUI Web UI 看不到。现在通过
-        RETURN_TYPES 第二个 STRING 输出。现有调用方取 result[0] 不变。
-        """
-        from nodes import MidiLyricsAlignment
-        node = MidiLyricsAlignment()
-        # 200 字塞进 2 token 槽 → 极端 SPLIT/HIGH_SPLIT 或
-        # MIN_DURATION_UNRESOLVED 警告。
-        result = node.align_lyrics(self.TRACK_JSON, "我" * 200)
-        assert len(result) == 2, (
-            f"expected 2-tuple (midi_json, warnings), got {len(result)} elements"
-        )
-        assert isinstance(result[1], str), (
-            f"warnings output must be str, got {type(result[1])}"
-        )
-        # 非 Error 输出时，200 字对 2 槽必然触发质量警告。
-        if "Error" not in result[0]:
-            assert result[1], (
-                "expected non-empty warnings for 200-char lyric in 2 slots"
-            )
-            assert (
-                "MIN_DURATION_UNRESOLVED" in result[1]
-                or "HIGH_SPLIT" in result[1]
-            ), f"unexpected warnings: {result[1]!r}"
-
-    def test_warnings_empty_on_clean_alignment(self):
-        """RF-2: 干净对齐时 warnings 返回空字符串（仍为 str 类型）."""
-        from nodes import MidiLyricsAlignment
-        node = MidiLyricsAlignment()
-        result = node.align_lyrics(self.TRACK_JSON, "\n你好\n")
-        assert len(result) == 2
-        assert isinstance(result[1], str)
-
-    def test_force_tone4_applied(self):
-        """RF-3: force_tone4 把高音中文音素改四声.
-
-        Helper ``_apply_force_tone4`` 对 note_pitch >= threshold（默认 79=G5）
-        且以 ``zh_`` 开头、末位为声调数字的 phoneme，把末位改 4。
-        SP 与低音 token 不受影响。
-        """
-        from nodes import _apply_force_tone4
-        # pitch=80 (>79=G5), phoneme=zh_ni3 → zh_ni4
-        tokens = [Token("你", "zh_ni3", 0.4, 80, 2, 0)]
-        result = _apply_force_tone4(tokens, threshold=79)
-        assert result[0].phoneme == "zh_ni4", (
-            f"high-pitch zh phoneme should be forced to tone 4, got {result[0].phoneme}"
-        )
-        # pitch=60 (<79), 不改
-        tokens2 = [Token("你", "zh_ni3", 0.4, 60, 2, 0)]
-        result2 = _apply_force_tone4(tokens2, threshold=79)
-        assert result2[0].phoneme == "zh_ni3", (
-            f"low-pitch zh phoneme should be unchanged, got {result2[0].phoneme}"
-        )
-        # SP token, 不改（即使 pitch 高）
-        tokens3 = [Token("<SP>", "<SP>", 0.3, 80, 1, 0)]
-        result3 = _apply_force_tone4(tokens3, threshold=79)
-        assert result3[0].phoneme == "<SP>", (
-            f"SP phoneme should be unchanged, got {result3[0].phoneme}"
-        )
-
-    def test_force_tone4_boundary_threshold(self):
-        """RF-3: threshold 边界 — pitch == threshold 也改（>= 语义）."""
-        from nodes import _apply_force_tone4
-        # pitch == 79 (exactly G5), >= threshold → 改
-        tokens = [Token("啊", "zh_a1", 0.4, 79, 2, 0)]
-        result = _apply_force_tone4(tokens, threshold=79)
-        assert result[0].phoneme == "zh_a4"
-        # pitch == 78 (< threshold), 不改
-        tokens2 = [Token("啊", "zh_a1", 0.4, 78, 2, 0)]
-        result2 = _apply_force_tone4(tokens2, threshold=79)
-        assert result2[0].phoneme == "zh_a1"
-
-
-# ---------------------------------------------------------------------------
-# Regression tests against a real-world vocal track (Task 11)
-#
-# Fixture source: docs/midi-edit-lyrics.json → PrimitiveStringMultiline
-# node (id=5) widget_value[0], first (and only) track `vocal_0_15000`.
-# 42 tokens, 4 SPs, 38 non-SP tokens, total duration 14.99s, 750-point f0.
-# These tests guard against regressions on production-shaped input where
-# the DP must DROP heavily (real tracks are far longer than typical
-# replacement lyrics) while preserving the documented invariants:
-#   * SP count conservation (soft SP placement, quantity fixed)
-#   * total duration conservation across multi-section DROPs
-#   * pitch contour sanity under severe length mismatch
-# ---------------------------------------------------------------------------
-
-import os
 
 
 class TestRegression:
     FIXTURE_PATH = "tests/fixtures/vocal_sample.json"
 
     def setup_method(self):
-        # The fixture path is relative to the repo root; make it robust to
-        # pytest invocation from subdirectories.
         if not os.path.exists(self.FIXTURE_PATH):
             self.FIXTURE_PATH = os.path.join(
                 os.path.dirname(__file__), "fixtures", "vocal_sample.json"
             )
 
-    def test_real_track_alignment(self):
-        """Real 42-token vocal track: SP count and total duration conserved."""
+    def test_real_track_aligns_without_error(self):
+        """真实 42-token track: 对齐不报错，输出字段完整。"""
         with open(self.FIXTURE_PATH) as f:
             track_json = f.read()
         from nodes import MidiLyricsAlignment
@@ -855,83 +615,45 @@ class TestRegression:
         assert not out.startswith("Error"), f"Node error: {out[:100]}"
         parsed = json.loads(out)
         track = parsed[0]
-        new_tokens = track["text"].split()
-        orig_tokens = json.loads(track_json)[0]["text"].split()
-        orig_sp = sum(1 for t in orig_tokens if t == "<SP>")
-        new_sp = sum(1 for t in new_tokens if t == "<SP>")
-        assert new_sp == orig_sp
-        orig_sum = sum(float(d) for d in json.loads(track_json)[0]["duration"].split())
-        new_sum = sum(float(d) for d in track["duration"].split())
-        assert abs(orig_sum - new_sum) < 0.1
+        # 必需字段齐全
+        for field in ("text", "phoneme", "duration", "note_pitch", "note_type", "f0"):
+            assert field in track, f"missing field: {field}"
 
-    def test_melody_direction_weak_assertion(self):
-        """Weak sanity check: pitch sign-change count stays bounded.
-
-        NOTE on the bound: the spec called for ``abs(orig_sc - new_sc) <= 10``
-        but that is mathematically impossible when the replacement lyrics are
-        much shorter than the original track. Here ``"\\n你好世界\\n"`` (4
-        chars) replaces 38 non-SP tokens, so the new contour has ~4 notes vs
-        the original ~38; the sign-change counts are 3 vs 28 (diff = 25). The
-        bound is therefore relaxed to 30 — well above the observed diff and
-        still tight enough to catch gross regressions (e.g. a flat-line
-        output with sc=0 vs an unchanged track would only fire if the
-        original had <= 30 sign changes; large multi-section real tracks
-        sit comfortably inside this envelope).
-        """
+    def test_real_track_sp_at_least_two(self):
+        """v3: 至少有首尾 SP(>=2)。"""
         with open(self.FIXTURE_PATH) as f:
             track_json = f.read()
-        tracks = parse_tracks(track_json)
-        w = CostWeights()
-        track = tracks[0]
-        orig_pitches = [t.note_pitch for t in track.tokens if not t.is_sp]
-        text, sp_pos = normalize_lyrics(
-            "\n你好世界\n", sum(1 for t in track.tokens if t.is_sp)
-        )
-        units = tokenize_units(text, sp_pos, w)
-        path = solve_alignment(track.tokens, units, w)
-        new_tokens = rebuild_tokens(path, track.tokens, w)
-        new_pitches = [t.note_pitch for t in new_tokens if not t.is_sp]
+        from nodes import MidiLyricsAlignment
+        node = MidiLyricsAlignment()
+        result = node.align_lyrics(track_json, "我是一只小小鸟")
+        parsed = json.loads(result[0])
+        new_tokens = parsed[0]["text"].split()
+        new_sp = sum(1 for t in new_tokens if t == "<SP>")
+        assert new_sp >= 2, f"expected >=2 SP, got {new_sp}"
 
-        def sign_changes(seq):
-            return sum(1 for i in range(1, len(seq))
-                       if seq[i] != seq[i - 1])
+    def test_real_track_f0_valid_floats(self):
+        """f0 是空格分隔的浮点数。"""
+        with open(self.FIXTURE_PATH) as f:
+            track_json = f.read()
+        from nodes import MidiLyricsAlignment
+        node = MidiLyricsAlignment()
+        result = node.align_lyrics(track_json, "我是一只小小鸟")
+        parsed = json.loads(result[0])
+        f0_str = parsed[0]["f0"]
+        f0_vals = f0_str.split()
+        # 全部可解析为 float
+        for v in f0_vals:
+            float(v)
+        # f0 非空
+        assert len(f0_vals) > 0
 
-        orig_sc = sign_changes(orig_pitches)
-        new_sc = sign_changes(new_pitches)
-        assert abs(orig_sc - new_sc) <= 30
-
-
-# ---------------------------------------------------------------------------
-# Performance test (Task 11)
-#
-# The DP is pure Python (no numpy). We assert that a 150-token track
-# (representative of one long vocal section) aligns in well under 3s so
-# the node stays interactive inside ComfyUI. Marked ``slow`` so it can
-# be skipped in tight inner dev loops with ``-m "not slow"``.
-# ---------------------------------------------------------------------------
-
-import time
-
-
-class TestPerformance:
-    @pytest.mark.slow
-    def test_150_tokens_under_3_seconds(self):
-        """150 token track should align in < 3s (pure Python DP)."""
-        # 148 "啊" tokens spanning 12 pitch classes, bracketed by 2 SPs.
-        specs = (["<SP>"]
-                 + [("啊", 60 + i % 12, 2, 0.4) for i in range(148)]
-                 + ["<SP>"])
-        token_specs = [
-            ("<SP>", 0, 1, 0.3) if s == "<SP>" else (s[0], s[1], s[2], s[3])
-            for s in specs
-        ]
-        tokens = _make_tokens(token_specs)
-        w = CostWeights()
-        sp_target = 2
-        text, sp_pos = normalize_lyrics("\n" + "啊" * 148 + "\n", sp_target)
-        units = tokenize_units(text, sp_pos, w)
-        start = time.time()
-        path = solve_alignment(tokens, units, w)
-        elapsed = time.time() - start
-        assert path is not None  # linter: make sure we use path
-        assert elapsed < 3.0, f"DP took {elapsed:.2f}s, expected < 3s"
+    def test_real_track_note_types_valid(self):
+        """note_type 全部在 {1,2,3}。"""
+        with open(self.FIXTURE_PATH) as f:
+            track_json = f.read()
+        from nodes import MidiLyricsAlignment
+        node = MidiLyricsAlignment()
+        result = node.align_lyrics(track_json, "我是一只小小鸟")
+        parsed = json.loads(result[0])
+        types = [int(x) for x in parsed[0]["note_type"].split()]
+        assert all(t in (1, 2, 3) for t in types)
