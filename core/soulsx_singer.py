@@ -163,47 +163,89 @@ def _get_phoneset_path() -> str:
     return _phoneset_path
 
 
+def _ensure_pretrained_models_links():
+    """Create pretrained_models/ symlinks inside SoulX-Singer.
+
+    SoulX-Singer's code uses relative paths like
+    ``pretrained_models/SoulX-Singer-Preprocess/...``. The official setup
+    downloads models into ``pretrained_models/`` inside the repo. Since our
+    models live in ComfyUI's models/ directory, we create symlinks so the
+    relative paths resolve without downloading anything.
+
+    Only symlinks are created (under pretrained_models/), no SoulX-Singer
+    source code is modified.
+    """
+    sx_root = _get_soulxsinger_root()
+    base = get_models_base()
+
+    pairs = [
+        (
+            os.path.join(sx_root, "pretrained_models", "SoulX-Singer"),
+            os.path.join(base, "Soul-AILab", "SoulX-Singer"),
+        ),
+        (
+            os.path.join(sx_root, "pretrained_models", "SoulX-Singer-Preprocess"),
+            os.path.join(base, "Soul-AILab", "SoulX-Singer-Preprocess"),
+        ),
+    ]
+
+    for link_path, target_path in pairs:
+        if os.path.islink(link_path):
+            continue
+        if os.path.isdir(link_path):
+            continue
+        if not os.path.isdir(target_path):
+            continue
+        os.makedirs(os.path.dirname(link_path), exist_ok=True)
+        os.symlink(target_path, link_path)
+
+
 def _get_preprocess_pipeline(language: str = "Mandarin", save_dir: str | None = None,
                               max_merge_duration: int = 30000):
+    _ensure_pretrained_models_links()
+
     pipeline_mod = _load_submodule("preprocess.pipeline")
     PreprocessPipeline = pipeline_mod.PreprocessPipeline
 
     device = _get_device()
-    base = get_models_base()
-    pre_base = os.path.join(base, "Soul-AILab", "SoulX-Singer-Preprocess")
 
     if save_dir is None:
         save_dir = os.path.join(tempfile.gettempdir(), "soulsx_singer_preprocess")
 
-    pipeline = PreprocessPipeline(
-        device=device,
-        language=language,
-        save_dir=save_dir,
-        vocal_sep=True,
-        max_merge_duration=max_merge_duration,
-        midi_transcribe=True,
-    )
+    # SoulX-Singer uses relative paths from its repo root.
+    base = get_models_base()
+    pre_base = os.path.join(base, "Soul-AILab", "SoulX-Singer-Preprocess")
+    sx_root = _get_soulxsinger_root()
+    orig_cwd = os.getcwd()
+    try:
+        os.chdir(sx_root)
+        pipeline = PreprocessPipeline(
+            device=device,
+            language=language,
+            save_dir=save_dir,
+            vocal_sep=True,
+            max_merge_duration=max_merge_duration,
+            midi_transcribe=True,
+        )
+    finally:
+        os.chdir(orig_cwd)
 
-    sep_dir = os.path.join(pre_base, "mel-band-roformer-karaoke")
-    der_dir = os.path.join(pre_base, "dereverb_mel_band_roformer")
-    if os.path.isdir(sep_dir) and pipeline.vocal_separator is not None:
-        pipeline.vocal_separator.sep_model_path = os.path.join(
-            sep_dir, "mel_band_roformer_karaoke_becruily.ckpt"
-        )
-        pipeline.vocal_separator.sep_config_path = os.path.join(
-            sep_dir, "config_karaoke_becruily.yaml"
-        )
-    if os.path.isdir(der_dir) and pipeline.vocal_separator is not None:
-        pipeline.vocal_separator.der_model_path = os.path.join(
-            der_dir, "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt"
-        )
-        pipeline.vocal_separator.der_config_path = os.path.join(
-            der_dir, "dereverb_mel_band_roformer_anvuew.yaml"
-        )
+    # Override to absolute paths for components that need them at runtime
+    if pipeline.vocal_separator is not None:
+        sep = os.path.join(pre_base, "mel-band-roformer-karaoke", "mel_band_roformer_karaoke_becruily.ckpt")
+        if os.path.isfile(sep):
+            pipeline.vocal_separator.sep_model_path = sep
+            pipeline.vocal_separator.sep_config_path = os.path.join(
+                pre_base, "mel-band-roformer-karaoke", "config_karaoke_becruily.yaml")
+        der = os.path.join(pre_base, "dereverb_mel_band_roformer", "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt")
+        if os.path.isfile(der):
+            pipeline.vocal_separator.der_model_path = der
+            pipeline.vocal_separator.der_config_path = os.path.join(
+                pre_base, "dereverb_mel_band_roformer", "dereverb_mel_band_roformer_anvuew.yaml")
 
-    f0_model = os.path.join(pre_base, "rmvpe", "rmvpe.pt")
-    if os.path.isfile(f0_model) and pipeline.f0_extractor is not None:
-        pipeline.f0_extractor.model_path = f0_model
+    f0 = os.path.join(pre_base, "rmvpe", "rmvpe.pt")
+    if os.path.isfile(f0) and pipeline.f0_extractor is not None:
+        pipeline.f0_extractor.model_path = f0
 
     if pipeline.vocal_detector is not None:
         pipeline.vocal_detector.cut_wavs_output_dir = os.path.join(save_dir, "cut_wavs")
@@ -215,12 +257,12 @@ def _get_preprocess_pipeline(language: str = "Mandarin", save_dir: str | None = 
     if os.path.isfile(en_asr) and pipeline.lyric_transcriber is not None:
         pipeline.lyric_transcriber.en_model_path = en_asr
 
-    rosvot_model = os.path.join(pre_base, "rosvot", "rosvot", "model.pt")
-    rwbd_model = os.path.join(pre_base, "rosvot", "rwbd", "model.pt")
-    if os.path.isfile(rosvot_model) and pipeline.note_transcriber is not None:
-        pipeline.note_transcriber.rosvot_model_path = rosvot_model
-    if os.path.isfile(rwbd_model) and pipeline.note_transcriber is not None:
-        pipeline.note_transcriber.rwbd_model_path = rwbd_model
+    rosvot = os.path.join(pre_base, "rosvot", "rosvot", "model.pt")
+    rwbd = os.path.join(pre_base, "rosvot", "rwbd", "model.pt")
+    if os.path.isfile(rosvot) and pipeline.note_transcriber is not None:
+        pipeline.note_transcriber.rosvot_model_path = rosvot
+    if os.path.isfile(rwbd) and pipeline.note_transcriber is not None:
+        pipeline.note_transcriber.rwbd_model_path = rwbd
 
     return pipeline
 
@@ -359,6 +401,7 @@ def transcribe_audio(audio, sample_rate: int | None = None,
             save_dir=save_dir,
             max_merge_duration=max_merge_duration,
         )
+
         pipeline.run(audio_path=audio_path, language=language)
 
         meta_path = os.path.join(save_dir, "metadata.json")
