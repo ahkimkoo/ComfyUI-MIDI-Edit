@@ -138,10 +138,11 @@ class TestSegmentSentences:
         assert segment_sentences("你好世界", 0) == ["你好世界"]
 
     def test_split_to_meet_target(self):
-        """超过 10 字的句子用 jieba 词边界切分。"""
+        """超过 10 字无标点、无 CT-Transformer 时保持原句（只断一次需 punctuate_fn）。"""
         result = segment_sentences("我是一只小小鸟想要飞呀飞不过却怎么也飞不高")
-        assert len(result) >= 2  # 19 字 > 10，应该被切
-        assert "".join(result) == "我是一只小小鸟想要飞呀飞不过却怎么也飞不高"
+        # 无 punctuate_fn → 无法切，原句保留
+        assert len(result) == 1
+        assert result[0] == "我是一只小小鸟想要飞呀飞不过却怎么也飞不高"
 
     def test_no_split_when_too_short(self):
         """<= 10 字不切。"""
