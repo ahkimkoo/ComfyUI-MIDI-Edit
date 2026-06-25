@@ -171,12 +171,45 @@ def _patch_transformers_compat():
         if position_embeddings is None:
             rotary = getattr(self, "rotary_emb", None)
             if rotary is None:
-                # Lazily create rotary_emb with the correct head_dim for this layer
                 import inspect
                 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
                 head_dim = self.head_dim if hasattr(self, "head_dim") else (
                     self.config.hidden_size // self.config.num_attention_heads
                 )
+                sig = inspect.signature(LlamaRotaryEmbedding.__init__)
+                params = set(sig.parameters.keys()) - {"self"}
+                rkwargs = {}
+                if "head_dim" in params:
+                    rkwargs["head_dim"] = head_dim
+                if "max_position_embeddings" in params:
+                    rkwargs["max_position_embeddings"] = getattr(self.config, "max_position_embeddings", 4096)
+                if "base" in params:
+                    rkwargs["base"] = getattr(self.config, "rope_theta", 10000.0)
+                if "config" in params and not rkwargs:
+                    rkwargs["config"] = self.config
+                rotary = LlamaRotaryEmbedding(**rkwargs)
+                rotary = rotary.to(hidden_states.device, dtype=hidden_states.dtype)
+                self.rotary_emb = rotary
+            if position_ids is None:
+                position_ids = torch.arange(
+                    hidden_states.shape[1], device=hidden_states.device
+                ).unsqueeze(0)
+            position_embeddings = rotary(hidden_states, position_ids)
+        result = _orig_attn_forward(
+            self,
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        # SoulX-Singer expects 3-tuple: (hidden_states, attn_weights, present_key_value)
+        # Newer transformers may return 2-tuple or a different format
+        if isinstance(result, tuple) and len(result) == 2:
+            return (result[0], result[1], None)
+        return result
                 sig = inspect.signature(LlamaRotaryEmbedding.__init__)
                 params = set(sig.parameters.keys()) - {"self"}
                 kwargs = {}
