@@ -127,15 +127,90 @@ def _load_submodule(module_relpath: str):
 # ---------------------------------------------------------------------------
 
 
+def _patch_transformers_compat():
+    """Monkey-patch for transformers >= 4.53 compatibility with SoulX-Singer.
+
+    In transformers >= 4.53, LlamaDecoderLayer.forward() now requires
+    position_embeddings to be computed at the layer level and passed to
+    LlamaAttention.forward(). SoulX-Singer's LlamaNARDecoderLayer inherits
+    from LlamaDecoderLayer but doesn't pass position_embeddings, causing:
+        TypeError: LlamaAttention.forward() missing 1 required positional argument: 'position_embeddings'
+
+    This patch wraps LlamaDecoderLayer.forward() to compute and pass
+    position_embeddings when the transformers version requires it.
+    """
+    import importlib.metadata as meta
+    try:
+        ver = tuple(int(x) for x in meta.version("transformers").split(".")[:2])
+    except Exception:
+        return
+
+    if ver < (4, 53):
+        return
+
+    import torch
+    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+
+    _orig_forward = LlamaDecoderLayer.forward
+
+    def _compute_position_embeddings(layer, hidden_states, position_ids):
+        rotary = getattr(layer, "rotary_emb", None)
+        if rotary is None and hasattr(layer, "self_attn"):
+            rotary = getattr(layer.self_attn, "rotary_emb", None)
+        if rotary is None:
+            return None
+        return rotary(hidden_states, position_ids)
+
+    def _patched_forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=None,
+        **kwargs,
+    ):
+        if position_embeddings is None:
+            if position_ids is None:
+                position_ids = torch.arange(
+                    hidden_states.shape[1], device=hidden_states.device
+                ).unsqueeze(0)
+            position_embeddings = _compute_position_embeddings(
+                self, hidden_states, position_ids
+            )
+        return _orig_forward(
+            self,
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+    LlamaDecoderLayer.forward = _patched_forward
+    print(f"[MIDI-Edit] Patched LlamaDecoderLayer for transformers {ver} compatibility")
+
+
 def _get_svs_model():
     global _svs_model, _svs_config
     if _svs_model is not None:
         return _svs_model, _svs_config
 
+    _patch_transformers_compat()
+
     file_utils = _load_submodule("soulxsinger.utils.file_utils")
     load_config = file_utils.load_config
     cli_inference = _load_submodule("cli.inference")
     build_model = cli_inference.build_model
+
+    print(f"[MIDI-Edit] Building SVS model...")
 
     base = get_models_base()
     model_path = os.path.join(base, "Soul-AILab", "SoulX-Singer", "model.pt")
@@ -150,7 +225,9 @@ def _get_svs_model():
 
     config = load_config(config_path)
     device = _get_device()
-    _svs_model = build_model(model_path=model_path, config=config, device=device, use_fp16=False)
+    use_fp16 = "cuda" in device
+    print(f"[MIDI-Edit] Loading SVS model on {device}, fp16={use_fp16}")
+    _svs_model = build_model(model_path=model_path, config=config, device=device, use_fp16=use_fp16)
     _svs_config = config
     return _svs_model, _svs_config
 
@@ -208,6 +285,7 @@ def _get_preprocess_pipeline(language: str = "Mandarin", save_dir: str | None = 
     PreprocessPipeline = pipeline_mod.PreprocessPipeline
 
     device = _get_device()
+    print(f"[MIDI-Edit] Preprocess pipeline using device: {device}")
 
     if save_dir is None:
         save_dir = os.path.join(tempfile.gettempdir(), "soulsx_singer_preprocess")
@@ -468,7 +546,7 @@ def synthesize_audio(midi_json_str: str, prompt_audio,
         args.auto_shift = auto_shift
         args.pitch_shift = pitch_shift
         args.control = control
-        args.use_fp16 = False
+        args.use_fp16 = "cuda" in device
 
         prompt_meta_path = os.path.join(tmpdir, "prompt_meta.json")
         target_meta_path = os.path.join(tmpdir, "target_meta.json")
