@@ -127,18 +127,24 @@ def _load_submodule(module_relpath: str):
 # ---------------------------------------------------------------------------
 
 
+_transformers_patched = False
+
+
 def _patch_transformers_compat():
     """Monkey-patch for transformers >= 4.53 compatibility with SoulX-Singer.
 
-    In transformers >= 4.53, LlamaDecoderLayer.forward() now requires
-    position_embeddings to be computed at the layer level and passed to
-    LlamaAttention.forward(). SoulX-Singer's LlamaNARDecoderLayer inherits
-    from LlamaDecoderLayer but doesn't pass position_embeddings, causing:
-        TypeError: LlamaAttention.forward() missing 1 required positional argument: 'position_embeddings'
+    In transformers >= 4.53, LlamaAttention.forward() requires position_embeddings.
+    SoulX-Singer's LlamaNARDecoderLayer.forward() calls self.self_attn() without
+    passing position_embeddings.
 
-    This patch wraps LlamaDecoderLayer.forward() to compute and pass
-    position_embeddings when the transformers version requires it.
+    Strategy: patch LlamaAttention.forward() to compute position_embeddings
+    from rotary_emb when not provided. We also inject rotary_emb references
+    into each LlamaAttention instance after model loading.
     """
+    global _transformers_patched
+    if _transformers_patched:
+        return
+
     import importlib.metadata as meta
     try:
         ver = tuple(int(x) for x in meta.version("transformers").split(".")[:2])
@@ -149,53 +155,67 @@ def _patch_transformers_compat():
         return
 
     import torch
-    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+    from transformers.models.llama.modeling_llama import LlamaAttention
 
-    _orig_forward = LlamaDecoderLayer.forward
+    _orig_attn_forward = LlamaAttention.forward
 
-    def _compute_position_embeddings(layer, hidden_states, position_ids):
-        rotary = getattr(layer, "rotary_emb", None)
-        if rotary is None and hasattr(layer, "self_attn"):
-            rotary = getattr(layer.self_attn, "rotary_emb", None)
-        if rotary is None:
-            return None
-        return rotary(hidden_states, position_ids)
-
-    def _patched_forward(
+    def _patched_attn_forward(
         self,
         hidden_states,
         attention_mask=None,
         position_ids=None,
         past_key_value=None,
-        output_attentions=False,
-        use_cache=False,
         cache_position=None,
         position_embeddings=None,
         **kwargs,
     ):
         if position_embeddings is None:
-            if position_ids is None:
-                position_ids = torch.arange(
-                    hidden_states.shape[1], device=hidden_states.device
-                ).unsqueeze(0)
-            position_embeddings = _compute_position_embeddings(
-                self, hidden_states, position_ids
-            )
-        return _orig_forward(
+            rotary = getattr(self, "_rotary_emb_ref", None)
+            if rotary is None:
+                rotary = getattr(self, "rotary_emb", None)
+            if rotary is not None:
+                if position_ids is None:
+                    position_ids = torch.arange(
+                        hidden_states.shape[1], device=hidden_states.device
+                    ).unsqueeze(0)
+                position_embeddings = rotary(hidden_states, position_ids)
+        return _orig_attn_forward(
             self,
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )
 
-    LlamaDecoderLayer.forward = _patched_forward
-    print(f"[MIDI-Edit] Patched LlamaDecoderLayer for transformers {ver} compatibility")
+    LlamaAttention.forward = _patched_attn_forward
+    _transformers_patched = True
+    print(f"[MIDI-Edit] Patched LlamaAttention.forward for transformers {ver} compatibility")
+
+
+def _inject_rotary_emb(model):
+    """Inject rotary_emb references into all LlamaAttention instances.
+
+    After SoulX-Singer model is loaded, walk the module tree and set
+    _rotary_emb_ref on each LlamaAttention so the patched forward can
+    compute position_embeddings.
+    """
+    from transformers.models.llama.modeling_llama import LlamaAttention
+
+    rotary = None
+    for name, mod in model.named_modules():
+        if hasattr(mod, "rotary_emb") and not isinstance(mod, LlamaAttention):
+            rotary = mod.rotary_emb
+            break
+
+    if rotary is None:
+        return
+
+    for name, mod in model.named_modules():
+        if isinstance(mod, LlamaAttention):
+            mod._rotary_emb_ref = rotary
 
 
 def _get_svs_model():
@@ -228,6 +248,7 @@ def _get_svs_model():
     use_fp16 = "cuda" in device
     print(f"[MIDI-Edit] Loading SVS model on {device}, fp16={use_fp16}")
     _svs_model = build_model(model_path=model_path, config=config, device=device, use_fp16=use_fp16)
+    _inject_rotary_emb(_svs_model)
     _svs_config = config
     return _svs_model, _svs_config
 
