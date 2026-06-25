@@ -5,7 +5,7 @@
 提供四个节点：
 
 - **MIDI Edit Lyrics** — 替换歌词并自动生成音素
-- **MIDI Lyrics Alignment (DP)** — 基于联合动态规划的统一对齐算法（推荐新用户使用）
+- **MIDI Lyrics Alignment** — 顺序映射 + 贪心压缩 + CT-Transformer 智能断句的对齐算法
 - **MIDI Extract Lyrics** — 提取歌词文本（去空格，`<SP>` 转换行）
 - **MIDI Merge Repeated Chars** — 合并连续重复字符
 
@@ -125,22 +125,19 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 
 ---
 
-### MIDI Lyrics Alignment (DP)
+### MIDI Lyrics Alignment
 
-基于**联合动态规划**的统一歌词对齐节点，是 `MIDI Edit Lyrics` 的算法升级版。用单一 DP 求解全局最优对齐，**无 `if/else` 场景分支**——不再区分 Collapse / Expand / Collapse+Distribute 三种模式，所有字数匹配/不匹配情况由加权代价函数统一处理。
+基于**顺序映射 + 贪心压缩 + CT-Transformer 智能断句**的歌词对齐节点。v3 彻底放弃 DP，用确定性管线覆盖所有字数匹配情况：原 `<SP>` 全部丢弃并按新歌词断句重建，新字与原曲非 SP token 建立顺序映射，f0 按 token 切段重组。
 
 **算法概述：**
 
-- **联合 DP**：在新歌词单元（Unit）与原曲 token 网格上一次 Viterbi 式搜索，输出总代价最小的对齐路径
-- **加权代价函数**：`pitch` + `duration` + `structure` 三项加权，权重可在节点参数中调节
-- **5 种原子操作**：
-  - `REPLACE` — 一个 Unit 占一个 token，pitch/type 沿用原 token（最常见的字对字替换）
-  - `WORD_SPAN` — 一个英文词占多个 token，首 token `note_type=2`、延续 token `note_type=3`
-  - `SPLIT` — 一个字共享一个长 token，duration 在共享者间均分
-  - `DROP` — 丢弃多余 token，其 duration 在同 section 内重新分配（总时长守恒）
-  - `SP_ALIGN` — SP 软约束：SP 数量守恒（必须保留），位置可由代价函数最优放置
-- **中英混合粒度**：中文字 `max_occupy=1`，英文连续字母为一个词（`max_occupy ≤ K=4`）
-- **守恒不变量**：SP 数量、每个 section 的总 duration、f0 帧级数据
+- **CT-Transformer 智能断句**：先按标点切，超过 10 字的句子用 CT-Transformer 标点模型加标点后全切；断句只看新歌词，不参照原曲句数
+- **SP 结构重建**：丢弃原曲所有 `<SP>`，按断句结果重建 `[SP] 句1 [SP] 句2 ... [SP]`
+- **SPD 时长**：`AVG(原 SP duration) × (原 token 数 / 新 token 数)`，限制 `[0.1, MAX(原 SP)]`
+- **顺序映射（字数 ≤ 原 token）**：前 C 个非 SP token 各承载 1 字，多余 token 丢弃，字继承原 token 的 duration/pitch/f0
+- **贪心压缩（字数 > 原 token）**：按原 token duration 比例分配字数，长 token 多扛字、短 token 少扛字；SPLIT 组内 duration 等分并施加 0.1s 下限保障
+- **f0 按 token 切段重建**：按 `round(duration×50)` 切原 f0，丢原 SP 段，字用映射 token 的 f0 段，SPLIT 的段按字数切片，新 SP 插全 0 帧
+- **time 反算**：`time = [0, round(帧数/50×1000)]`，消除累积误差，避免 SoulX-Singer "could not broadcast" 错误
 
 **输入：**
 
@@ -151,9 +148,6 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 | `speed` | FLOAT | 变速倍率（0.1~3.0，默认 1.0），duration 和 f0 同步缩放 |
 | `normalize_digits` | BOOLEAN | 阿拉伯数字自动转中文（默认 ON） |
 | `force_tone4` | BOOLEAN | 高音强制第四声（默认 OFF） |
-| `w_pitch` *(optional)* | FLOAT | pitch 代价权重（0~1，默认 0.5） |
-| `w_duration` *(optional)* | FLOAT | duration 代价权重（0~1，默认 0.3） |
-| `w_structure` *(optional)* | FLOAT | 结构代价权重（0~1，默认 0.2） |
 
 **输出：**
 
@@ -164,32 +158,32 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 
 **与 MIDI Edit Lyrics 的差异：**
 
-| 维度 | MIDI Edit Lyrics | MIDI Lyrics Alignment (DP) |
-|------|------------------|----------------------------|
-| 算法 | 3 模式 + 多分支（Collapse/Expand/Distribute） | 单一 DP，无场景分支 |
-| 字数匹配 | 按场景选不同策略 | 加权代价函数统一求最优 |
-| SP 处理 | 严格位置保留 | 软约束（数量守恒，位置可移） |
-| 中英混合 | 单独逻辑分支 | Unit 抽象统一处理 |
-| 适用场景 | 已稳定，老工作流兼容 | 推荐新用户使用，对齐质量更可控 |
+| 维度 | MIDI Edit Lyrics | MIDI Lyrics Alignment |
+|------|------------------|-----------------------|
+| 算法 | 3 模式 + 多分支（Collapse/Expand/Distribute） | 顺序映射 + 贪心压缩，确定性管线 |
+| 字数匹配 | 按场景选不同策略 | 字数 ≤ token 顺序 1:1 丢弃；字数 > token 按 duration 比例压缩 |
+| SP 处理 | 严格位置保留 | 原曲 SP 全丢弃，按新歌词断句重建 SP |
+| 断句依据 | 参照原曲 section 数，AI 辅助切到匹配 | 只看新歌词（标点 + CT-Transformer），不参照原曲句数 |
+| f0 处理 | 帧级整体不动 | 按 token 切段重建（丢原 SP 段，SPLIT 切片，SP 插 0） |
+| 总时长 | 守恒 | 不守恒（SP 数变、SPD 为估计值） |
+| 适用场景 | 已稳定，老工作流兼容 | SP 边界随新歌词自由调整，断句更贴合语义 |
 
-> 同一输入下两者输出可能略有差异。`MidiLyricsAlignment` 在 DROP/SPLIT 时由 DP 自动选择代价最小的位置，比基于规则的分支更鲁棒。
+> 注意：v3 不保证总 duration 守恒。SP 数量与 SPD 都随新歌词变化，输出 track 总时长会与原曲不同。
 
 **多 track 行为：**
 
-输入含多个 track 时，整段歌词按各 track 的非 SP duration 比例自动分配——长 track 分到更多歌词，短 track 分到更少。分到空歌词的 track 原样保留（不替换）。例如：track0=30s + track1=1.5s 时，track1 只分到约 5% 的歌词。
+输入含多个 track 时，整段歌词按各 track 的非 SP duration 比例自动分配——长 track 分到更多歌词，短 track 分到更少。分到空歌词的 track 原样保留（不替换）。例如：track0=30s + track1=1.5s 时，track1 只分到约 5% 的歌词。每个 track 独立走断句 + 对齐管线。
 
 **警告类型（通过 `warnings` 输出）：**
 
-算法在物理限制或极端不匹配场景下会发出警告（分号分隔），用户可在 ComfyUI 中通过 `warnings` 输出查看：
+算法在物理限制或极端不匹配场景下会发出警告（分号分隔，带 `t{idx}` track 索引前缀），用户可在 ComfyUI 中通过 `warnings` 输出查看：
 
 | 警告 | 含义 |
 |------|------|
-| `SP_COUNT_REDUCED(t{idx}:{orig}→{actual})` | SP 数受物理限制减少（如 4 字歌词无法容纳 8 个停顿，最多 5 个位置） |
-| `MIN_DURATION_UNRESOLVED(t{idx}:{count})` | 有 `{count}` 个 token 短于 0.30s 且无法从同 section 借时间（字数极端多） |
-| `HIGH_SPLIT_RATIO(t{idx})` | SPLIT 操作占比 > 40%（字数远多于原 token） |
-| `HIGH_DROP_RATIO(t{idx})` | DROP 操作占比 > 30%（字数远少于原 token） |
+| `HIGH_SPLIT_RATIO(chars=C,slots=nonsl)(t{idx})` | 字数 `C` 远多于原非 SP token 数 `nonsl`（`C - nonsl > 0.4 × nonsl`） |
+| `MIN_DURATION_UNRESOLVED(t{idx})` | SPLIT 组内存在字 duration 低于 0.1s 且组内无余量可借 |
 
-> 这些警告表示输入的歌词与原曲 token 数严重不匹配，输出虽在算法层面最优，但演唱效果可能受限。建议调整歌词字数或选择更匹配的原曲。
+> 这些警告表示字数与原曲 token 数严重不匹配，输出虽已尽力处理，但演唱效果可能受限。建议调整歌词字数或选择更匹配的原曲。
 
 **示例：**
 
@@ -197,7 +191,7 @@ CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 Mode
 
 输入新歌词：`天空`
 
-输出 text：`<SP> 天 空 <SP>`（SP 数量守恒，2 个字 REPLACE 原 2 个字，总时长不变）
+输出 text：`<SP> 天 空 <SP>`（原 2 个 `<SP>` 丢弃，"天空"为 1 句 → 重建为首尾 SP；字数 ≤ 原 token，顺序 1:1 映射，字继承原 token 的 duration/pitch/f0）
 
 **分类：** `MIDI`
 
@@ -365,8 +359,15 @@ curl -s http://127.0.0.1:8188/prompt \
 ```
 ComfyUI-MIDI-Edit/
 ├── __init__.py          # ComfyUI 插件入口，导出节点映射
-├── nodes.py             # 核心逻辑与节点定义（含 MidiLyricsAlignment）
-├── alignment/           # 统一对齐算法子包（DP / cost / rebuild / speed）
+├── nodes.py             # ComfyUI 节点定义（MIDIEditLyrics / MidiLyricsAlignment 等）+ 历史 API 再导出
+├── core/                # 核心算法包（模块化）
+│   ├── g2p.py           # G2P：char_to_phoneme / word_to_phoneme / normalize_digits
+│   ├── ct_transformer.py # CT-Transformer 标点恢复模型（智能断句）
+│   ├── midi_format.py   # Token / Track 数据结构 + JSON parse/serialize（FPS=50）
+│   ├── text_utils.py    # clean_lyrics / split_lyrics_to_sentences / is_reduplication
+│   ├── speed.py         # 变速：duration 缩放 + f0 插值重采样
+│   ├── edit_algorithm.py # MIDIEditLyrics 实现：replace_lyrics / extract_lyrics 等
+│   └── align_algorithm.py # MidiLyricsAlignment v3：align_track / segment_sentences / calculate_spd
 ├── requirements.txt     # Python 依赖
 ├── pyproject.toml       # Comfy Registry 发布配置
 ├── CHANGELOG.md         # 更新日志

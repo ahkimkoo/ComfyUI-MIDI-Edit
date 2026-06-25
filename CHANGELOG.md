@@ -3,6 +3,22 @@
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
 
+## [2026-06-25] v3.1.0
+
+### Changed
+
+- **断句改用 CT-Transformer 标点模型**：不再用 jieba，不再参照原 SP 数
+  - 先按标点切，超过 10 字用 CT-Transformer 加标点后按标点全切
+- **SPLIT 分配改为按 duration 比例**：长 token 多分字，短 token 少分字
+- **time 字段从 f0 帧数反算**：修复 SoulX-Singer "could not broadcast" 错误
+- **移除无效参数**：w_pitch / w_duration / w_structure（DP 遗留）
+
+### Refactored
+
+- **代码模块化**：nodes.py 从 1764 行瘦身到 330 行
+  - 新建 core/ 包（7 个模块）：g2p / ct_transformer / midi_format / text_utils / speed / edit_algorithm / align_algorithm
+  - 删除 alignment/ 包
+
 ## [2026-06-24] v3.0.0
 
 ### Added
@@ -12,7 +28,7 @@ All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
   - 原始 SP 移除，按新歌词断句重建 SP
   - f0 按 token duration 切段重建（50fps，源码确认）
   - SPD 公式计算 SP 时长
-  - 断句：标点优先，不足参照原 SP 数切最长句
+  - 断句：标点优先
 
 ### Removed
 
