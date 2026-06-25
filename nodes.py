@@ -1698,11 +1698,6 @@ class MidiLyricsAlignment:
                 "speed": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.1}),
                 "normalize_digits": ("BOOLEAN", {"default": True}),
                 "force_tone4": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
-                "w_pitch": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
-                "w_duration": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.1}),
-                "w_structure": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.1}),
             }
         }
 
@@ -1712,16 +1707,12 @@ class MidiLyricsAlignment:
     CATEGORY = "MIDI"
 
     def align_lyrics(self, midi_json, lyrics, speed=1.0,
-                     normalize_digits=True, force_tone4=False,
-                     w_pitch=0.5, w_duration=0.3, w_structure=0.2):
-        # v3 重写：彻底放弃 DP，改用顺序映射 + 贪心压缩（alignment.align）。
-        # weights 参数保留以保持 ComfyUI INPUT_TYPES 不变，v3 算法基本不依赖它。
+                     normalize_digits=True, force_tone4=False):
         from alignment import (
             parse_tracks, serialize_tracks, align_track,
             apply_speed_change, CostWeights,
         )
 
-        # 输入校验：处理 ComfyUI 可能传入的 None。
         midi_json = "" if midi_json is None else str(midi_json)
         lyrics = "" if lyrics is None else str(lyrics)
 
@@ -1730,9 +1721,7 @@ class MidiLyricsAlignment:
         except ValueError as e:
             return (f"Error: {e}", "")
 
-        weights = CostWeights(
-            w_pitch=w_pitch, w_duration=w_duration, w_structure=w_structure,
-        )
+        weights = CostWeights()
 
         # 多 track：按非 SP duration 比例分配歌词（避免小 track 被塞全文）。
         lyrics_per_track = _distribute_lyrics(lyrics, tracks)
