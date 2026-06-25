@@ -65,41 +65,61 @@ def _load_submodule(module_relpath: str):
     """Import a submodule from SoulX-Singer by file path.
 
     SoulX-Singer's subdirectories (preprocess/, cli/) lack __init__.py and
-    cannot be imported with a plain `import` statement. This helper registers
-    parent packages in sys.modules so that internal cross-imports work.
+    cannot be imported with a plain `import` statement. This helper builds
+    each package level from its actual filesystem location so internal
+    cross-imports (e.g. ``from preprocess.utils import ...``) resolve correctly.
     """
-    import types
-    import importlib
+    import importlib.util
 
     root = _get_soulxsinger_root()
-    if root not in sys.path:
-        sys.path.insert(0, root)
     parts = module_relpath.split(".")
 
-    # Ensure all ancestor packages are registered in sys.modules
-    for i in range(1, len(parts)):
-        parent_name = ".".join(parts[:i])
-        if parent_name in sys.modules:
+    for i in range(len(parts)):
+        name = ".".join(parts[: i + 1])
+        if name in sys.modules:
             continue
-        parent_dir = os.path.join(root, *parts[:i])
-        if os.path.isdir(parent_dir):
-            mod = types.ModuleType(parent_name)
-            mod.__path__ = [parent_dir]
-            mod.__package__ = parent_name
-            sys.modules[parent_name] = mod
 
-    return importlib.import_module(module_relpath)
+        dir_path = os.path.join(root, *parts[: i + 1])
+        py_path = dir_path + ".py"
 
-    if os.path.isfile(spec_path + ".py"):
-        spec_path = spec_path + ".py"
+        if i < len(parts) - 1:
+            # Intermediate package: must be a directory
+            if not os.path.isdir(dir_path):
+                raise ImportError(f"Package directory not found: {dir_path}")
+            init_path = os.path.join(dir_path, "__init__.py")
+            spec = importlib.util.spec_from_file_location(
+                name,
+                init_path if os.path.isfile(init_path) else None,
+                submodule_search_locations=[dir_path],
+            )
+        else:
+            # Leaf module: .py file or package directory
+            if os.path.isfile(py_path):
+                spec = importlib.util.spec_from_file_location(name, py_path)
+            elif os.path.isdir(dir_path):
+                init_path = os.path.join(dir_path, "__init__.py")
+                spec = importlib.util.spec_from_file_location(
+                    name,
+                    init_path if os.path.isfile(init_path) else None,
+                    submodule_search_locations=[dir_path],
+                )
+            else:
+                raise ImportError(f"Module not found: {name} (looked at {dir_path})")
 
-    spec = importlib.util.spec_from_file_location(module_relpath, spec_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load module '{module_relpath}' from {spec_path}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_relpath] = mod
-    spec.loader.exec_module(mod)
-    return mod
+        if spec is None:
+            # Namespace package (no __init__.py) — create a bare module
+            import types
+            mod = types.ModuleType(name)
+            mod.__path__ = [dir_path]
+            mod.__package__ = name
+        else:
+            mod = importlib.util.module_from_spec(spec)
+
+        sys.modules[name] = mod
+        if spec is not None and spec.loader is not None:
+            spec.loader.exec_module(mod)
+
+    return sys.modules[module_relpath]
 
 
 # ---------------------------------------------------------------------------
