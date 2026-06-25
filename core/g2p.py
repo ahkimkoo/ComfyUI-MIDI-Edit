@@ -16,11 +16,23 @@ import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # --- NLTK data directory ---
-# Resolve to <repo>/models/nltk regardless of import site. This file lives at
-# <repo>/core/g2p.py, so two dirname() calls reach the repository root.
-_NLTK_DATA_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "nltk"
-)
+# Download to ComfyUI's models/nltk/ on first run, not bundled in this repo.
+# Resolve: find ComfyUI root by looking for "main.py" in parent directories.
+def _find_comfyui_models_dir():
+    """Find ComfyUI's models/ directory. Falls back to ~/.cache/nltk_data."""
+    p = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for _ in range(5):
+        if os.path.isfile(os.path.join(p, "main.py")):
+            return os.path.join(p, "models", "nltk")
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    # Not found (e.g., running tests outside ComfyUI) → use default cache
+    import tempfile
+    return os.path.join(os.path.expanduser("~"), ".cache", "nltk_data")
+
+_NLTK_DATA_DIR = _find_comfyui_models_dir()
 os.makedirs(_NLTK_DATA_DIR, exist_ok=True)
 os.environ.setdefault("NLTK_DATA", _NLTK_DATA_DIR)
 
@@ -38,8 +50,9 @@ _g2p_zh = None
 _g2p_en = None
 
 _NLTK_PACKAGES = [
-    "taggers/averaged_perceptron_tagger_eng",
     "taggers/averaged_perceptron_tagger",
+    "taggers/averaged_perceptron_tagger_eng",
+    "tokenizers/punkt",
     "tokenizers/punkt_tab",
 ]
 
