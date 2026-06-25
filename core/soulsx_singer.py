@@ -208,6 +208,18 @@ def _patch_transformers_compat():
         )
 
     LlamaAttention.forward = _patched_attn_forward
+
+    # Also patch LlamaConfig to ensure _attn_implementation is set.
+    # SoulX-Singer creates LlamaConfig with positional args only, leaving
+    # _attn_implementation as None, which breaks transformers >= 4.57.
+    from transformers import LlamaConfig as _LlamaCfg
+    _orig_cfg_init = _LlamaCfg.__init__
+    def _patched_cfg_init(self, *args, **kwargs):
+        _orig_cfg_init(self, *args, **kwargs)
+        if getattr(self, "_attn_implementation", None) is None:
+            self._attn_implementation = "eager"
+    _LlamaCfg.__init__ = _patched_cfg_init
+
     _transformers_patched = True
     print(f"[MIDI-Edit] Patched LlamaAttention.forward for transformers {ver} compatibility")
 
