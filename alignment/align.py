@@ -65,21 +65,25 @@ def segment_sentences(lyrics: str, target_count: int = 0,
 
 def _split_long_sentence(text: str, max_len: int,
                           punctuate_fn=None) -> list[str]:
-    """对超过 max_len 的句子用 CT-Transformer 断句一次（不递归）。"""
+    """对超过 max_len 的句子用 CT-Transformer 加标点后按标点切分。
+
+    CT-Transformer 一次输出多个标点，直接全切，不需要递归。
+    """
     if len(text) <= max_len:
         return [text]
 
-    # 用 CT-Transformer 加标点，在标点处切一次
     if punctuate_fn is not None:
         try:
             punctuated = punctuate_fn(text)
-            cut = _cut_at_punctuation(punctuated)
-            if cut and len(cut) == 2:
-                return cut
+            # 按所有标点切分
+            pieces = re.split(r'[，。！？；：、]', punctuated)
+            pieces = [p.strip() for p in pieces if p.strip()]
+            if len(pieces) > 1:
+                return pieces
         except Exception:
             pass
 
-    # CT-Transformer 不可用或没找到标点 → 原句保留
+    # CT-Transformer 不可用或没有标点 → 原句保留
     return [text]
 
 
