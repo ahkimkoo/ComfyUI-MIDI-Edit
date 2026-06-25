@@ -5,7 +5,8 @@ import os
 
 import pytest
 
-from alignment.models import Token, Unit, AlignmentOp, AlignmentPath, CostWeights, Track
+from core.midi_format import Token, Track
+from core.align_algorithm import Unit, AlignmentOp, AlignmentPath, CostWeights
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +60,7 @@ class TestModels:
 # ---------------------------------------------------------------------------
 
 
-from alignment.parser import parse_tracks, serialize_track, serialize_tracks
+from core.midi_format import parse_tracks, serialize_track, serialize_tracks
 
 
 class TestParser:
@@ -124,7 +125,7 @@ class TestParser:
 # ---------------------------------------------------------------------------
 
 
-from alignment.align import segment_sentences, calculate_spd, align_track
+from core.align_algorithm import segment_sentences, calculate_spd, align_track
 
 
 class TestSegmentSentences:
@@ -570,7 +571,7 @@ class TestForceTone4:
 # ---------------------------------------------------------------------------
 
 
-from alignment.speed import apply_speed_change
+from core.speed import apply_speed_change
 
 
 class TestSpeedAdapter:

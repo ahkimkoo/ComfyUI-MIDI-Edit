@@ -1,26 +1,34 @@
-# alignment/align.py
-"""v3 歌词对齐算法：顺序映射 + 贪心压缩（彻底替换 DP）.
+# core/align_algorithm.py
+"""MidiLyricsAlignment v3 core algorithm: sequential mapping + greedy packing.
 
-设计见 ``docs/superpowers/specs/2026-06-24-alignment-v3-design.md``.
+Design: ``docs/superpowers/specs/2026-06-24-alignment-v3-design.md``.
 
-核心思路：
-  1. 原始 SP 全部移除，按新歌词断句重建 [SP] 句1 [SP] ... [SP] 结构。
-  2. 新字映射到原始非 SP token（旋律来源）。
-  3. 字数 <= 非 SP token 数 -> 1:1 顺序映射，多余 token 丢弃。
-  4. 字数 > 非 SP token 数 -> 贪心压缩，多字词(jieba)共享最长 token。
-  5. f0 按 50fps 切段保留，SP 处插全 0，SPLIT 按字数切片。
-  6. SPD 公式决定新 SP 的 duration(不守恒总时长)。
+Core ideas:
+  1. Original SP tokens are all removed; rebuild ``[SP] sent1 [SP] ... [SP]``
+     from the new lyrics' sentence boundaries.
+  2. New chars map onto the original non-SP tokens (the melodic source).
+  3. chars <= non-SP tokens -> 1:1 sequential mapping, surplus tokens dropped.
+  4. chars > non-SP tokens -> greedy packing, multi-char words (jieba) share
+     the longest tokens.
+  5. f0 is sliced per 50fps segment, SP fills zeros, SPLIT slices by char count.
+  6. SPD formula decides the new SP duration (total duration is not conserved).
 """
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
+from typing import Literal
 
-import jieba
+from core.midi_format import Token, FPS
+from core.g2p import (
+    char_to_phoneme,
+    is_chinese_char,
+    normalize_digits,
+    word_to_phoneme,
+    ZH_FLAG,
+)
+from core.text_utils import is_reduplication
 
-from alignment.models import Token
-
-# SoulX-Singer data_processor.py 确认：sample_rate=24000, hop_size=480 -> 50fps。
-FPS = 50
 # SPLIT 后单字最低 duration 保障(spec §3.5 / §5)。
 MIN_SPLIT_DUR = 0.1
 # 无原始 SP 时的默认 AVG/MAX(spec §5)。
@@ -28,11 +36,57 @@ DEFAULT_SP_DUR = 0.3
 # force_tone4 触发阈值。
 TONE4_THRESHOLD = 79
 
-_ZH_FLAG = "zh_"
-# 阿拉伯数字 -> 中文数字字(g2pM 可发音)，与 phoneme.py / nodes.py 一致。
-_DIGIT_TO_ZH = str.maketrans("0123456789", "零一二三四五六七八九")
 # 断句标点。
 _SENTENCE_PUNCT_RE = re.compile(r"[。！？，、；：\n]")
+
+
+# ---------------------------------------------------------------------------
+# Data structures (alignment-specific)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Unit:
+    """预处理后的对齐单元."""
+
+    text: str
+    phoneme: str
+    kind: Literal["zh", "en", "sp"]
+    max_occupy: int                                       # zh=1, en≤K, sp=1
+    source: Literal["lyric", "punct", "orig_sp"] = "lyric"
+
+
+@dataclass(frozen=True)
+class AlignmentOp:
+    """DP 转移的原子操作."""
+
+    kind: Literal["REPLACE", "WORD_SPAN", "SPLIT", "DROP", "SP_ALIGN"]
+    unit: Unit | None
+    token_indices: tuple[int, ...]
+    op_cost: float
+
+
+@dataclass
+class AlignmentPath:
+    """完整的对齐路径."""
+
+    ops: list[AlignmentOp]
+    total_cost: float
+    sp_placements: list[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CostWeights:
+    """代价函数权重配置."""
+
+    w_pitch: float = 0.5
+    w_duration: float = 0.3
+    w_structure: float = 0.2
+    min_duration: float = 0.30
+    lambda_min_dur: float = 5.0
+    mu_word_boundary: float = 10.0
+    max_word_occupy: int = 4
+    w_pitch_cont: float = 0.05  # pitch 连贯性：相邻字 pitch 差异惩罚
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +118,7 @@ def segment_sentences(lyrics: str, target_count: int = 0,
 
 
 def _split_long_sentence(text: str, max_len: int,
-                          punctuate_fn=None) -> list[str]:
+                         punctuate_fn=None) -> list[str]:
     """对超过 max_len 的句子用 CT-Transformer 加标点后按标点切分。
 
     CT-Transformer 一次输出多个标点，直接全切，不需要递归。
@@ -123,15 +177,15 @@ def calculate_spd(orig_sp_durations: list[float], orig_total: int,
     return max(0.1, min(spd, mx))
 
 
-def align_track(track, lyrics_text: str, weights, normalize_digits: bool,
+def align_track(track, lyrics_text: str, weights, normalize_digits_flag: bool,
                 force_tone4: bool, punctuate_fn=None) -> tuple:
     """主入口：把新歌词对齐到单个 track。
 
     Args:
-        track: alignment.models.Track。
+        track: core.midi_format.Track。
         lyrics_text: 该 track 分到的新歌词(可能含多句/标点/换行)。
         weights: CostWeights(v3 基本不用，保留入参以稳定 API)。
-        normalize_digits: 是否把阿拉伯数字转中文数字字。
+        normalize_digits_flag: 是否把阿拉伯数字转中文数字字。
         force_tone4: 是否对高音中文音素强制改四声。
         punctuate_fn: 可选的 CT-Transformer 标点函数，用于智能断句。
 
@@ -148,8 +202,8 @@ def align_track(track, lyrics_text: str, weights, normalize_digits: bool,
 
     # ---- 2. 归一化 + 断句 ----
     text = lyrics_text or ""
-    if normalize_digits:
-        text = _normalize_digits(text)
+    if normalize_digits_flag:
+        text = normalize_digits(text)
     sentences = segment_sentences(text, punctuate_fn=punctuate_fn)
     sentences = [s for s in sentences if s.strip()]
     if not sentences:
@@ -270,43 +324,11 @@ def align_track(track, lyrics_text: str, weights, normalize_digits: bool,
 # ---------------------------------------------------------------------------
 
 
-def _normalize_digits(text: str) -> str:
-    if not text:
-        return text
-    return text.translate(_DIGIT_TO_ZH)
-
-
-def _split_at_word_boundary(text: str) -> tuple[str, str]:
-    """在中间附近的 jieba 词边界把 text 切成两段。无合适边界则返回 (text, "")."""
-    if len(text) <= 1:
-        return text, ""
-    mid = len(text) / 2.0
-    words = [w for w in jieba.cut(text) if w]
-    # 累计每个词的起始位置(词边界)。
-    cum = 0
-    boundaries = []
-    for w in words:
-        boundaries.append(cum)
-        cum += len(w)
-    boundaries.append(cum)
-    # 候选切点 = 非首尾的词边界。
-    candidates = [p for p in boundaries[1:-1] if 0 < p < len(text)]
-    if not candidates:
-        return text, ""
-    best = min(candidates, key=lambda p: abs(p - mid))
-    return text[:best], text[best:]
-
-
 def _build_units(sentence: str) -> list[dict]:
     """把句子解析为单元列表：中文字各一单元，英文词各一单元。
 
-    与 nodes._build_units 行为一致，但用 alignment.phoneme 的函数，
-    避免依赖外部 nodes.py(ComfyUI 命名冲突)。
+    与 core.edit_algorithm._build_units 行为一致，但用 core.g2p 的函数。
     """
-    from alignment.phoneme import (
-        char_to_phoneme, word_to_phoneme, is_chinese_char,
-    )
-
     units: list[dict] = []
     if not sentence:
         return units
@@ -340,6 +362,8 @@ def _unit_spans(units: list[dict]) -> list[tuple[int, int]]:
     连续中文单元按 jieba 分词成组；英文单元各自长度 1。
     用于贪心压缩时识别"多字词"。
     """
+    import jieba  # lazy: avoids loading jieba's dictionary at package import
+
     spans: list[tuple[int, int]] = []
     i = 0
     n = len(units)
@@ -463,8 +487,6 @@ def _slice_segment(seg: list[float], cnt: int, pos: int) -> list[float]:
 
 def _note_type(unit: dict, prev_text: str) -> int:
     """v3 note_type: SP=1(由调用方处理)；重复字(非叠词)=3；其余=2。"""
-    from alignment.phoneme import is_reduplication
-
     text = unit["text"]
     # 仅单字参与重复检测(英文词整词独立)。
     if len(text) == 1 and prev_text == text and not is_reduplication(text, prev_text):
@@ -508,7 +530,7 @@ def _apply_force_tone4(tokens: list, threshold: int = TONE4_THRESHOLD) -> list:
     result = []
     for t in tokens:
         if (not t.is_sp and t.note_pitch >= threshold
-                and t.phoneme.startswith(_ZH_FLAG)
+                and t.phoneme.startswith(ZH_FLAG)
                 and t.phoneme[-1:].isdigit()):
             new_ph = re.sub(r"(\d)$", "4", t.phoneme)
             result.append(Token(
@@ -520,7 +542,7 @@ def _apply_force_tone4(tokens: list, threshold: int = TONE4_THRESHOLD) -> list:
 
 
 def _format_f0(vals: list[float]) -> str:
-    """格式化 f0 帧：0.0 用 "0.0"，其余去尾零(与 speed_impl._fmt_f0 一致)。"""
+    """格式化 f0 帧：0.0 用 "0.0"，其余去尾零(与 core.speed.format_f0 一致)。"""
     out = []
     for v in vals:
         f = float(v)

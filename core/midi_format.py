@@ -1,15 +1,50 @@
-# alignment/parser.py
-"""JSON ↔ Token/Track 转换."""
+# core/midi_format.py
+"""MIDI token/track data structures and JSON parse/serialize.
+
+Houses the ``Token`` / ``Track`` dataclasses and the conversion layer between
+the MIDI JSON wire format and the internal representation. Frame rate (FPS) is
+fixed at 50 (SoulX-Singer: sample_rate=24000, hop_size=480).
+"""
 from __future__ import annotations
+
 import json
-from alignment.models import Token, Track
+from dataclasses import dataclass, field
+
+
+# SoulX-Singer data_processor.py: sample_rate=24000, hop_size=480 -> 50fps.
+FPS = 50
+
+
+@dataclass(frozen=True)
+class Token:
+    """A single MIDI token (internal representation of one JSON entry)."""
+
+    text: str            # "<SP>" or an actual char/word
+    phoneme: str         # original phoneme
+    duration: float      # seconds
+    note_pitch: int      # MIDI note number (0 = rest)
+    note_type: int       # 1 = section tail / 2 = normal·word head / 3 = word-internal continuation
+    index: int           # original index within the track
+
+    @property
+    def is_sp(self) -> bool:
+        return self.text == "<SP>"
+
+
+@dataclass
+class Track:
+    """Internal representation of one MIDI track (preserves non-token fields)."""
+
+    tokens: list[Token]
+    meta: dict = field(default_factory=dict)  # index/language/time etc. from the original JSON
+    f0: str = ""          # frame-level f0, preserved verbatim
 
 
 def parse_tracks(midi_json_str: str) -> list[Track]:
-    """解析 MIDI JSON 字符串为 Track 列表.
+    """Parse a MIDI JSON string into a list of ``Track`` objects.
 
     Raises:
-        ValueError: JSON 解析失败或字段缺失.
+        ValueError: JSON parse failure or a missing required field.
     """
     if not midi_json_str or not midi_json_str.strip():
         raise ValueError("midi_json is empty")
@@ -23,11 +58,11 @@ def parse_tracks(midi_json_str: str) -> list[Track]:
 
 
 def _parse_track(track_data: dict, track_idx: int) -> Track:
-    """解析单个 track dict."""
+    """Parse a single track dict."""
     required = ["text", "phoneme", "duration", "note_pitch", "note_type"]
-    for field in required:
-        if field not in track_data:
-            raise ValueError(f"track {track_idx} missing field: {field}")
+    for field_name in required:
+        if field_name not in track_data:
+            raise ValueError(f"track {track_idx} missing field: {field_name}")
 
     texts = track_data["text"].split()
     phonemes = track_data["phoneme"].split()
@@ -62,7 +97,7 @@ def _parse_track(track_data: dict, track_idx: int) -> Track:
 
 
 def serialize_track(track: Track) -> dict:
-    """把 Track 序列化回 track dict（与原 JSON 格式兼容）."""
+    """Serialize a ``Track`` back into a track dict (wire-format compatible)."""
     tokens = track.tokens
     result = dict(track.meta)
     result["text"] = " ".join(t.text for t in tokens)
@@ -76,6 +111,6 @@ def serialize_track(track: Track) -> dict:
 
 
 def serialize_tracks(tracks: list[Track]) -> str:
-    """序列化 Track 列表为 JSON 字符串."""
+    """Serialize a list of ``Track`` objects into a JSON string."""
     return json.dumps([serialize_track(t) for t in tracks],
                       ensure_ascii=False, indent=2)
