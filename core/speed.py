@@ -1,12 +1,10 @@
-# alignment/speed_impl.py
-"""Speed adjustment implementation (self-contained).
+# core/speed.py
+"""Speed adjustment: duration scaling and f0 resampling.
 
-Extracted from ``nodes._apply_speed`` so the alignment subpackage does not
-import the external ``nodes.py`` (which clashes with ComfyUI core's
-``nodes.py`` under ``sys.modules['nodes']``).
-
-Behaviour is identical to ``nodes._apply_speed`` + its private formatting
-helpers (``_fmt_durs`` / ``_fmt_f0``).
+Provides both the dict-level ``apply_speed`` (operates on the raw MIDI JSON
+track dicts) and the ``apply_speed_change`` adapter (operates on parsed
+``Track`` objects). Formatting helpers round durations to 2 decimals while
+keeping the rounded total equal to the true total.
 """
 from __future__ import annotations
 
@@ -25,13 +23,13 @@ def apply_speed(midi_data: list, speed: float) -> list:
     """
     import numpy as _np
 
-    ratio = 1.0 / speed  # duration scale factor (speed up -> ratio < 1 -> shorter)
+    ratio = 1.0 / speed  # duration scale factor (speed up → ratio < 1 → shorter)
 
     for track in midi_data:
         # Scale durations
         if "duration" in track:
             dur_vals = [float(x) * ratio for x in track["duration"].split(" ")]
-            track["duration"] = " ".join(_fmt_durs(dur_vals))
+            track["duration"] = " ".join(format_durations(dur_vals))
 
         # Scale time range (used by downstream to preallocate audio buffer)
         if "time" in track and isinstance(track["time"], list) and len(track["time"]) == 2:
@@ -45,24 +43,29 @@ def apply_speed(midi_data: list, speed: float) -> list:
 
             if new_len == orig_len:
                 # No change needed
-                track["f0"] = " ".join(_fmt_f0(v) for v in f0_vals)
+                track["f0"] = " ".join(format_f0(v) for v in f0_vals)
             elif new_len > orig_len:
                 # Stretch: linear interpolation
                 old_indices = _np.linspace(0, orig_len - 1, orig_len)
                 new_indices = _np.linspace(0, orig_len - 1, new_len)
                 resampled = _np.interp(new_indices, old_indices, f0_vals)
-                track["f0"] = " ".join(_fmt_f0(v) for v in resampled)
+                track["f0"] = " ".join(format_f0(v) for v in resampled)
             else:
                 # Shrink: linear interpolation then take fewer samples
                 old_indices = _np.linspace(0, orig_len - 1, orig_len)
                 new_indices = _np.linspace(0, orig_len - 1, new_len)
                 resampled = _np.interp(new_indices, old_indices, f0_vals)
-                track["f0"] = " ".join(_fmt_f0(v) for v in resampled)
+                track["f0"] = " ".join(format_f0(v) for v in resampled)
 
     return midi_data
 
 
-def _fmt_durs(durations: list[float]) -> list[str]:
+def _fmt_dur(v: float) -> str:
+    """Format a single duration value, cleaning up float artifacts. Keeps 2 decimal places."""
+    return f"{v:.2f}"
+
+
+def format_durations(durations: list[float]) -> list[str]:
     """Format a list of durations to 2 decimal places, adjusting the last
     element so the rounded total matches the true total."""
     if not durations:
@@ -76,10 +79,26 @@ def _fmt_durs(durations: list[float]) -> list[str]:
     return [f"{d:.2f}" for d in rounded]
 
 
-def _fmt_f0(v) -> str:
+def format_f0(v) -> str:
     """Format an f0 value, cleaning up float artifacts."""
     f = float(v)
     if f == 0.0:
         return "0.0"
     s = f"{f:.1f}".rstrip("0").rstrip(".")
     return s if s else "0"
+
+
+def apply_speed_change(tracks: list, speed: float) -> list:
+    """Apply speed change to parsed ``Track`` objects (speed ≠ 1).
+
+    Serializes each track to its dict form, runs :func:`apply_speed`, then
+    re-parses the result back into ``Track`` objects (avoiding a redundant
+    JSON round-trip).
+    """
+    from core.midi_format import serialize_track, _parse_track
+
+    if speed == 1.0:
+        return tracks
+    track_dicts = [serialize_track(t) for t in tracks]
+    result_dicts = apply_speed(track_dicts, speed)
+    return [_parse_track(d, i) for i, d in enumerate(result_dicts)]
