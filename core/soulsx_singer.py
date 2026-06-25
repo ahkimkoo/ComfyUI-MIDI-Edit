@@ -172,15 +172,23 @@ def _patch_transformers_compat():
             rotary = getattr(self, "rotary_emb", None)
             if rotary is None:
                 # Lazily create rotary_emb with the correct head_dim for this layer
+                import inspect
                 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
                 head_dim = self.head_dim if hasattr(self, "head_dim") else (
                     self.config.hidden_size // self.config.num_attention_heads
                 )
-                rotary = LlamaRotaryEmbedding(
-                    head_dim=head_dim,
-                    max_position_embeddings=getattr(self.config, "max_position_embeddings", 4096),
-                    base=getattr(self.config, "rope_theta", 10000.0),
-                )
+                sig = inspect.signature(LlamaRotaryEmbedding.__init__)
+                params = set(sig.parameters.keys()) - {"self"}
+                kwargs = {}
+                if "head_dim" in params:
+                    kwargs["head_dim"] = head_dim
+                if "max_position_embeddings" in params:
+                    kwargs["max_position_embeddings"] = getattr(self.config, "max_position_embeddings", 4096)
+                if "base" in params:
+                    kwargs["base"] = getattr(self.config, "rope_theta", 10000.0)
+                if "config" in params and not kwargs:
+                    kwargs["config"] = self.config
+                rotary = LlamaRotaryEmbedding(**kwargs)
                 rotary = rotary.to(hidden_states.device, dtype=hidden_states.dtype)
                 self.rotary_emb = rotary
             if position_ids is None:
