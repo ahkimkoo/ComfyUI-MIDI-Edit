@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -60,11 +61,45 @@ def _get_device() -> str:
         return "cpu"
 
 
-def _ensure_sys_path():
+def _load_submodule(module_relpath: str):
+    """Import a submodule from SoulX-Singer by file path.
+
+    SoulX-Singer's subdirectories (preprocess/, cli/) lack __init__.py and
+    cannot be imported with a plain `import` statement. This helper registers
+    parent packages in sys.modules so that internal cross-imports work.
+    """
+    import types
+    import importlib
+
     root = _get_soulxsinger_root()
-    import sys
     if root not in sys.path:
         sys.path.insert(0, root)
+    parts = module_relpath.split(".")
+
+    # Ensure all ancestor packages are registered in sys.modules
+    for i in range(1, len(parts)):
+        parent_name = ".".join(parts[:i])
+        if parent_name in sys.modules:
+            continue
+        parent_dir = os.path.join(root, *parts[:i])
+        if os.path.isdir(parent_dir):
+            mod = types.ModuleType(parent_name)
+            mod.__path__ = [parent_dir]
+            mod.__package__ = parent_name
+            sys.modules[parent_name] = mod
+
+    return importlib.import_module(module_relpath)
+
+    if os.path.isfile(spec_path + ".py"):
+        spec_path = spec_path + ".py"
+
+    spec = importlib.util.spec_from_file_location(module_relpath, spec_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module '{module_relpath}' from {spec_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_relpath] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ---------------------------------------------------------------------------
@@ -77,9 +112,10 @@ def _get_svs_model():
     if _svs_model is not None:
         return _svs_model, _svs_config
 
-    _ensure_sys_path()
-    from soulxsinger.utils.file_utils import load_config
-    from cli.inference import build_model
+    file_utils = _load_submodule("soulxsinger.utils.file_utils")
+    load_config = file_utils.load_config
+    cli_inference = _load_submodule("cli.inference")
+    build_model = cli_inference.build_model
 
     base = get_models_base()
     model_path = os.path.join(base, "Soul-AILab", "SoulX-Singer", "model.pt")
@@ -109,8 +145,8 @@ def _get_phoneset_path() -> str:
 
 def _get_preprocess_pipeline(language: str = "Mandarin", save_dir: str | None = None,
                               max_merge_duration: int = 30000):
-    _ensure_sys_path()
-    from preprocess.pipeline import PreprocessPipeline
+    pipeline_mod = _load_submodule("preprocess.pipeline")
+    PreprocessPipeline = pipeline_mod.PreprocessPipeline
 
     device = _get_device()
     base = get_models_base()
@@ -353,8 +389,8 @@ def synthesize_audio(midi_json_str: str, prompt_audio,
     with tempfile.TemporaryDirectory(prefix="soulsx_synth_") as tmpdir:
         prompt_wav_path = _ensure_wav_path(prompt_audio, prompt_sample_rate, tmpdir)
 
-        _ensure_sys_path()
-        from cli.inference import process as svs_process
+        cli_inference = _load_submodule("cli.inference")
+        svs_process = cli_inference.process
 
         class Args:
             pass
