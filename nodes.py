@@ -12,6 +12,8 @@ import json
 import os
 import sys
 
+import numpy as np
+
 # Ensure the package directory is importable under ComfyUI's loader.
 # ComfyUI imports this module dynamically; the extension dir may not be on
 # sys.path, so `from core import ...` below would fail without this.
@@ -114,6 +116,23 @@ def _smart_split_sentences(plain_lyrics, midi_data, split_mode="token"):
         plain_lyrics, midi_data, split_mode=split_mode,
         restore_punc_fn=_restore_punctuation,
     )
+
+
+def _comfyui_audio_to_numpy(audio) -> tuple:
+    """Convert ComfyUI AUDIO dict to (numpy_array, sample_rate)."""
+    if isinstance(audio, dict):
+        waveform = audio["waveform"]
+        sr = audio["sample_rate"]
+    else:
+        raise TypeError(f"Expected ComfyUI AUDIO dict, got {type(audio)}")
+    import torch
+    if isinstance(waveform, torch.Tensor):
+        wav = waveform.squeeze().cpu().numpy()
+    else:
+        wav = np.asarray(waveform)
+    if wav.ndim == 2 and wav.shape[0] <= 2:
+        wav = wav.T.squeeze()
+    return wav.astype(np.float32), int(sr)
 
 
 # --- ComfyUI Nodes ---
@@ -236,19 +255,7 @@ class MIDIMergeRepeatedChars:
         return (merge_repeated_chars(text),)
 
 
-# --- Mappings ---
-
-NODE_CLASS_MAPPINGS = {
-    "MIDIEditLyrics": MIDIEditLyrics,
-    "MIDIExtractLyrics": MIDIExtractLyrics,
-    "MIDIMergeRepeatedChars": MIDIMergeRepeatedChars,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "MIDIEditLyrics": "MIDI Edit Lyrics",
-    "MIDIExtractLyrics": "MIDI Extract Lyrics",
-    "MIDIMergeRepeatedChars": "MIDI Merge Repeated Chars",
-}
+# --- Mappings (defined at end of file after all class definitions) ---
 
 
 # --- Unified DP-based alignment node ---
@@ -328,3 +335,113 @@ class MidiLyricsAlignment:
         # Web UI 反馈。替代原来的 print() 静默输出。
         warnings_str = "; ".join(warnings_list) if warnings_list else ""
         return (output_json, warnings_str)
+
+
+# --- SoulX-Singer integration nodes ---
+
+
+class MIDITranscribeAudio:
+    """Transcribe audio to MIDI JSON using SoulX-Singer preprocessing pipeline."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+            },
+            "optional": {
+                "max_merge_duration": ("INT", {"default": 30000, "min": 1000, "max": 120000, "step": 1000}),
+                "language": (["Mandarin", "English", "Cantonese"], {"default": "Mandarin"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("midi_json",)
+    FUNCTION = "transcribe"
+    CATEGORY = "MIDI-SoulX"
+    DESCRIPTION = (
+        "Transcribe audio to MIDI JSON using SoulX-Singer. "
+        "Runs full preprocessing: vocal separation, F0 extraction, VAD, "
+        "lyrics transcription, and note transcription. "
+        "Output MIDI JSON can be edited with MIDI Edit Lyrics / MIDI Lyrics Alignment, "
+        "then fed into MIDI Synthesize Audio for singing voice synthesis."
+    )
+
+    def transcribe(self, audio, max_merge_duration=30000, language="Mandarin"):
+        from core.soulsx_singer import transcribe_audio
+        arr, sr = _comfyui_audio_to_numpy(audio)
+        try:
+            result = transcribe_audio(
+                (arr, sr), language=language, max_merge_duration=max_merge_duration,
+            )
+            return (result,)
+        except Exception as e:
+            raise ValueError(f"Audio transcription error: {e}") from e
+
+
+class MIDISynthesizeAudio:
+    """Synthesize singing audio from MIDI JSON and reference voice using SoulX-Singer."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "midi_json": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+                "prompt_audio": ("AUDIO",),
+            },
+            "optional": {
+                "control": (["score", "melody"], {"default": "score"}),
+                "seed": ("INT", {"default": 12306, "min": 0, "max": 2147483647, "step": 1}),
+                "auto_shift": ("BOOLEAN", {"default": True, "label_on": "ON", "label_off": "OFF"}),
+                "pitch_shift": ("INT", {"default": 0, "min": -36, "max": 36, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "synthesize"
+    CATEGORY = "MIDI-SoulX"
+    DESCRIPTION = (
+        "Synthesize singing voice from MIDI JSON and a reference audio using SoulX-Singer. "
+        "The MIDI JSON provides lyrics, phonemes, duration, pitch, and F0 data. "
+        "The prompt audio provides the target voice timbre. "
+        "Control mode: 'score' uses MIDI note pitches, 'melody' uses F0 contour."
+    )
+
+    def synthesize(self, midi_json, prompt_audio, control="score",
+                   seed=12306, auto_shift=True, pitch_shift=0):
+        midi_json = midi_json or ""
+        if not midi_json.strip():
+            raise ValueError("MIDI JSON is empty")
+        from core.soulsx_singer import synthesize_audio
+        arr, sr = _comfyui_audio_to_numpy(prompt_audio)
+        try:
+            wav, out_sr = synthesize_audio(
+                midi_json, (arr, sr),
+                control=control, seed=seed,
+                auto_shift=auto_shift, pitch_shift=pitch_shift,
+            )
+            import torch
+            waveform = torch.from_numpy(wav).float()
+            if waveform.dim() == 1:
+                waveform = waveform.unsqueeze(0)
+            return ({"waveform": waveform, "sample_rate": out_sr},)
+        except Exception as e:
+            raise ValueError(f"Audio synthesis error: {e}") from e
+
+
+NODE_CLASS_MAPPINGS = {
+    "MIDIEditLyrics": MIDIEditLyrics,
+    "MIDIExtractLyrics": MIDIExtractLyrics,
+    "MIDIMergeRepeatedChars": MIDIMergeRepeatedChars,
+    "MIDITranscribeAudio": MIDITranscribeAudio,
+    "MIDISynthesizeAudio": MIDISynthesizeAudio,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "MIDIEditLyrics": "MIDI Edit Lyrics",
+    "MIDIExtractLyrics": "MIDI Extract Lyrics",
+    "MIDIMergeRepeatedChars": "MIDI Merge Repeated Chars",
+    "MIDITranscribeAudio": "MIDI Transcribe Audio",
+    "MIDISynthesizeAudio": "MIDI Synthesize Audio",
+}
