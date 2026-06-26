@@ -595,4 +595,4 @@ def synthesize_audio(midi_json_str: str, prompt_audio,
         if not os.path.isfile(generated_path):
             raise RuntimeError("SVS inference did not produce generated.wav")
 
-    return _load_wav_result(generated_path)
+        return _load_wav_result(generated_path)
