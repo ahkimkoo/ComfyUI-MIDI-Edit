@@ -255,7 +255,12 @@ def _get_svs_model():
 
     config = load_config(config_path)
     device = _get_device()
-    use_fp16 = "cuda" in device
+    # Build in FP32 to match the reference SVS implementation, which runs pure
+    # FP32 (no model.half()). FP16 weights are a secondary suspect for degraded
+    # audio quality / garbled pronunciation. FP32 is the safe default; per-call
+    # mixed precision can still be requested via synthesize_audio(use_fp16=True),
+    # which uses autocast on the fly without changing the model dtype.
+    use_fp16 = False
     print(f"[MIDI-Edit] Loading SVS model on {device}, fp16={use_fp16}")
     _svs_model = build_model(model_path=model_path, config=config, device=device, use_fp16=use_fp16)
     _svs_config = config
@@ -307,8 +312,38 @@ def _ensure_pretrained_models_links():
         os.symlink(target_path, link_path)
 
 
+def _ensure_nltk_for_preprocess():
+    """Ensure NLTK data is available before the SoulX-Singer preprocess pipeline runs.
+
+    The preprocess chain's English g2p (``SoulX-Singer/preprocess/tools/g2p.py``,
+    which we must not modify) calls ``nltk.pos_tag`` at *pipeline run* time, and
+    that requires NLTK resources such as ``averaged_perceptron_tagger_eng``.
+
+    Those resources are downloaded lazily by :mod:`core.g2p`, but only when the
+    MIDIEdit lyrics path (:func:`core.g2p._get_g2p_en`) is taken — the
+    transcription path never touches it, so ``ComfyUI/models/nltk`` would be
+    empty and ``LookupError`` would be raised. Even after download, the env-var
+    ``NLTK_DATA`` setdefault in :mod:`core.g2p` is ineffective once nltk has been
+    imported (which the preprocess chain does), so we must also register the
+    directory on ``nltk.data.path`` explicitly.
+
+    Reuses :func:`core.g2p.ensure_nltk_data` (single source of truth: path
+    injection + download into ``ComfyUI/models/nltk``) and must run *before*
+    :func:`_load_submodule` so any nltk initialization in the imported modules
+    already sees the registered path.
+    """
+    from core.g2p import ensure_nltk_data
+
+    ensure_nltk_data()
+
+
 def _get_preprocess_pipeline(language: str = "Mandarin", save_dir: str | None = None,
                               max_merge_duration: int = 30000):
+    # Must run before _load_submodule("preprocess.*"): the preprocess chain
+    # imports g2p_en (-> nltk), so register ComfyUI/models/nltk on nltk.data.path
+    # and ensure required packages are downloaded before any nltk init sees it.
+    _ensure_nltk_for_preprocess()
+
     _ensure_pretrained_models_links()
 
     pipeline_mod = _load_submodule("preprocess.pipeline")
@@ -489,21 +524,23 @@ def midi_json_to_metadata(midi_json_str: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def transcribe_audio(audio, sample_rate: int | None = None,
-                     language: str = "Mandarin",
-                     max_merge_duration: int = 30000) -> str:
-    """Transcribe audio to MIDI JSON using SoulX-Singer preprocessing.
+def _preprocess_audio_to_metadata(audio, sample_rate: int | None = None,
+                                  language: str = "Mandarin",
+                                  max_merge_duration: int = 30000) -> list[dict]:
+    """Run SoulX-Singer preprocessing on *audio* and return the raw metadata list.
 
-    Args:
-        audio: File path (str/Path), numpy array, or (array, sample_rate) tuple.
-        sample_rate: Required only when audio is a bare numpy array.
-        language: Lyric language — "Mandarin", "English", or "Cantonese".
-        max_merge_duration: Max segment merge duration in ms.
+    This is the shared core of :func:`transcribe_audio`. It reuses the existing
+    preprocess pipeline (vocal separation, F0 extraction, VAD, lyrics ASR, note
+    transcription) without re-implementing any of it, and returns the raw
+    metadata list (one dict per segment) exactly as written by the pipeline —
+    **not** converted to MIDI JSON.
 
-    Returns:
-        MIDI JSON string.
+    The returned metadata describes the *actual acoustic content* of *audio*
+    (phoneme / duration / note_pitch / note_type / f0 aligned to the waveform),
+    which is the contract SoulX-Singer requires for prompt metadata
+    (see :func:`synthesize_audio`).
     """
-    with tempfile.TemporaryDirectory(prefix="soulsx_transcribe_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="soulsx_preprocess_") as tmpdir:
         audio_path = _ensure_wav_path(audio, sample_rate, tmpdir)
 
         save_dir = os.path.join(tmpdir, "output")
@@ -522,31 +559,189 @@ def transcribe_audio(audio, sample_rate: int | None = None,
         with open(meta_path, "r", encoding="utf-8") as f:
             metadata_list = json.load(f)
 
+        if not metadata_list:
+            raise RuntimeError(
+                "Preprocessing produced an empty metadata list; "
+                "check that the audio actually contains vocals."
+            )
+
+    return metadata_list
+
+
+def transcribe_audio(audio, sample_rate: int | None = None,
+                     language: str = "Mandarin",
+                     max_merge_duration: int = 30000) -> str:
+    """Transcribe audio to MIDI JSON using SoulX-Singer preprocessing.
+
+    Args:
+        audio: File path (str/Path), numpy array, or (array, sample_rate) tuple.
+        sample_rate: Required only when audio is a bare numpy array.
+        language: Lyric language — "Mandarin", "English", or "Cantonese".
+        max_merge_duration: Max segment merge duration in ms.
+
+    Returns:
+        MIDI JSON string.
+    """
+    metadata_list = _preprocess_audio_to_metadata(
+        audio, sample_rate=sample_rate, language=language,
+        max_merge_duration=max_merge_duration,
+    )
     return metadata_to_midi_json(metadata_list)
+
+
+def _validate_metadata_items(metadata_list) -> list[dict]:
+    """Ensure *metadata_list* is a list of non-empty dicts.
+
+    Raises ``ValueError`` if any element is not a ``dict`` or is an empty ``dict``.
+    A non-empty list with invalid content is a user error; an empty list itself
+    is intentionally allowed (semantics: "not provided" -> auto-preprocess).
+    """
+    for item in metadata_list:
+        if not isinstance(item, dict) or not item:
+            kind = "empty dict" if isinstance(item, dict) else type(item).__name__
+            raise ValueError(
+                "prompt_metadata list must contain only non-empty dict items; "
+                f"found element of type {kind}"
+            )
+    return metadata_list
+
+
+def _coerce_prompt_metadata(prompt_metadata) -> list[dict]:
+    """Coerce a user-supplied *prompt_metadata* value into a metadata list.
+
+    Accepts:
+      - ``None`` / empty string  → ``[]`` (caller falls back to auto-preprocess)
+      - MIDI JSON string (our track format: has ``text``, no ``time``)
+        → converted via :func:`midi_json_to_metadata`
+      - JSON string of a raw metadata list (dicts carry a ``time`` field)
+        → ``json.loads`` used directly
+      - ``list`` → used directly (each item must be a non-empty dict)
+      - ``dict`` → wrapped into a single-element list
+
+    The result always describes the prompt waveform (the reference voice), never
+    the target content.
+
+    Format disambiguation for JSON strings: the ``time`` / ``text`` fields tell
+    the two accepted formats apart. Our MIDI JSON *track* format (produced by
+    :func:`metadata_to_midi_json` / the ``MIDI Transcribe Audio`` node) uses
+    space-separated string fields and always carries a ``text`` key but **no**
+    ``time`` key, so it must pass through :func:`midi_json_to_metadata` to infer
+    timing. Raw SoulX-Singer metadata dicts (as written by the preprocess
+    pipeline and by :func:`_preprocess_audio_to_metadata`) carry a ``time``
+    ``[start_ms, end_ms]`` field and are already the native format, so they are
+    used as-is. This rule is based on the current contract of these two formats.
+    """
+    if prompt_metadata is None:
+        return []
+    if isinstance(prompt_metadata, list):
+        return _validate_metadata_items(prompt_metadata)
+    if isinstance(prompt_metadata, dict):
+        return [prompt_metadata]
+    if isinstance(prompt_metadata, str):
+        s = prompt_metadata.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"prompt_metadata is not valid JSON: {e}") from e
+        if isinstance(parsed, dict):
+            return [parsed]
+        if isinstance(parsed, list):
+            # Distinguish our MIDI JSON track format (string fields, "text",
+            # no "time") from a raw metadata list (carries "time"). Only the
+            # former needs midi_json_to_metadata; the latter is already the
+            # native SoulX-Singer metadata format.
+            if (parsed and isinstance(parsed[0], dict)
+                    and "time" not in parsed[0] and "text" in parsed[0]):
+                return midi_json_to_metadata(s)
+            return _validate_metadata_items(parsed)
+        raise ValueError("prompt_metadata JSON must be a list or object")
+    raise TypeError(
+        f"Unsupported prompt_metadata type: {type(prompt_metadata)}"
+    )
+
+
+def _resolve_prompt_metadata(prompt_metadata, fallback_audio,
+                             fallback_sample_rate: int | None = None,
+                             fallback_language: str = "Mandarin") -> list[dict]:
+    """Return prompt metadata that matches the reference (prompt) audio.
+
+    Resolution order:
+      1. If *prompt_metadata* is provided and non-empty (bypass), coerce it to a
+         metadata list. This is typically the output of running
+         :func:`transcribe_audio` (or the ``MIDI Transcribe Audio`` node) on the
+         prompt audio.
+      2. Otherwise, auto-preprocess *fallback_audio* to obtain metadata that
+         describes its real acoustic content.
+
+    SoulX-Singer requires the prompt metadata's phoneme / duration / note_pitch /
+    note_type / f0 to match the prompt waveform. The reference voice is a
+    different recording from the target, so prompt metadata must NEVER be derived
+    from the target MIDI JSON.
+    """
+    if prompt_metadata is not None:
+        coerced = _coerce_prompt_metadata(prompt_metadata)
+        if coerced:
+            return coerced
+        # Blank/empty -> treat as "not provided" and auto-preprocess.
+    return _preprocess_audio_to_metadata(
+        fallback_audio,
+        sample_rate=fallback_sample_rate,
+        language=fallback_language,
+    )
 
 
 def synthesize_audio(midi_json_str: str, prompt_audio,
                      prompt_sample_rate: int | None = None,
-                     control: str = "score",
+                     prompt_metadata=None,
+                     prompt_language: str = "Mandarin",
+                     control: str = "melody",
                      seed: int = 12306,
                      auto_shift: bool = True,
-                     pitch_shift: int = 0) -> tuple[np.ndarray, int]:
+                     pitch_shift: int = 0,
+                     use_fp16: bool = False,
+                     cfg: float | None = None,
+                     n_steps: int | None = None) -> tuple[np.ndarray, int]:
     """Synthesize singing audio from MIDI JSON and a reference voice.
 
     Args:
-        midi_json_str: MIDI JSON string (target lyrics/notes).
-        prompt_audio: Reference voice — file path, numpy array, or (array, sr) tuple.
+        midi_json_str: MIDI JSON string (the TARGET lyrics/notes to sing).
+        prompt_audio: Reference voice — file path, numpy array, or (array, sr)
+            tuple. Provides the target timbre; its waveform is paired with the
+            prompt metadata.
         prompt_sample_rate: Required only when prompt_audio is a bare numpy array.
-        control: "melody" (F0 contour) or "score" (MIDI notes).
+        prompt_metadata: Optional prompt metadata describing the prompt audio's
+            real acoustic content (phoneme/duration/note_pitch/note_type/f0).
+            Recommended: feed the output of ``MIDI Transcribe Audio`` run on the
+            prompt audio here, to avoid re-running preprocessing each call. If
+            omitted/empty, the prompt audio is preprocessed internally.
+        prompt_language: Language used when auto-preprocessing the prompt audio.
+        control: "melody" (F0 contour) or "score" (MIDI note pitches).
         seed: Random seed for reproducibility.
         auto_shift: Auto pitch shift to match reference voice range.
         pitch_shift: Manual pitch shift in semitones (-36 to 36).
+        use_fp16: If True, run inference with autocast mixed precision on CUDA
+            (faster). Defaults to False (pure FP32) to match the reference SVS
+            implementation and avoid quality regressions.
+        cfg: Classifier-free guidance scale (default 3 when None, read from the
+            SVS config). Higher values enforce stronger adherence to the lyrics /
+            phoneme content — in ``melody`` mode, raise toward 4-5 if diction is
+            muddy / swallowed; too high may cause over-saturation or artifacts.
+        n_steps: Number of flow-matching reverse-diffusion steps (default 32 when
+            None). Raising it slightly improves quality at the cost of inference
+            speed; lowering below 16 trades quality for speed.
+
+    Note:
+        ``rescale_cfg`` is intentionally **not** exposed: upstream
+        ``SoulXSinger.infer`` does not pass it through (it is hardcoded to 0.75
+        inside ``flow_matching.reverse_diffusion``). Exposing it would require
+        monkey-patching model internals, which violates the reuse principle.
 
     Returns:
         (waveform, sample_rate) — waveform is float32 numpy array.
     """
     import torch
-    import soundfile as sf
     import random
 
     torch.manual_seed(seed)
@@ -559,6 +754,23 @@ def synthesize_audio(midi_json_str: str, prompt_audio,
     metadata_list = midi_json_to_metadata(midi_json_str)
     if not metadata_list:
         raise ValueError("No valid tracks found in MIDI JSON")
+
+    # Resolve prompt metadata so it ALWAYS matches the reference (prompt) audio.
+    # Previously the first TARGET track was (incorrectly) used as the prompt,
+    # causing the prompt waveform to be truncated/misaligned to target content
+    # (data_processor truncates waveform to min_frame*hop_size derived from the
+    # metadata's duration/f0), producing garbled pronunciation.
+    prompt_meta_list = _resolve_prompt_metadata(
+        prompt_metadata,
+        fallback_audio=prompt_audio,
+        fallback_sample_rate=prompt_sample_rate,
+        fallback_language=prompt_language,
+    )
+    if not prompt_meta_list:
+        raise ValueError(
+            "Prompt metadata is empty. Provide prompt_metadata (e.g. the output "
+            "of MIDI Transcribe Audio on the prompt audio) or a valid prompt_audio."
+        )
 
     with tempfile.TemporaryDirectory(prefix="soulsx_synth_") as tmpdir:
         prompt_wav_path = _ensure_wav_path(prompt_audio, prompt_sample_rate, tmpdir)
@@ -579,20 +791,35 @@ def synthesize_audio(midi_json_str: str, prompt_audio,
         args.auto_shift = auto_shift
         args.pitch_shift = pitch_shift
         args.control = control
-        args.use_fp16 = "cuda" in device
+        args.use_fp16 = use_fp16
 
         prompt_meta_path = os.path.join(tmpdir, "prompt_meta.json")
         target_meta_path = os.path.join(tmpdir, "target_meta.json")
 
         with open(prompt_meta_path, "w", encoding="utf-8") as f:
-            json.dump([metadata_list[0]], f, ensure_ascii=False)
+            json.dump(prompt_meta_list, f, ensure_ascii=False)
         with open(target_meta_path, "w", encoding="utf-8") as f:
             json.dump(metadata_list, f, ensure_ascii=False)
 
         args.prompt_metadata_path = prompt_meta_path
         args.target_metadata_path = target_meta_path
 
-        svs_process(args, config, model)
+        # Build an EFFECTIVE config so per-call inference knobs (cfg, n_steps)
+        # can be overridden WITHOUT mutating the global _svs_config singleton.
+        # Upstream `cli.inference.process` reads n_steps/cfg from config.infer
+        # (NOT from args), so we deep-copy the config and override on the copy.
+        # OmegaConf.create(to_yaml(...)) yields a structurally independent copy;
+        # subsequent calls that pass cfg/n_steps=None keep using the defaults
+        # (3 / 32). rescale_cfg is NOT overridden here: SoulXSinger.infer does
+        # not accept it (hardcoded 0.75 in flow_matching.reverse_diffusion).
+        from omegaconf import OmegaConf
+        eff_config = OmegaConf.create(OmegaConf.to_yaml(config))
+        if cfg is not None:
+            eff_config.infer.cfg = cfg
+        if n_steps is not None:
+            eff_config.infer.n_steps = n_steps
+
+        svs_process(args, eff_config, model)
 
         generated_path = os.path.join(args.save_dir, "generated.wav")
         if not os.path.isfile(generated_path):

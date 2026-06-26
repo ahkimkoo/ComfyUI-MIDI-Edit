@@ -3,33 +3,84 @@
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
 
-## [2026-06-25] v3.2.0
+## [2026-06-26] v3.2.0
 
-### Added
+### Fixed
 
-- **SoulX-Singer 集成**：添加 `SoulX-Singer` 作为 git 子模块，支持完整的歌声合成管线
-- **MIDI Transcribe Audio 节点**：AUDIO → MIDI JSON，调用 SoulX-Singer 预处理管线（人声分离→F0提取→VAD→歌词转录→音符转录）
-  - 输入：AUDIO（ComfyUI 音频）
-  - 可选参数：`max_merge_duration`（默认 30000ms）、`language`（Mandarin/English/Cantonese）
-  - 输出：`midi_json`（STRING）
-  - 分类：`MIDI-SoulX`
-- **MIDI Synthesize Audio 节点**：MIDI JSON + 参考音色 AUDIO → 合成歌声 AUDIO
-  - 输入：`midi_json`（STRING）、`prompt_audio`（AUDIO，参考音色）
-  - 可选参数：`control`（score/melody）、`seed`、`auto_shift`、`pitch_shift`
-  - 输出：`audio`（AUDIO）
-  - 分类：`MIDI-SoulX`
-- **核心函数独立模块** `core/soulsx_singer.py`：
-  - `transcribe_audio(audio, sample_rate, language, max_merge_duration)` → MIDI JSON
-  - `synthesize_audio(midi_json, prompt_audio, sample_rate, control, seed, ...)` → (waveform, sample_rate)
-  - 不依赖 ComfyUI，接受文件路径或 numpy 数组，供 HTTP API 服务器复用
-  - `set_models_base(path)` / `get_models_base()` 自定义模型路径
-- **transformers 兼容补丁**：自动适配 transformers >= 4.53（LlamaAttention position_embeddings、LlamaConfig._attn_implementation、3-tuple 返回值）
-- **GPU FP16 加速**：CUDA 可用时自动启用 FP16
+- **`MIDI Synthesize Audio` SVS garbled pronunciation (root cause)**: the prompt
+  metadata was previously taken from the first segment of the *target* MIDI JSON,
+  which mismatches the reference (prompt) audio waveform. The SVS data processor
+  truncates the prompt waveform to a frame count derived from the metadata's
+  duration/f0, so a target-derived prompt produced misaligned/truncated audio and
+  unintelligible singing. Prompt metadata now **always** comes from the reference
+  voice: either from the new optional `prompt_metadata` input (recommended — feed
+  the output of `MIDI Transcribe Audio` run on the prompt audio) or, when left
+  empty, from preprocessing the prompt audio internally.
 
 ### Changed
 
-- `requirements.txt` 合并 SoulX-Singer + preprocess 依赖
-- `pyproject.toml` 依赖列表同步更新
+- **`control` default `score` → `melody`**: aligns with the upstream SoulX-Singer
+  CLI and the reference SVS implementation, which default to the F0 contour.
+- **Inference now defaults to FP32** (previously FP16 on GPU). FP16 weights were a
+  secondary suspect for degraded audio quality. A new `use_fp16` input lets you
+  opt back into autocast mixed precision on CUDA for speed.
+- **`MIDISynthesizeAudio` new optional inputs**:
+  - `prompt_metadata` (STRING) — metadata describing the prompt audio's real
+    acoustic content. Recommended: connect the `midi_json` output of
+    `MIDI Transcribe Audio` run on the *reference* audio here, to avoid
+    re-running preprocessing on every call. When empty, the node preprocesses the
+    prompt audio internally.
+  - `use_fp16` (BOOLEAN, default OFF/FP32) — enable FP16 autocast on GPU.
+
+### Added
+
+- **SoulX-Singer 集成**：以 git 子模块形式集成 SoulX-Singer，支持完整的歌声合成管线（音频转写 + 歌声合成）。
+- **`MIDI Transcribe Audio` 节点**：AUDIO → MIDI JSON，调用 SoulX-Singer 预处理管线（人声分离 → F0 提取 → VAD → 歌词转录 → 音符转录）。
+- **`MIDI Synthesize Audio` 节点**：MIDI JSON + 参考音色 AUDIO → 合成歌声 AUDIO（flow-matching 扩散模型）。
+- **`core/soulsx_singer.py` 独立模块**：`transcribe_audio` / `synthesize_audio` 不依赖 ComfyUI，接受文件路径或 numpy 数组，供 HTTP API 服务器复用；`set_models_base(path)` / `get_models_base()` 自定义模型路径。
+- **transformers 兼容补丁**：自动适配 transformers >= 4.53（LlamaAttention position_embeddings、LlamaConfig._attn_implementation、3-tuple 返回值）。
+- **Internal SVS API** in `core/soulsx_singer.py`:
+  - `_preprocess_audio_to_metadata` — runs the preprocess pipeline and returns the
+    raw metadata list (shared core of `transcribe_audio`); raises `RuntimeError`
+    on an empty result.
+  - `_coerce_prompt_metadata` — coerces a user-supplied prompt_metadata value
+    (None / str MIDI JSON / str raw metadata JSON / list / dict) into a validated
+    metadata list; raises `ValueError` on a non-empty list with non-dict/empty-dict
+    items.
+  - `_resolve_prompt_metadata` — resolves prompt metadata from the provided value,
+    falling back to auto-preprocessing the reference audio.
+- **`MIDISynthesizeAudio` exposes `cfg` and `n_steps`**: two new optional inputs that
+  pass through to SoulX-Singer inference. `cfg` (FLOAT, default 3.0) is the
+  classifier-free guidance scale — raise toward 4-5 in `melody` mode if diction is
+  muddy (stronger adherence to lyrics/phonemes); too high may over-saturate.
+  `n_steps` (INT, default 32) is the flow-matching reverse-diffusion step count —
+  higher slightly improves quality at the cost of speed. `core.synthesize_audio`
+  gains matching `cfg` / `n_steps` keyword args (None = use config defaults 3 / 32);
+  the SVS `config` is deep-copied per call so the global `_svs_config` singleton is
+  never mutated.
+- **`MIDI Extract Lyrics` new `resegment` switch**: when ON, the node ignores the
+  original `<SP>` phrasing and re-segments the lyrics — digits are converted to
+  Chinese number chars, spaces/newlines/punctuation are stripped, consecutive
+  repeated characters are merged, CT-Transformer re-adds punctuation, and the result
+  is emitted as one sentence per line (every punctuation-delimited fragment becomes
+  its own line). Useful for re-flowing lyrics into natural sentence boundaries. When
+  `resegment` is ON, `merge_repeated` has no extra effect (the merge step is already
+  part of the pipeline).
+
+### Docs
+
+- **`control` selection strategy**: node description now documents when to pick
+  each mode — `melody` when the target has a real vocal F0 (e.g. lyrics edited from
+  a vocal) for closer timbre to the prompt; `score` when the target is a score /
+  instrumental without a reliable F0, for clearer diction. `cfg` tuning guidance is
+  also documented.
+
+### Note
+
+- **`rescale_cfg` is intentionally not exposed**: upstream `SoulXSinger.infer` does
+  not accept it (it is hardcoded to 0.75 inside `flow_matching.reverse_diffusion`).
+  Exposing it would require monkey-patching model internals, which violates the
+  reuse principle (the SoulX-Singer submodule is treated as read-only).
 
 ## [2026-06-25] v3.1.0
 
