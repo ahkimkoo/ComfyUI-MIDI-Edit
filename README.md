@@ -1,9 +1,11 @@
 # ComfyUI-MIDI-Edit
 
-[ComfyUI](https://github.com/comfyanonymous/ComfyUI) 自定义节点插件，搭配 [ComfyUI_RH_SoulX-Singer](https://github.com/HM-RunningHub/ComfyUI_RH_SoulX-Singer) 实现魔改歌词——替换 MIDI JSON 中的歌词文本并自动生成拼音/音素，也可从 MIDI JSON 中提取歌词。适用于 MIDI 歌曲生成工作流，支持中文、英文及中英混合歌词。
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI) 自定义节点插件，搭配 [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) 实现完整的 MIDI 歌曲生成工作流：音频转录、歌词编辑、歌声合成。支持中文、英文及中英混合歌词。
 
-提供四个节点：
+提供六个节点：
 
+- **MIDI Transcribe Audio** — 音频转 MIDI JSON（人声分离→歌词/音符转录）
+- **MIDI Synthesize Audio** — MIDI JSON + 参考音色合成歌声
 - **MIDI Edit Lyrics** — 替换歌词并自动生成音素
 - **MIDI Lyrics Alignment** — 顺序映射 + 贪心压缩 + CT-Transformer 智能断句的对齐算法
 - **MIDI Extract Lyrics** — 提取歌词文本（去空格，`<SP>` 转换行）
@@ -49,34 +51,116 @@
 
 - ComfyUI
 - Python conda 环境 `comfyui`
-- `g2pM>=0.1.2.5`
-- `g2p_en>=2.1.0`
-- `modelscope`（CT-Transformer 模型下载）
-- `onnxruntime>=1.17.0`（CT-Transformer 推理）
-- NLTK 数据（插件首次运行自动下载到本地 `models/nltk/`）
-- CT-Transformer 标点恢复模型（首次使用智能拆句时自动下载到 ComfyUI `models/ct-transformer-punc/`，~270MB）
+- SoulX-Singer 子模块（自动拉取）
+- `g2pM>=0.1.2.5`、`g2p_en>=2.1.0`
+- `modelscope`、`onnxruntime>=1.17.0`（CT-Transformer）
+- `torch>=2.2.0`、`torchaudio>=2.2.0`、`transformers>=4.41.2`
+- `funasr>=1.3.0`、`librosa>=0.11.0`、`soundfile>=0.13.1`
+- NLTK 数据（自动下载到 `models/nltk/`）
+- CT-Transformer 标点恢复模型（自动下载到 `models/ct-transformer-punc/`，~270MB）
+
+### 模型下载
+
+SoulX-Singer 需要预训练模型，下载到 ComfyUI 的 `models/` 目录：
+
+```bash
+# SVS 模型
+hf download Soul-AILab/SoulX-Singer --local-dir models/Soul-AILab/SoulX-Singer
+
+# 预处理模型（人声分离、F0、ASR、音符转录）
+hf download Soul-AILab/SoulX-Singer-Preprocess --local-dir models/Soul-AILab/SoulX-Singer-Preprocess
+```
+
+目录结构：
+
+```
+ComfyUI/models/
+└── Soul-AILab/
+    ├── SoulX-Singer/
+    │   └── model.pt
+    └── SoulX-Singer-Preprocess/
+        ├── mel-band-roformer-karaoke/
+        ├── dereverb_mel_band_roformer/
+        ├── rmvpe/
+        ├── speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch/
+        ├── parakeet-tdt-0.6b-v2/
+        └── rosvot/
+```
 
 ### 安装步骤
 
 ```bash
-# 1. 克隆到 ComfyUI custom_nodes 目录
+# 1. 克隆到 ComfyUI custom_nodes 目录（含子模块）
 cd ~/App/ComfyUI/custom_nodes
-ln -s /path/to/ComfyUI-MIDI-Edit ComfyUI-MIDI-Edit
+git clone --recurse-submodules https://github.com/ahkimkoo/ComfyUI-MIDI-Edit.git
 
 # 2. 安装 Python 依赖
 conda activate comfyui
-pip install g2pM g2p_en modelscope onnxruntime
+cd ComfyUI-MIDI-Edit
+pip install -r requirements.txt
 
 # 3. 重启 ComfyUI
 ```
 
-NLTK 数据会自动下载到项目内的 `models/nltk/` 目录，无需手动操作。
-
-CT-Transformer 标点恢复模型会在首次需要智能拆句时自动从 ModelScope 下载到 ComfyUI 的 `models/ct-transformer-punc/` 目录（~270MB），无需手动操作。
-
 ---
 
 ## 节点说明
+
+### MIDI Transcribe Audio
+
+将音频转录为 MIDI JSON，调用 SoulX-Singer 完整预处理管线。
+
+**输入：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `audio` | AUDIO | 输入音频（ComfyUI AUDIO 类型） |
+| `max_merge_duration` | INT | 最大片段合并时长（默认 30000ms） |
+| `language` | COMBO | 歌词语种：Mandarin / English / Cantonese（默认 Mandarin） |
+
+**输出：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `midi_json` | STRING | 转录生成的 MIDI JSON 字符串 |
+
+**处理逻辑：**
+
+1. 人声分离（mel-band-roformer-karaoke）+ 去混响
+2. F0 提取（RMVPE）
+3. 语音活动检测（VAD）
+4. 歌词转录（Paraformer 中文 / Parakeet 英文）
+5. 音符转录（ROSVOT）
+6. 按 `max_merge_duration` 合并短片段，输出 MIDI JSON
+
+**分类：** `MIDI-SoulX`
+
+---
+
+### MIDI Synthesize Audio
+
+从 MIDI JSON 和参考音色合成歌声，调用 SoulX-Singer SVS 推理。
+
+**输入：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `midi_json` | STRING, multiline | MIDI JSON 字符串（目标歌词/音符） |
+| `prompt_audio` | AUDIO | 参考音色音频 |
+| `control` | COMBO | 控制模式：score（乐谱）/ melody（旋律 F0），默认 score |
+| `seed` | INT | 随机种子（默认 12306） |
+| `auto_shift` | BOOLEAN | 自动变调（默认 ON） |
+| `pitch_shift` | INT | 手动变调半音数（-36~36，默认 0） |
+
+**输出：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `audio` | AUDIO | 合成的歌声音频 |
+
+**分类：** `MIDI-SoulX`
+
+---
 
 ### MIDI Edit Lyrics
 
@@ -344,6 +428,38 @@ curl -s http://127.0.0.1:8188/prompt \
 
 ---
 
+## 核心函数独立使用（HTTP API）
+
+`core/` 下的所有模块不依赖 ComfyUI，可直接用于 HTTP API 服务器：
+
+```python
+from core.soulsx_singer import transcribe_audio, synthesize_audio, set_models_base
+
+# 可选：自定义模型路径（默认自动从 ComfyUI models/ 或本地 models/ 查找）
+set_models_base("/path/to/models")
+
+# 音频转 MIDI JSON
+midi_json = transcribe_audio("/path/to/audio.wav", language="Mandarin")
+
+# MIDI JSON + 参考音色合成歌声
+waveform, sample_rate = synthesize_audio(
+    midi_json,
+    "/path/to/prompt.wav",  # 也接受 (numpy_array, sample_rate) 元组
+    control="score",
+    seed=12306,
+)
+```
+
+其他核心模块：
+
+```python
+from core.edit_algorithm import replace_lyrics, extract_lyrics
+from core.align_algorithm import align_track
+from core.g2p import char_to_phoneme, word_to_phoneme
+```
+
+---
+
 ## 注意事项
 
 - `g2pM` 首次使用时会自动下载模型（与 NLTK 数据分开）
@@ -359,15 +475,17 @@ curl -s http://127.0.0.1:8188/prompt \
 ```
 ComfyUI-MIDI-Edit/
 ├── __init__.py          # ComfyUI 插件入口，导出节点映射
-├── nodes.py             # ComfyUI 节点定义（MIDIEditLyrics / MidiLyricsAlignment 等）+ 历史 API 再导出
-├── core/                # 核心算法包（模块化）
+├── nodes.py             # ComfyUI 节点定义（6 个节点）+ 历史 API 再导出
+├── core/                # 核心算法包（独立函数，不依赖 ComfyUI）
 │   ├── g2p.py           # G2P：char_to_phoneme / word_to_phoneme / normalize_digits
 │   ├── ct_transformer.py # CT-Transformer 标点恢复模型（智能断句）
 │   ├── midi_format.py   # Token / Track 数据结构 + JSON parse/serialize（FPS=50）
 │   ├── text_utils.py    # clean_lyrics / split_lyrics_to_sentences / is_reduplication
 │   ├── speed.py         # 变速：duration 缩放 + f0 插值重采样
 │   ├── edit_algorithm.py # MIDIEditLyrics 实现：replace_lyrics / extract_lyrics 等
-│   └── align_algorithm.py # MidiLyricsAlignment v3：align_track / segment_sentences / calculate_spd
+│   ├── align_algorithm.py # MidiLyricsAlignment v3：align_track / segment_sentences / calculate_spd
+│   └── soulsx_singer.py # SoulX-Singer 集成：transcribe_audio / synthesize_audio（HTTP API 可用）
+├── SoulX-Singer/        # SoulX-Singer 子模块（严禁修改内部代码）
 ├── requirements.txt     # Python 依赖
 ├── pyproject.toml       # Comfy Registry 发布配置
 ├── CHANGELOG.md         # 更新日志

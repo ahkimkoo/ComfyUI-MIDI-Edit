@@ -3,6 +3,34 @@
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
 
+## [2026-06-25] v3.2.0
+
+### Added
+
+- **SoulX-Singer 集成**：添加 `SoulX-Singer` 作为 git 子模块，支持完整的歌声合成管线
+- **MIDI Transcribe Audio 节点**：AUDIO → MIDI JSON，调用 SoulX-Singer 预处理管线（人声分离→F0提取→VAD→歌词转录→音符转录）
+  - 输入：AUDIO（ComfyUI 音频）
+  - 可选参数：`max_merge_duration`（默认 30000ms）、`language`（Mandarin/English/Cantonese）
+  - 输出：`midi_json`（STRING）
+  - 分类：`MIDI-SoulX`
+- **MIDI Synthesize Audio 节点**：MIDI JSON + 参考音色 AUDIO → 合成歌声 AUDIO
+  - 输入：`midi_json`（STRING）、`prompt_audio`（AUDIO，参考音色）
+  - 可选参数：`control`（score/melody）、`seed`、`auto_shift`、`pitch_shift`
+  - 输出：`audio`（AUDIO）
+  - 分类：`MIDI-SoulX`
+- **核心函数独立模块** `core/soulsx_singer.py`：
+  - `transcribe_audio(audio, sample_rate, language, max_merge_duration)` → MIDI JSON
+  - `synthesize_audio(midi_json, prompt_audio, sample_rate, control, seed, ...)` → (waveform, sample_rate)
+  - 不依赖 ComfyUI，接受文件路径或 numpy 数组，供 HTTP API 服务器复用
+  - `set_models_base(path)` / `get_models_base()` 自定义模型路径
+- **transformers 兼容补丁**：自动适配 transformers >= 4.53（LlamaAttention position_embeddings、LlamaConfig._attn_implementation、3-tuple 返回值）
+- **GPU FP16 加速**：CUDA 可用时自动启用 FP16
+
+### Changed
+
+- `requirements.txt` 合并 SoulX-Singer + preprocess 依赖
+- `pyproject.toml` 依赖列表同步更新
+
 ## [2026-06-25] v3.1.0
 
 ### Changed
