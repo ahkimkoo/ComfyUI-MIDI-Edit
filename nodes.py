@@ -423,15 +423,14 @@ class MIDISynthesizeAudio:
             )
             import torch
             waveform = torch.from_numpy(wav).float()
-            # ComfyUI AUDIO expects (channels, samples) with channels <= 2
-            if waveform.dim() == 1:
-                waveform = waveform.unsqueeze(0)  # (samples,) -> (1, samples)
-            elif waveform.dim() == 2:
-                if waveform.shape[0] > 2:
-                    # (samples, channels) -> (channels, samples)
-                    waveform = waveform.T
-                # else already (channels, samples)
-            return ({"waveform": waveform.contiguous(), "sample_rate": out_sr},)
+            # ComfyUI AUDIO expects (channels, samples) shape, channels <= 2
+            while waveform.dim() < 2:
+                waveform = waveform.unsqueeze(0)
+            if waveform.shape[0] > 2 and waveform.shape[1] <= 2:
+                waveform = waveform.T
+            waveform = waveform.contiguous()
+            print(f"[MIDI-Edit] Synthesize output: waveform shape={waveform.shape}, sr={out_sr}")
+            return ({"waveform": waveform, "sample_rate": out_sr},)
         except Exception as e:
             raise ValueError(f"Audio synthesis error: {e}") from e
 

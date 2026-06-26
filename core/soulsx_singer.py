@@ -418,9 +418,12 @@ def _load_wav_result(wav_path: str) -> tuple[np.ndarray, int]:
     """Load a wav file and return (waveform, sample_rate).
 
     waveform shape: (samples,) for mono, (samples, channels) for multi-channel.
+    Always returns at least 1D array.
     """
     import soundfile as sf
     audio_np, sr = sf.read(wav_path, dtype="float32")
+    if audio_np.ndim == 0:
+        audio_np = audio_np.reshape(1)
     return audio_np, sr
 
 
