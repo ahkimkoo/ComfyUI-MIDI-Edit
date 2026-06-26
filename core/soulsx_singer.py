@@ -210,35 +210,6 @@ def _patch_transformers_compat():
         if isinstance(result, tuple) and len(result) == 2:
             return (result[0], result[1], None)
         return result
-                sig = inspect.signature(LlamaRotaryEmbedding.__init__)
-                params = set(sig.parameters.keys()) - {"self"}
-                kwargs = {}
-                if "head_dim" in params:
-                    kwargs["head_dim"] = head_dim
-                if "max_position_embeddings" in params:
-                    kwargs["max_position_embeddings"] = getattr(self.config, "max_position_embeddings", 4096)
-                if "base" in params:
-                    kwargs["base"] = getattr(self.config, "rope_theta", 10000.0)
-                if "config" in params and not kwargs:
-                    kwargs["config"] = self.config
-                rotary = LlamaRotaryEmbedding(**kwargs)
-                rotary = rotary.to(hidden_states.device, dtype=hidden_states.dtype)
-                self.rotary_emb = rotary
-            if position_ids is None:
-                position_ids = torch.arange(
-                    hidden_states.shape[1], device=hidden_states.device
-                ).unsqueeze(0)
-            position_embeddings = rotary(hidden_states, position_ids)
-        return _orig_attn_forward(
-            self,
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
 
     LlamaAttention.forward = _patched_attn_forward
 
