@@ -57,9 +57,33 @@ _NLTK_PACKAGES = [
 ]
 
 
-def _ensure_nltk_data():
-    """Download required NLTK data to the local models/nltk directory if missing."""
+def ensure_nltk_data():
+    """Ensure NLTK data path is registered and required packages are downloaded.
+
+    ComfyUI-MIDI-Edit stores NLTK data under ``ComfyUI/models/nltk``
+    (``_NLTK_DATA_DIR``). This canonical entry point performs two steps:
+
+    1. Inserts ``_NLTK_DATA_DIR`` at the front of ``nltk.data.path``. This is
+       required when ``nltk`` was imported *before* this module's ``NLTK_DATA``
+       env-var ``setdefault`` executed — in that case the env var no longer
+       affects ``nltk.data.path``, so ``nltk.data.find`` / models (e.g.
+       ``nltk.pos_tag`` used by ``g2p_en``) cannot discover the directory. This
+       is exactly what breaks the SoulX-Singer transcription path: the preprocess
+       chain imports ``g2p_en`` (which pulls in nltk) independently of
+       :func:`_get_g2p_en`, so by the time we reach the tagger the env var has
+       had no effect.
+    2. Downloads any of :data:`_NLTK_PACKAGES` still missing into
+       ``_NLTK_DATA_DIR``.
+
+    Safe to call multiple times (idempotent). Single source of truth shared by
+    the MIDIEdit lyrics nodes (via :func:`_get_g2p_en`) and the SoulX-Singer
+    preprocess pipeline
+    (:func:`core.soulsx_singer._get_preprocess_pipeline`).
+    """
     import nltk
+
+    if _NLTK_DATA_DIR not in nltk.data.path:
+        nltk.data.path.insert(0, _NLTK_DATA_DIR)
 
     for pkg in _NLTK_PACKAGES:
         try:
@@ -67,6 +91,11 @@ def _ensure_nltk_data():
         except LookupError:
             print(f"[MIDI-Edit] Downloading NLTK data: {pkg}")
             nltk.download(pkg, download_dir=_NLTK_DATA_DIR, quiet=True)
+
+
+def _ensure_nltk_data():
+    """Backward-compatible alias for :func:`ensure_nltk_data`."""
+    ensure_nltk_data()
 
 
 def _get_g2p_zh():
@@ -87,7 +116,7 @@ def _get_g2p_en():
         # Lazy import: g2p_en pulls in nltk + model data on construction.
         from g2p_en import G2p as G2pE
 
-        _ensure_nltk_data()
+        ensure_nltk_data()
         _g2p_en = G2pE()
     return _g2p_en
 

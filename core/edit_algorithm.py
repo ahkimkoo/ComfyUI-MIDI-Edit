@@ -926,11 +926,11 @@ def replace_lyrics(midi_json_str: str, new_lyrics: str,
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-def extract_lyrics(midi_json_str: str, merge_repeated: bool = False) -> str:
-    """Extract and concatenate lyrics text from MIDI JSON.
+def _concat_track_text(midi_json_str: str) -> str:
+    """Concatenate the ``text`` field of every track in the MIDI JSON.
 
-    Iterates all tracks, collects the ``text`` field, strips spaces,
-    and replaces ``<SP>`` markers with newlines.
+    Shared helper for :func:`extract_lyrics`. Returns ``""`` on invalid input
+    (bad JSON, non-list payload) or when no track carries text.
     """
     try:
         midi_data = json.loads(midi_json_str)
@@ -940,17 +940,67 @@ def extract_lyrics(midi_json_str: str, merge_repeated: bool = False) -> str:
     if not isinstance(midi_data, list):
         return ""
 
-    # Concatenate text from every track that has one
     all_text = ""
     for track in midi_data:
         text = track.get("text") if isinstance(track, dict) else None
         if text:
             all_text += text
+    return all_text
 
+
+def extract_lyrics(
+    midi_json_str: str,
+    merge_repeated: bool = False,
+    resegment: bool = False,
+) -> str:
+    """Extract lyrics text from MIDI JSON.
+
+    Default behaviour (*resegment* = False): iterate every track, collect the
+    ``text`` field, strip spaces and convert ``<SP>`` markers to newlines.
+    When *merge_repeated* is True, consecutive duplicate characters are
+    collapsed into one.
+
+    Re-segment pipeline (*resegment* = True): ignore the original ``<SP>``
+    phrasing and rebuild natural sentence boundaries. "One sentence per line"
+    here means *one punctuation-delimited fragment per line* (every comma /
+    period / question-mark etc. starts a new line):
+
+    1. Concatenate text from all tracks (via :func:`_concat_track_text`).
+    2. Normalise Arabic digits to Chinese number chars, drop ``<SP>`` markers,
+       then keep only Chinese chars + ASCII letters (every space, newline and
+       punctuation is removed).
+    3. Merge consecutive repeated characters (:func:`merge_repeated_chars`).
+    4. Run CT-Transformer (:func:`restore_punctuation`) to add punctuation
+       back. The model handles arbitrarily long text internally via
+       mini-sentence splitting + a cache, so the whole song can be fed in one
+       call.
+    5. Split by punctuation (:func:`split_lyrics_to_sentences`) into fragments
+       and emit one fragment per line.
+
+    Note: when *resegment* is True the merge step is already part of the
+    pipeline (step 3), so *merge_repeated* has no additional effect — it is
+    intentionally covered to avoid double processing.
+    """
+    all_text = _concat_track_text(midi_json_str)
     if not all_text:
         return ""
 
-    # Remove all plain spaces, then convert <SP> → newline
+    if resegment:
+        # 2. Normalise digits, drop <SP>, keep only CJK + ASCII letters.
+        cleaned = normalize_digits(all_text)
+        cleaned = cleaned.replace("<SP>", "")
+        cleaned = re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", cleaned)
+        if not cleaned:
+            return ""
+        # 3. Merge consecutive repeated characters.
+        cleaned = merge_repeated_chars(cleaned)
+        # 4. CT-Transformer adds punctuation back (，。？…).
+        punctuated = restore_punctuation(cleaned)
+        # 5-6. Split by every punctuation mark and emit one fragment per line.
+        sentences = split_lyrics_to_sentences(punctuated)
+        return "\n".join(sentences)
+
+    # Original behaviour: strip spaces, then <SP> → newline.
     all_text = all_text.replace(" ", "")
     all_text = all_text.replace("<SP>", "\n")
 
