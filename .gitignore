@@ -1,5 +1,7 @@
 # Models (downloaded on first use, not bundled)
-models/
+models/*
+# ...but keep the reduplication wordlist (user-maintained)
+!models/reduplication-verbs.txt
 
 # Publish artifacts
 node.zip

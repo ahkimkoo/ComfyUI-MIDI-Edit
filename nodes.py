@@ -365,11 +365,14 @@ class MIDITranscribeAudio:
             "optional": {
                 "max_merge_duration": ("INT", {"default": 30000, "min": 1000, "max": 120000, "step": 1000}),
                 "language": (["Mandarin", "English", "Cantonese"], {"default": "Mandarin"}),
+                "reference_lyrics": ("STRING", {"multiline": True, "dynamicPrompts": False, "default": ""}),
+                "merge_held_notes": ("BOOLEAN", {"default": True, "label_on": "ON", "label_off": "OFF"}),
+                "merge_repeated_chars": ("BOOLEAN", {"default": True, "label_on": "ON", "label_off": "OFF"}),
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("midi_json",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("midi_json", "lyrics_text")
     FUNCTION = "transcribe"
     CATEGORY = "MIDI-SoulX"
     DESCRIPTION = (
@@ -377,17 +380,50 @@ class MIDITranscribeAudio:
         "Runs full preprocessing: vocal separation, F0 extraction, VAD, "
         "lyrics transcription, and note transcription. "
         "Output MIDI JSON can be edited with MIDI Edit Lyrics / MIDI Lyrics Alignment, "
-        "then fed into MIDI Synthesize Audio for singing voice synthesis."
+        "then fed into MIDI Synthesize Audio for singing voice synthesis.\n\n"
+        "Reference Lyrics (optional): when provided, ASR is biased toward the "
+        "reference text via Paraformer `hotword` decoding, then post-aligned "
+        "with char-level DTW to guarantee 100% text accuracy. Pitch, duration, "
+        "f0, SP placement, and ROSVOT's melisma (one-char-many-notes) detection "
+        "are still driven by the audio — only the *text identity* of each token "
+        "changes. Punctuation/whitespace in the reference are stripped before "
+        "use; they only serve as semantic hints for the user's own reading, not "
+        "for SP insertion. Recommended when the audio's lyrics are known: "
+        "eliminates ASR phonetic confusions (e.g. 长→潮, 几→记) without "
+        "altering musical content. Currently only the Mandarin/Cantonese path "
+        "uses the reference (English ASR falls back to default decoding).\n\n"
+        "Merge Held Notes (default ON): when a singer sustains one syllable "
+        "across multiple notes, ROSVOT may incorrectly insert a pause (<SP>) "
+        "in the middle. This option merges those pauses so the held note is "
+        "continuous. Turn OFF to keep ROSVOT's original output.\n\n"
+        "Merge Repeated Chars (default ON): merges consecutive identical "
+        "characters that are NOT valid reduplication words (per "
+        "models/reduplication-verbs.txt). For example, 沧沧 (from a held "
+        "note) is merged to 沧, but 哥哥 (a real word) is kept. Duration "
+        "is combined; the first note's pitch is kept. Turn OFF to keep all "
+        "repeated characters.\n\n"
+        "lyrics_text output: the *pre-ROSVOT* lyrics (one char per syllable, "
+        "no melisma duplications) with `<SP>` tokens replaced by newlines."
     )
 
-    def transcribe(self, audio, max_merge_duration=30000, language="Mandarin"):
+    def transcribe(self, audio, max_merge_duration=30000, language="Mandarin",
+                   reference_lyrics=None, merge_held_notes=True,
+                   merge_repeated_chars=True):
         from core.soulsx_singer import transcribe_audio
         arr, sr = _comfyui_audio_to_numpy(audio)
+        # Empty string / whitespace → None (no bias, use default ASR).
+        if isinstance(reference_lyrics, str) and not reference_lyrics.strip():
+            reference_lyrics = None
         try:
-            result = transcribe_audio(
-                (arr, sr), language=language, max_merge_duration=max_merge_duration,
+            midi_json, lyrics_text = transcribe_audio(
+                (arr, sr), language=language,
+                max_merge_duration=max_merge_duration,
+                reference_lyrics=reference_lyrics,
+                return_lyrics=True,
+                merge_held_notes=merge_held_notes,
+                merge_repeated_chars=merge_repeated_chars,
             )
-            return (result,)
+            return (midi_json, lyrics_text)
         except Exception as e:
             raise ValueError(f"Audio transcription error: {e}") from e
 

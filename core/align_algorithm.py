@@ -223,9 +223,26 @@ def align_track(track, lyrics_text: str, weights, normalize_digits_flag: bool,
     C = len(char_units)
     N = num_new_sp + C
 
+    # ---- 3.5 构建原曲 section-aware slots (识别连续重复字) ----
+    # 不跨 SP 边界合并：原曲 "甲甲 <SP> 甲甲" 应为 2 个 slot，而非 1 个 count=4。
+    slots = _build_section_aware_slots(orig_tokens)
+    S = len(slots)
+    # Collapse 模式：新字数 <= 原曲 slot 数。每个新字映射到一个 slot，slot 内
+    # 多 token 时复制（如原 "女女" slot 接收新字 "男" → 输出 "男男"）。
+    # 仅在 C < nonsl 时启用（C >= nonsl 时每个原 token 都会有字，无复制需要）。
+    nonsl_count_pre = len(orig_nonsl_tokens)
+    use_collapse_mode = (C <= S) and (C < nonsl_count_pre) and (C > 0)
+
     # ---- 4. SPD ----
     orig_sp_durations = [t.duration for t in orig_sp_tokens]
-    spd = calculate_spd(orig_sp_durations, M, N)
+    if use_collapse_mode:
+        # Collapse 模式下输出非 SP token 数 = 用到的 slot 的 token 总数
+        # (一个新字可能展开成多个 token，故 N_effective > N)
+        output_nonsl = sum(len(slots[i][2]) for i in range(min(C, S)))
+        N_effective = num_new_sp + output_nonsl
+    else:
+        N_effective = N
+    spd = calculate_spd(orig_sp_durations, M, N_effective)
 
     # ---- 5. 切分原 f0(含原 SP 段) ----
     f0_vals = _parse_f0(track.f0)
@@ -234,40 +251,58 @@ def align_track(track, lyrics_text: str, weights, normalize_digits_flag: bool,
     nonsl_segments = [
         all_segments[i] for i, t in enumerate(orig_tokens) if not t.is_sp
     ]
-    nonsl_count = len(orig_nonsl_tokens)
+    nonsl_count = nonsl_count_pre
 
-    # ---- 6. 计算贪心压缩方案 pack[token_idx] = 该 token 承载的字数 ----
-    pack = _compute_pack(char_units, orig_nonsl_tokens)
-    # char_assignment[char_idx] = (token_idx, pos_within_token)
-    char_assignment: list[tuple[int, int]] = []
-    for tok_idx, cnt in enumerate(pack):
-        for pos in range(cnt):
-            char_assignment.append((tok_idx, pos))
-    # 兜底：若 pack 总和 < C(异常)，把剩余字挂到最后一个 token。
-    if len(char_assignment) < C and nonsl_count > 0:
-        last = nonsl_count - 1
-        while len(char_assignment) < C:
-            char_assignment.append((last, pack[last]))
-            pack[last] += 1
-
-    # ---- 7. 每组 SPLIT 的 duration(含 0.1 下限保障) ----
+    # ---- 6. 决定 char → token 映射 ----
+    # char_to_token_indices[char_idx] = 该字映射到的原 non-SP token 索引列表
+    # - Collapse 模式：1 字 → slot 内全部 token (复制)
+    # - Distribute/Expand 模式：1 字 → 1 token (可能 SPLIT)
+    char_to_token_indices: dict[int, list[int]] = {}
+    # pack 仍用于 distribute/expand 模式的 duration 切分计算
+    pack: list[int] = []
     group_durations: dict[int, list[float]] = {}
-    min_unresolved = False
-    for tok_idx, cnt in enumerate(pack):
-        if cnt <= 0:
-            continue
-        src = orig_nonsl_tokens[tok_idx]
-        per = [src.duration / cnt] * cnt
-        per = _enforce_min_split(per)
-        if any(v < MIN_SPLIT_DUR - 1e-9 for v in per):
-            min_unresolved = True
-        group_durations[tok_idx] = per
 
-    # 高压缩告警
-    if nonsl_count > 0 and C > nonsl_count and (C - nonsl_count) > 0.4 * nonsl_count:
-        warnings.append("HIGH_SPLIT_RATIO(chars=%d,slots=%d)" % (C, nonsl_count))
-    if min_unresolved:
-        warnings.append("MIN_DURATION_UNRESOLVED")
+    if use_collapse_mode:
+        # Collapse 模式：左对齐，char_idx → slots[char_idx] 的全部 token
+        # 末尾 S-C 个 slot 被丢弃（它们的 duration 不进入输出）
+        for char_idx in range(C):
+            if char_idx < S:
+                char_to_token_indices[char_idx] = list(slots[char_idx][2])
+    else:
+        # Distribute/Expand 模式：原贪心压缩
+        pack = _compute_pack(char_units, orig_nonsl_tokens)
+        char_assignment: list[tuple[int, int]] = []
+        for tok_idx, cnt in enumerate(pack):
+            for pos in range(cnt):
+                char_assignment.append((tok_idx, pos))
+        # 兜底：若 pack 总和 < C(异常)，把剩余字挂到最后一个 token。
+        if len(char_assignment) < C and nonsl_count > 0:
+            last = nonsl_count - 1
+            while len(char_assignment) < C:
+                char_assignment.append((last, pack[last]))
+                pack[last] += 1
+
+        # 反向构建 char_to_token_indices
+        for char_idx, (tok_idx, _pos) in enumerate(char_assignment):
+            char_to_token_indices.setdefault(char_idx, []).append(tok_idx)
+
+        # ---- 7. 每组 SPLIT 的 duration(含 0.1 下限保障) ----
+        min_unresolved = False
+        for tok_idx, cnt in enumerate(pack):
+            if cnt <= 0:
+                continue
+            src = orig_nonsl_tokens[tok_idx]
+            per = [src.duration / cnt] * cnt
+            per = _enforce_min_split(per)
+            if any(v < MIN_SPLIT_DUR - 1e-9 for v in per):
+                min_unresolved = True
+            group_durations[tok_idx] = per
+
+        # 高压缩告警
+        if nonsl_count > 0 and C > nonsl_count and (C - nonsl_count) > 0.4 * nonsl_count:
+            warnings.append("HIGH_SPLIT_RATIO(chars=%d,slots=%d)" % (C, nonsl_count))
+        if min_unresolved:
+            warnings.append("MIN_DURATION_UNRESOLVED")
 
     # ---- 8. 构建新 token + f0 ----
     new_tokens: list[Token] = []
@@ -284,23 +319,30 @@ def align_track(track, lyrics_text: str, weights, normalize_digits_flag: bool,
             new_f0.extend([0.0] * max(0, round(spd * FPS)))
         else:
             cu = char_units[char_ptr]
-            tok_idx, pos = char_assignment[char_ptr]
-            src = orig_nonsl_tokens[tok_idx]
-            durs = group_durations.get(tok_idx, [src.duration])
-            dur = durs[pos] if pos < len(durs) else src.duration
-            seg = nonsl_segments[tok_idx] if tok_idx < len(nonsl_segments) else []
-            cnt = pack[tok_idx]
-            if cnt <= 1:
-                char_f0 = list(seg)
-            else:
-                char_f0 = _slice_segment(seg, cnt, pos)
-            nt = _note_type(cu, prev_non_sp_text)
-            new_tokens.append(Token(
-                text=cu["text"], phoneme=cu["phoneme"], duration=dur,
-                note_pitch=src.note_pitch, note_type=nt, index=len(new_tokens),
-            ))
-            new_f0.extend(char_f0)
-            prev_non_sp_text = cu["text"]
+            token_indices = char_to_token_indices.get(char_ptr, [])
+            for pos_in_slot, tok_idx in enumerate(token_indices):
+                src = orig_nonsl_tokens[tok_idx]
+                seg = nonsl_segments[tok_idx] if tok_idx < len(nonsl_segments) else []
+                if use_collapse_mode:
+                    # Collapse 模式：每个 token 保留自己的完整 duration / f0 段
+                    dur = src.duration
+                    char_f0 = list(seg)
+                else:
+                    # Distribute/Expand 模式：可能 SPLIT (一个 token 切多字)
+                    durs = group_durations.get(tok_idx, [src.duration])
+                    dur = durs[pos_in_slot] if pos_in_slot < len(durs) else src.duration
+                    cnt = pack[tok_idx] if tok_idx < len(pack) else 1
+                    if cnt <= 1:
+                        char_f0 = list(seg)
+                    else:
+                        char_f0 = _slice_segment(seg, cnt, pos_in_slot)
+                nt = _note_type(cu, prev_non_sp_text)
+                new_tokens.append(Token(
+                    text=cu["text"], phoneme=cu["phoneme"], duration=dur,
+                    note_pitch=src.note_pitch, note_type=nt, index=len(new_tokens),
+                ))
+                new_f0.extend(char_f0)
+                prev_non_sp_text = cu["text"]
             char_ptr += 1
 
     # ---- 9. force_tone4 后处理 ----
@@ -442,6 +484,55 @@ def _compute_pack(char_units: list[dict],
             remaining -= reduce
 
     return pack
+
+
+def _build_section_aware_slots(orig_tokens) -> list[tuple[str, int, list[int]]]:
+    """把原曲非 SP token 按连续相同字合并成 slot，但不跨 SP 边界合并。
+
+    返回 ``[(char, count, [nonsl_token_indices])]``，其中索引是相对于
+    *扁平化* 的非 SP token 列表（即 ``orig_nonsl_tokens``）。
+
+    例：原曲 ``"<SP> 甲 甲 <SP> 甲 甲 <SP>"`` 的非 SP 列表是
+    ``[甲, 甲, 甲, 甲]``，但因为中间有 SP 隔断，应产生 2 个独立 slot：
+    ``[(甲, 2, [0, 1]), (甲, 2, [2, 3])]``，而不是 1 个 ``count=4`` 的 slot。
+
+    这是因为歌手在原曲不同 section 唱同一个字是独立的音乐事件（如两段
+    副歌的开头），不应被当作一个长音复制给新字。
+    """
+    slots: list[tuple[str, int, list[int]]] = []
+    nonsl_idx = 0
+    # 当前 section 内的连续 (char, nonsl_idx) 序列
+    run: list[tuple[str, int]] = []
+
+    for t in orig_tokens:
+        if t.is_sp:
+            if run:
+                slots.extend(_collapse_consecutive(run))
+                run = []
+        else:
+            run.append((t.text, nonsl_idx))
+            nonsl_idx += 1
+    if run:
+        slots.extend(_collapse_consecutive(run))
+    return slots
+
+
+def _collapse_consecutive(run: list[tuple[str, int]]) -> list[tuple[str, int, list[int]]]:
+    """把连续相同 (char, idx) 序列合并成 slot 列表。"""
+    if not run:
+        return []
+    slots: list[tuple[str, int, list[int]]] = []
+    cur_char = run[0][0]
+    cur_indices: list[int] = [run[0][1]]
+    for i in range(1, len(run)):
+        if run[i][0] == cur_char:
+            cur_indices.append(run[i][1])
+        else:
+            slots.append((cur_char, len(cur_indices), cur_indices))
+            cur_char = run[i][0]
+            cur_indices = [run[i][1]]
+    slots.append((cur_char, len(cur_indices), cur_indices))
+    return slots
 
 
 def _parse_f0(f0_str: str) -> list[float]:

@@ -271,6 +271,76 @@ class TestAlign:
         assert all(t.note_type == 2 for t in char_tokens)
         assert all(t.text == "哥" for t in char_tokens)
 
+    def test_collapse_replicates_new_char_on_repeat_slot(self):
+        """新字数 < 原非 SP token 数 + 原曲有重复字 slot 时，新字复制到 slot 内每个 token。
+
+        这是与 MIDIEditLyrics 一致的 collapse 行为：
+        原"好看的女女人"(6 token, 5 slot) + 新"强壮的男人"(5 char)
+        → 输出"强壮的男男人"(6 token, 男 复制到 女×2 slot)。
+        """
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("好", 60, 2, 0.4), ("看", 62, 2, 0.4),
+             ("的", 64, 2, 0.4), ("女", 65, 2, 0.4), ("女", 67, 2, 0.4),
+             ("人", 69, 2, 0.4), ("<SP>", 0, 1, 0.3)],
+        )
+        new_track, _ = align_track(track, "强壮的男人", self.weights, True, False)
+        char_tokens = [t for t in new_track.tokens if not t.is_sp]
+        # 输出 6 token（原 token 结构保留），男男替代女女 slot
+        assert len(char_tokens) == 6
+        assert [t.text for t in char_tokens] == ["强", "壮", "的", "男", "男", "人"]
+        # 每个 token 保留原 token 的 pitch
+        assert [t.note_pitch for t in char_tokens] == [60, 62, 64, 65, 67, 69]
+        # 男男：第二个标 type=3 (非叠词的节奏重复)
+        assert char_tokens[3].note_type == 2
+        assert char_tokens[4].note_type == 3
+        # duration 守恒
+        orig_total = sum(t.duration for t in track.tokens)
+        out_total = sum(t.duration for t in new_track.tokens)
+        assert abs(orig_total - out_total) < 1e-6
+
+    def test_collapse_no_replication_when_new_ge_orig(self):
+        """新字数 >= 原 token 数时，不触发 collapse 复制。"""
+        track = _make_track(
+            [("<SP>", 0, 1, 0.3), ("好", 60, 2, 0.4), ("看", 62, 2, 0.4),
+             ("的", 64, 2, 0.4), ("女", 65, 2, 0.4), ("女", 67, 2, 0.4),
+             ("人", 69, 2, 0.4), ("<SP>", 0, 1, 0.3)],
+        )
+        # 新词 6 char >= 6 token → 不触发复制
+        new_track, _ = align_track(track, "强壮的老男人", self.weights, True, False)
+        char_tokens = [t for t in new_track.tokens if not t.is_sp]
+        assert len(char_tokens) == 6
+        assert [t.text for t in char_tokens] == ["强", "壮", "的", "老", "男", "人"]
+        # 没有 男男 这种复制痕迹
+        assert "男" not in [t.text for t in char_tokens][:-1] or \
+               [t.text for t in char_tokens].count("男") == 1
+
+    def test_collapse_respects_sp_boundary(self):
+        """原曲"甲甲<SP>甲甲"应是 2 个独立 slot，而非 1 个 count=4 的 slot。"""
+        from core.align_algorithm import _build_section_aware_slots
+        from core.midi_format import Token, Track
+        tokens = []
+        for i, t in enumerate("<SP> 甲 甲 <SP> 甲 甲 <SP>".split()):
+            is_sp = (t == "<SP>")
+            tokens.append(Token(
+                text=t, phoneme="<SP>" if is_sp else f"zh_{t}1",
+                duration=0.4, note_pitch=0 if is_sp else 60,
+                note_type=1 if is_sp else 2, index=i,
+            ))
+        track = Track(tokens=tokens, meta={}, f0="0.0 " * 200)
+        slots = _build_section_aware_slots(track.tokens)
+        # 2 个 slot，各 count=2，不是 1 个 count=4
+        assert len(slots) == 2
+        assert slots[0][1] == 2  # 第一个 slot count
+        assert slots[1][1] == 2  # 第二个 slot count
+        assert slots[0][2] == [0, 1]
+        assert slots[1][2] == [2, 3]
+
+        # 应用：新词"乙丙" → 乙乙<SP>丙丙 (但 MidiLyricsAlignment 重建 SP，
+        # 所以实际输出会是 [SP] 乙乙 丙丙 [SP])
+        new_track, _ = align_track(track, "乙丙", self.weights, True, False)
+        char_tokens = [t for t in new_track.tokens if not t.is_sp]
+        assert [t.text for t in char_tokens] == ["乙", "乙", "丙", "丙"]
+
     def test_split_keeps_word_on_longest_token(self):
         """字数 > 非 SP token：duration 按比例分配。"""
         track = _make_track(
@@ -337,16 +407,26 @@ class TestAlign:
         assert [t.text for t in char_tokens] == ["一", "二"]
 
     def test_digit_normalization_disabled(self):
-        """normalize_digits=False：英文词作为整词单元。"""
+        """normalize_digits=False：英文词作为整词单元（不拆成单字母）。
+
+        注意：原曲"啊啊"是连续重复字 → collapse 成 1 个 slot(count=2)，新词"ab"
+        会被复制到 slot 内每个 token（与 MIDIEditLyrics 的 collapse 行为一致）。
+        本测试验证"ab"作为整词不被拆开，复制后的两个 token 都保持"ab"整词。
+        """
         track = _make_track(
             [("<SP>", 0, 1, 0.3), ("啊", 60, 2, 0.4),
              ("啊", 62, 2, 0.4), ("<SP>", 0, 1, 0.3)],
         )
         new_track, _ = align_track(track, "ab", self.weights, False, False)
         char_tokens = [t for t in new_track.tokens if not t.is_sp]
-        # "ab" 是一个英文词单元
-        assert len(char_tokens) == 1
-        assert char_tokens[0].text == "ab"
+        # "ab" 作为一个整词单元，复制到 2 个原 token (slot count=2) 上。
+        # note_type=3 仅对单字重复生效（_note_type 的 len==1 守卫），英文词
+        # 不参与该标记，所以两个 token 的 note_type 都是 2（v3 设计）。
+        assert len(char_tokens) == 2
+        assert all(t.text == "ab" for t in char_tokens)
+        # 每个 token 保留对应原 token 的 pitch (60, 62)
+        assert char_tokens[0].note_pitch == 60
+        assert char_tokens[1].note_pitch == 62
 
     def test_force_tone4_applied(self):
         """force_tone4 把高音中文音素改四声。"""

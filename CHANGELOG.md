@@ -3,6 +3,99 @@
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
 
+## [2026-07-20] v3.3.0
+
+### Added
+
+- **`MIDI Transcribe Audio` 新增 `reference_lyrics` 可选输入**：当用户提供
+  标准歌词时，ASR 解码会被强制对齐到该歌词，**文字识别率达到 100%**，且
+  pitch / duration / f0 / SP 停顿 / ROSVOT 的 melisma 检测（一个字跨多个
+  音符）全部保持由音频驱动的原行为不变——只替换每个 token 的*文字身份*。
+  适用于：转写已知歌词的翻唱/原唱音频、消除 ASR 语音混淆
+  （如 长→潮、几→记、之→知）。
+
+  工作原理（不改 SoulX-Singer 子模块）：
+  1. 第 1 次 ASR（无 hotword）→ 拿到 segment 字数估算
+  2. 按字数比例把参考歌词切到各 segment
+  3. 第 2 次 ASR `hotword=<segment 参考短语>` → 修正大部分语音混淆
+  4. 字符级 DTW 兜底：把 ASR 字符映射到参考字，时间戳完全保留
+  5. ROSVOT 拿对齐后的 `words` / `word_durs` 跑 note 检测，行为不变
+
+  参考歌词里的换行/`，。！？；：` 等标点会被剥离（仅作语义切片提示用），
+  SP 停顿仍由 `vocal_detector` + f0 后处理按音频驱动，与原管线一致。
+
+  当前仅 Mandarin/Cantonese 路径走强制对齐（English 路径回退到默认 ASR）。
+
+  **`core.soulsx_singer.py` 配套 API**：`transcribe_audio(...)` 和
+  `_preprocess_audio_to_metadata(...)` 新增 `reference_lyrics: str | None`
+  关键字参数，便于 HTTP API 服务器复用。新增 `_ForceAlignLyricTranscriber`
+  内部类（包装原 `LyricTranscriber`，零侵入注入到 `pipeline.lyric_transcriber`）。
+
+- **`MIDI Transcribe Audio` 新增 `lyrics_text` 输出**：节点现在返回
+  `(midi_json, lyrics_text)` 二元组。`lyrics_text` 是 **ROSVOT 之前** 的歌词
+  文本（即送入音符转录器之前的 ASR / 强制对齐结果），一字一音节，没有
+  ROSVOT 的 melisma 重复。`<SP>` 停顿转换为换行符。便于：
+
+  - 快速查看 ASR / 强制对齐的识别结果（无需解析 MIDI JSON）
+  - 当 `reference_lyrics` 启用时，验证强制对齐是否成功（应与参考歌词一致）
+  - 把识别结果接到下游文本节点（如 `MIDI Edit Lyrics`、`MIDI Merge Repeated
+    Chars`）做进一步处理
+
+  `core.soulsx_singer.py` 配套：`transcribe_audio(..., return_lyrics=True)`
+  返回 `(midi_json, lyrics_text)` 元组；默认 `return_lyrics=False` 返回
+  MIDI JSON 字符串（向后兼容）。
+
+### Fixed
+
+- **`MidiLyricsAlignment` 引入 MIDIEditLyrics 风格的 collapse 模式**：当新字数
+  小于原曲非 SP token 数（`C < nonsl`）且原曲有连续重复字 slot 时
+  （`C <= S`，S 为 slot 数），新字会被**复制到 slot 内每个 token**，而非
+  丢弃多余 token。与 `MIDIEditLyrics` 的 `_build_collapsed_slots` 行为一致。
+
+  **示例**：原曲 `好看的<女女>人`（6 token，slot 数=5）+ 新词
+  `强壮的男人`（5 char）→ 输出 `强壮的<男男>人`（6 token，男 复制到 女
+  slot），duration 完全守恒，`note_type=3` 标记第二个 男 为延续音。
+
+  之前的行为是直接丢弃多余的 `女` token，输出 `强壮的男人`（5 token），
+  duration 少 0.4s，丢失原曲的 melisma 结构。
+
+  **算法细节**：
+  - 新增 `_build_section_aware_slots` helper，按原曲连续相同字合并成 slot
+    （不跨 SP 边界合并：`甲甲<SP>甲甲` 是 2 个独立 slot，不是 1 个 count=4 slot）
+  - `align_track` 在 `C <= S 且 C < nonsl` 时走 collapse 模式
+  - 每个 char 在 `char_to_token_indices` 映射下可指向多个原 token（复制）
+  - 复制的 token 保留各自的 pitch / duration / f0 段，互不干扰
+  - `C >= nonsl` 时走原贪心压缩（distribute/expand），不受影响
+  - SPD 计算用 `N_effective = num_new_sp + output_nonsl`，正确反映复制后的
+    实际输出 token 数
+
+### Changed
+
+- **`_preprocess_audio_to_metadata` 返回类型**：从 `list[dict]` 改为
+  `tuple[list[dict], str]`（metadata, lyrics_text）。`_resolve_prompt_metadata`
+  更新为只取 `[0]`。这是内部 API 变更，对外接口（`transcribe_audio` /
+  `synthesize_audio`）通过 `return_lyrics` 参数保持向后兼容。
+
+### Verified
+
+- 沧海笑样本（董贞，30s 中文歌）：原 ASR 有 6 个字符错误（长→潮、几→记、
+  场→潮、晓→笑、之→知），启用 `reference_lyrics` 后 100% 准确；
+  `note_pitch` / `duration` 与原输出完全一致；ROSVOT 仍把"沧海笑"3 字
+  扩展为 5 个 note（沧沧 / 海海 / 笑），melisma 结构完整保留。
+- `lyrics_text` 输出：不带 reference 时显示 ASR 原始结果（含错误），带
+  reference 时与参考歌词完全一致。
+- **`MidiLyricsAlignment` collapse 复制**：原 `好看的<女女>人` + 新
+  `强壮的男人` → 输出 `强壮的<男男>人`（6 token，男男替代女女 slot，
+  pitch [65,67] 保留，note_type [2,3] 标记延续音，duration 守恒 3.2s）。
+- **跨 SP 边界不合并**：原 `甲甲<SP>甲甲` → 2 个独立 slot，新词 `乙丙`
+  → `乙乙<SP>丙丙`。
+- **对照组**（`C >= nonsl`）：新词 `强壮的老男人`（6 char = 6 token）→
+  输出 `强壮的老男人`（6 token，无复制）。
+- 向后兼容：`transcribe_audio(return_lyrics=False)`（默认）与 v3.2.0 输出
+  完全一致（text / pitch / note_type / duration 全等）。
+- 全部 184 个测试通过（181 原有 + 3 新增 collapse 行为测试）。
+
+
 ## [2026-06-26] v3.2.0
 
 ### Fixed

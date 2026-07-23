@@ -13,7 +13,7 @@
 | `MIDI-SoulX` | MIDI Transcribe Audio | 用 SoulX-Singer 把音频转写成 MIDI JSON |
 | `MIDI-SoulX` | MIDI Synthesize Audio | 用 SoulX-Singer 把 MIDI JSON + 参考音色合成歌声 |
 
-> 最新版本：**v3.2.0**（2026-06-26）— 修复 SVS 口齿不清（prompt 元数据来源）、`control` 默认改 `melody`、推理默认 FP32、新增 `prompt_metadata` / `use_fp16` / `cfg` / `n_steps` 输入；`MIDI Extract Lyrics` 新增 `resegment` 重新断句开关。详见 [CHANGELOG.md](CHANGELOG.md)。
+> 最新版本：**v3.3.0**（2026-07-20）— `MIDI Transcribe Audio` 新增 `reference_lyrics` 可选输入（强制对齐到 100% 文字准确率）+ `lyrics_text` 输出（ROSVOT 之前的歌词文本，`<SP>` 转换行）；pitch/duration/f0/SP/melisma 完全保留音频驱动。详见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -32,14 +32,41 @@
 | `audio` | AUDIO | ✅ | — | 输入音频 |
 | `max_merge_duration` | INT | — | `30000` | 最大合并段时长，单位 ms（范围 1000–120000） |
 | `language` | [`Mandarin`, `English`, `Cantonese`] | — | `Mandarin` | 歌词语种 |
+| `reference_lyrics` | STRING, multiline | — | 空 | 标准歌词。提供时 ASR 被强制对齐到该歌词，**文字识别率达 100%**，pitch/duration/f0/SP/melisma 完全保留音频驱动。详见下方 **reference_lyrics 强制对齐** |
 
 **输出：**
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `midi_json` | STRING | 转写得到的 MIDI JSON 字符串 |
+| `lyrics_text` | STRING | **ROSVOT 之前**的歌词文本（一字一音节，无 melisma 重复），`<SP>` 转为换行符。便于查看 ASR / 强制对齐的原始结果，或接到下游文本节点 |
 
 **分类：** `MIDI-SoulX`
+
+#### reference_lyrics 强制对齐
+
+当用户提供参考歌词时，ASR 步骤会通过 **Paraformer `hotword` 偏置 + 字符级 DTW 后处理** 把识别结果强制对齐到参考歌词，做到文字 100% 准确，同时不破坏任何音乐信息。
+
+**会被修正**：所有 ASR 语音混淆错误（如 长↔潮、几↔记、之↔知、场↔潮、晓↔笑 这类同音/近音字）。
+
+**不会改变**：
+- `note_pitch` / `duration` / `f0`：完全由音频驱动（ROSVOT + RMVPE），与不传参考歌词时一致
+- `<SP>` 停顿位置：由 `vocal_detector` + f0 后处理按音频驱动
+- **melisma 结构**：ROSVOT 仍会把一个字扩展到多个 note（如歌手在多个音高上唱同一个字 → `note_type=3` 延续音），文字会按 melisma 结构重复，与歌手实际演唱一致
+
+**示例**（沧海笑，董贞，30s 中文歌）：
+
+| | 不传 reference_lyrics | 传 reference_lyrics |
+|---|---|---|
+| 输出文字 | `沧 沧 海 海 笑 滔 滔 滔 两 岸 **长** ... 浪 **几 几** 今 ... 苍 天 **晓** ... 世 上 上 **场** ... 天 天 **之 之 笑**` | `沧 沧 海 海 笑 滔 滔 滔 两 岸 **潮** ... 浪 **记 记** 今 ... 苍 天 **笑** ... 世 上 上 **潮** ... 天 天 **知 知 晓**` |
+| 字符错误 | 6 处 | **0 处** |
+| `note_pitch` | — | **完全一致** |
+| `duration` | — | **完全一致** |
+
+**用法约定**：
+- 参考歌词里的 `\n` 和 `，。！？；：` 等标点会被剥离（仅作语义切片提示用），不影响 SP 停顿
+- 当前仅 Mandarin/Cantonese 路径走强制对齐，English ASR 回退到默认解码
+- 如果参考歌词字数多于实际音频字数（用户写多了），多出的字会被丢弃并打印警告
 
 ---
 
@@ -146,9 +173,10 @@
 - **CT-Transformer 智能断句**：先按标点切，超过 10 字用 CT-Transformer 标点模型加标点后全切；断句只看新歌词，不参照原曲句数
 - **SP 结构重建**：丢弃原曲所有 `<SP>`，按断句结果重建 `[SP] 句1 [SP] 句2 ... [SP]`
 - **SPD 时长**：`AVG(原 SP duration) × (原 token 数 / 新 token 数)`，限制 `[0.1, MAX(原 SP)]`
-- **顺序映射（字数 ≤ 原 token）**：前 C 个非 SP token 各承载 1 字，多余 token 丢弃，字继承原 token 的 duration/pitch/f0
+- **Collapse 模式（字数 ≤ 原 slot 数 `S`）**：与 `MIDIEditLyrics` 一致的 slot-collapse 行为。先把原曲非 SP token 按连续相同字合并成 slot（不跨 SP 边界：`甲甲<SP>甲甲` 是 2 个 slot，不是 1 个 count=4 slot），左对齐把每个新字映射到一个 slot；slot 内多个 token 时**新字复制到每个 token**（如原 `好看的<女女>人` + 新 `强壮的男人` → `强壮的<男男>人`），每个 token 保留各自的 pitch/duration/f0 段，第二个复制 token 标 `note_type=3`（延续音）。仅在 `C < nonsl` 时启用，`C >= nonsl` 走贪心压缩
+- **顺序映射（Collapse 模式触发条件：`C ≤ S 且 C < nonsl`）**：每个新字映射到一个 slot，slot 内多 token 时复制；末尾 `S-C` 个 slot 被丢弃
 - **贪心压缩（字数 > 原 token）**：按原 token duration 比例分配字数，长 token 多扛字、短 token 少扛字；SPLIT 组内 duration 等分并施加 0.1s 下限保障
-- **f0 按 token 切段重建**：按 `round(duration×50)` 切原 f0，丢原 SP 段，字用映射 token 的 f0 段，SPLIT 的段按字数切片，新 SP 插全 0 帧
+- **f0 按 token 切段重建**：按 `round(duration×50)` 切原 f0，丢原 SP 段，字用映射 token 的 f0 段，SPLIT 的段按字数切片，新 SP 插全 0 帧；Collapse 模式下复制 token 各自继承对应原 token 的完整 f0 段
 - **time 反算**：`time = [0, round(帧数/50×1000)]`，消除累积误差，避免 SoulX-Singer "could not broadcast" 错误
 
 **输入：**
@@ -615,6 +643,25 @@ set_models_base("/path/to/models")
 # 音频转 MIDI JSON
 midi_json = transcribe_audio("/path/to/audio.wav", language="Mandarin")
 
+# 已知歌词时强制对齐：文字 100% 准确，pitch/duration/f0/melisma 完全保留
+midi_json = transcribe_audio(
+    "/path/to/audio.wav",
+    language="Mandarin",
+    reference_lyrics="沧海笑\n滔滔两岸潮\n浮沉随浪记今朝\n...",
+)
+
+# 同时拿到 ROSVOT 之前的歌词文本（<SP> → 换行），便于日志/调试/下游节点
+midi_json, lyrics_text = transcribe_audio(
+    "/path/to/audio.wav",
+    language="Mandarin",
+    reference_lyrics="沧海笑\n滔滔两岸潮\n...",
+    return_lyrics=True,
+)
+print(lyrics_text)
+# 沧海笑
+# 滔滔两岸潮
+# ...
+
 # MIDI JSON + 参考音色合成歌声
 # 推荐：先转写参考音频得到 prompt_metadata，避免每次重复预处理
 prompt_metadata = transcribe_audio("/path/to/prompt.wav")
@@ -650,6 +697,7 @@ from core.g2p import char_to_phoneme, word_to_phoneme
 - `<SP>` 标记始终保留，f0（帧级数据）完全不做修改
 - 推理默认 FP32（`use_fp16=OFF`）——与上游参考实现一致，音质最稳；GPU 显存紧张时可开 FP16
 - `MIDI Synthesize Audio` 的 `prompt_metadata` 强烈推荐从参考音频预转写得到，可显著加速并避免 SVS 口齿不清
+- `MIDI Transcribe Audio` 的 `reference_lyrics` 留空 = 完全向后兼容；只有显式提供歌词时才启用强制对齐路径
 
 ---
 
@@ -694,7 +742,7 @@ ComfyUI-MIDI-Edit/
 
 | 节点名 | 类名 | 分类 | 主要输入 | 主要输出 |
 |--------|------|------|----------|----------|
-| MIDI Transcribe Audio | `MIDITranscribeAudio` | MIDI-SoulX | `audio` | `midi_json` |
+| MIDI Transcribe Audio | `MIDITranscribeAudio` | MIDI-SoulX | `audio` | `midi_json` + `lyrics_text` |
 | MIDI Synthesize Audio | `MIDISynthesizeAudio` | MIDI-SoulX | `midi_json` + `prompt_audio` | `audio` |
 | MIDI Edit Lyrics | `MIDIEditLyrics` | MIDI-Edit | `midi_json` + `new_lyrics` | `midi_json` |
 | MIDI Lyrics Alignment | `MidiLyricsAlignment` | MIDI | `midi_json` + `lyrics` | `midi_json` + `warnings` |

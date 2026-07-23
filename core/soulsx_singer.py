@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -337,6 +338,611 @@ def _ensure_nltk_for_preprocess():
     ensure_nltk_data()
 
 
+# ---------------------------------------------------------------------------
+# Reference-lyrics-biased ASR wrapper
+# ---------------------------------------------------------------------------
+
+
+# Regex used to normalize reference lyrics: keep only CJK chars + ASCII letters.
+# Punctuation, whitespace, digits etc. are stripped before passing to ASR.
+_REF_LYRICS_STRIP_RE = re.compile(r"[^\u4e00-\u9fffA-Za-z]")
+
+
+class _ForceAlignLyricTranscriber:
+    """Wrap a SoulX-Singer ``LyricTranscriber`` for two jobs:
+
+    1. **Optional force-alignment** with user-provided reference lyrics (see
+       :func:`transcribe_audio` ``reference_lyrics``).
+    2. **Always capture** the per-segment ``words`` list — the *pre-ROSVOT*
+       lyrics that get fed into ``note_transcriber``. The captured words are
+       exposed via :attr:`captured_segment_words` so callers can build a
+       lyrics-text output alongside the MIDI JSON.
+
+    Capturing is necessary because once ROSVOT runs, the text gets expanded
+    with melisma duplications (one char across multiple notes) that are NOT
+    in the source lyrics. The pre-ROSVOT ``words`` is the right artifact for
+    "what lyrics were detected / forced" before ROSVOT's musical expansion.
+
+    Force-alignment strategy (per segment), only when ``reference_lyrics`` is
+    non-empty:
+
+    1. **First-pass ASR** (no hotword) → rough char count for this segment.
+    2. **Slice reference** by char count: take next *N* chars from remaining
+       reference, where *N* = ASR's char count for this segment.
+    3. **Second-pass ASR** with ``hotword=<reference phrases>``: Paraformer
+       biased toward reference, fixes most phonetic confusions.
+    4. **DTW post-correction**: char-level Dynamic Time Warping between ASR
+       output and reference slice. Guarantees text matches reference exactly
+       while preserving ASR's char-level timestamps.
+
+    The wrapper preserves the original ``process(wav_fn, language)``
+    signature so ``pipeline.run()`` uses it transparently. SPs / word_durs /
+    f0 post-processing are still driven by audio; only the *identity* of each
+    word is replaced.
+
+    Pitch / duration / f0 / melisma detection (ROSVOT) are NOT affected.
+    """
+
+    # Paraformer hotword phrases longer than this are less effective.
+    # 5 chars per phrase empirically works well for Mandarin lyrics.
+    _HOTWORD_PHRASE_LEN = 5
+
+    def __init__(self, inner, reference_lyrics: str | None = None):
+        """Args:
+            inner: the original ``LyricTranscriber`` instance (must already be
+                initialised with the Paraformer model).
+            reference_lyrics: optional user-provided lyrics. Punctuation and
+                whitespace are stripped; only CJK + ASCII letters are kept.
+                When empty/None, the wrapper delegates to the inner
+                transcriber and only does lyrics capture.
+        """
+        self.inner = inner
+        self.reference_chars = _REF_LYRICS_STRIP_RE.sub("", reference_lyrics or "")
+        # Position counter consumed across segments (one transcribe_audio call).
+        self._ref_pos = 0
+        # Per-segment diagnostics, exposed for warning messages.
+        self.diagnostics: list[dict] = []
+        # CAPTURE: per-segment pre-ROSVOT word lists (incl. <SP>). Populated
+        # by every process() call. Used to build the lyrics_text output.
+        self.captured_segment_words: list[list[str]] = []
+
+    # Forward attributes that `_get_preprocess_pipeline` mutates after wrapping
+    # (zh_model_path / en_model_path) so the path-override block still works.
+    @property
+    def zh_model_path(self):
+        return self.inner.zh_model_path
+
+    @zh_model_path.setter
+    def zh_model_path(self, v):
+        self.inner.zh_model_path = v
+
+    @property
+    def en_model_path(self):
+        return self.inner.en_model_path
+
+    @en_model_path.setter
+    def en_model_path(self, v):
+        self.inner.en_model_path = v
+
+    # Verbose / device / verbose passthroughs for `pipeline.run` logging.
+    @property
+    def verbose(self):
+        return self.inner.verbose
+
+    @property
+    def device(self):
+        return self.inner.device
+
+    def process(self, wav_fn: str, language: str | None = "Mandarin"):
+        """Drop-in replacement for ``LyricTranscriber.process``.
+
+        Always captures the returned ``words`` list into
+        :attr:`captured_segment_words` for downstream lyrics-text extraction.
+
+        Force-alignment is skipped (delegating to inner) when:
+          - reference lyrics is empty, or
+          - all reference chars have been consumed by earlier segments, or
+          - language is English (NeMo Parakeet does not accept hotword the same
+            way Paraformer-zh does; English path is left untouched for now).
+        """
+        lang = (language or "auto").lower()
+        is_zh_path = lang in {"mandarin", "cantonese", "zh", "中文", ""}
+        if (not self.reference_chars
+                or self._ref_pos >= len(self.reference_chars)
+                or not is_zh_path):
+            words, word_durs = self.inner.process(wav_fn, language)
+            self.captured_segment_words.append(list(words))
+            if self.reference_chars and self._ref_pos >= len(self.reference_chars):
+                print(f"[MIDI-Edit] ForceAlign: WARNING — reference exhausted "
+                      f"(pos={self._ref_pos}/{len(self.reference_chars)}), "
+                      f"segment {os.path.basename(wav_fn)} falls back to "
+                      f"default ASR (no DTW correction)")
+            return words, word_durs
+
+        # Load the shared transcription utilities lazily (they live in the
+        # SoulX-Singer submodule, which is only importable after
+        # `_load_submodule("preprocess.tools.lyric_transcription")`).
+        from preprocess.tools.lyric_transcription import (
+            _build_words_with_gaps, _word_dur_post_process,
+        )
+
+        # ---- Step 1: first-pass ASR (no hotword) → rough char count ----
+        # Used ONLY to generate the hotword; the actual reference slice uses
+        # the second-pass ASR's count (more accurate thanks to hotword bias).
+        out_first = self.inner.zh_model.model.generate(
+            wav_fn, output_timestamp=True,
+        )[0]
+        first_words = out_first["text"].replace("@", "").split(" ")
+        n_chars_first = len(first_words)
+        print(f"[MIDI-Edit] ForceAlign seg={os.path.basename(wav_fn)}: "
+              f"first-pass ASR ({n_chars_first} chars): {' '.join(first_words)}")
+
+        # ---- Step 2: slice reference for HOTWORD ONLY (rough) ----
+        # DON'T advance ref_pos yet — we'll re-slice after second-pass.
+        seg_ref_for_hotword = self.reference_chars[
+            self._ref_pos:self._ref_pos + n_chars_first
+        ]
+        if not seg_ref_for_hotword:
+            words, word_durs = self.inner.process(wav_fn, language)
+            self.captured_segment_words.append(list(words))
+            return words, word_durs
+
+        # ---- Step 3: second-pass ASR biased with hotword ----
+        hotword = " ".join(self._split_phrases(seg_ref_for_hotword))
+        try:
+            out = self.inner.zh_model.model.generate(
+                wav_fn, output_timestamp=True, hotword=hotword,
+            )[0]
+        except Exception as e:  # hotword not supported / model error
+            print(f"[MIDI-Edit] ForceAlign: hotword ASR failed ({e}); "
+                  f"falling back to first-pass")
+            out = out_first
+
+        asr_words = out["text"].replace("@", "").split(" ")
+        asr_ts = [[t[0] / 1000, t[1] / 1000] for t in out["timestamp"]]
+        n_chars_second = len(asr_words)
+        print(f"[MIDI-Edit] ForceAlign seg={os.path.basename(wav_fn)}: "
+              f"second-pass ASR ({n_chars_second} chars): {' '.join(asr_words)}")
+
+        # ---- Step 4: RE-SLICE reference using second-pass char count ----
+        # Use second-pass count (with hotword) for the slice — more accurate
+        # than first-pass. No overestimate: overeating ref chars from future
+        # segments causes cascading offset errors (worse than undercounting).
+        seg_ref = self.reference_chars[
+            self._ref_pos:self._ref_pos + n_chars_second
+        ]
+        self._ref_pos += len(seg_ref)
+        print(f"[MIDI-Edit] ForceAlign seg={os.path.basename(wav_fn)}: "
+              f"ref slice [{self._ref_pos - len(seg_ref)}:{self._ref_pos}] "
+              f"({len(seg_ref)} chars): {seg_ref}")
+
+        # ---- Step 5: DTW ----
+        final_words = self._dtw_align(list(seg_ref), asr_words)
+        diffs = [(a, b) for a, b in zip(asr_words, final_words) if a != b]
+        print(f"[MIDI-Edit] ForceAlign seg={os.path.basename(wav_fn)}: "
+              f"DTW output ({len(final_words)} chars): {' '.join(final_words)}"
+              + (f"  diffs={diffs}" if diffs else "  (no diffs)"))
+
+        # Record diagnostics for the wrapper's caller.
+        self.diagnostics.append({
+            "wav_fn": wav_fn,
+            "hotword": hotword,
+            "asr_words": asr_words,
+            "final_words": final_words,
+            "diffs": diffs,
+            "ref_slice": seg_ref,
+        })
+
+        # ---- Step 6: build (words, word_durs) identical to original ASR ----
+        words, word_durs = _build_words_with_gaps(final_words, asr_ts, wav_fn)
+        f0_path = os.path.splitext(wav_fn)[0] + "_f0.npy"
+        if os.path.exists(f0_path):
+            words, word_durs = _word_dur_post_process(
+                words, word_durs, np.load(f0_path),
+            )
+        self.captured_segment_words.append(list(words))
+        return words, word_durs
+
+    @classmethod
+    def _split_phrases(cls, text: str) -> list[str]:
+        """Split a reference slice into ~5-char phrases for hotword biasing."""
+        n = cls._HOTWORD_PHRASE_LEN
+        return [text[i:i + n] for i in range(0, len(text), n)]
+
+    @staticmethod
+    def _dtw_align(ref_chars: list[str], asr_words: list[str]) -> list[str]:
+        """Char-level DTW mapping each ASR position to its best ref char.
+
+        - 'sub' (1 ref ↔ 1 asr): substitute asr with ref
+        - 'ins' (1 ref ↔ 0 asr): ref char dropped (no ASR position to carry it)
+        - 'del' (0 ref ↔ 1 asr): asr is "extra"; assign it the nearest ref char
+
+        The output always has ``len == len(asr_words)`` so ASR's structure
+        (including melisma-induced duplications that ROSVOT will later expand)
+        is preserved — only the *identity* of each word changes.
+
+        Time complexity is O(M*N) where M, N are small (per-segment counts).
+        """
+        M, N = len(ref_chars), len(asr_words)
+        if N == 0:
+            return []
+        if M == 0:
+            return list(asr_words)
+
+        INF = float("inf")
+        dp = [[INF] * (N + 1) for _ in range(M + 1)]
+        back = [[None] * (N + 1) for _ in range(M + 1)]
+        dp[0][0] = 0
+        for i in range(M + 1):
+            for j in range(N + 1):
+                if i == 0 and j == 0:
+                    continue
+                if i > 0 and j > 0:
+                    cost = 0 if ref_chars[i - 1] == asr_words[j - 1] else 1
+                    if dp[i - 1][j - 1] + cost < dp[i][j]:
+                        dp[i][j] = dp[i - 1][j - 1] + cost
+                        back[i][j] = ("sub", i - 1, j - 1)
+                if i > 0:
+                    if dp[i - 1][j] + 1 < dp[i][j]:
+                        dp[i][j] = dp[i - 1][j] + 1
+                        back[i][j] = ("ins", i - 1, j)
+                if j > 0:
+                    if dp[i][j - 1] + 1 < dp[i][j]:
+                        dp[i][j] = dp[i][j - 1] + 1
+                        back[i][j] = ("del", i, j - 1)
+
+        ops = []
+        i, j = M, N
+        while i > 0 or j > 0:
+            op, pi, pj = back[i][j]
+            ops.append((op, pi, pj))
+            i, j = pi, pj
+        ops.reverse()
+
+        new_words: list[str | None] = [None] * N
+        for op, pi, pj in ops:
+            if op == "sub":
+                new_words[pj] = ref_chars[pi]
+            elif op == "del":
+                # Extra ASR position: assign nearest ref char so ROSVOT still
+                # has a meaningful word for every note it detects.
+                new_words[pj] = ref_chars[min(pi, M - 1)]
+        for k in range(N):
+            if new_words[k] is None:
+                new_words[k] = asr_words[k]
+        return new_words  # type: ignore[return-value]
+
+    @staticmethod
+    def _dtw_align_with_insert(
+        ref_chars: list[str],
+        asr_words: list[str],
+        asr_ts: list[list[float]],
+    ) -> tuple[list[str], list[list[float]], int]:
+        """DTW that INSERTS missing ref chars (instead of dropping them).
+
+        When ASR detects fewer chars than the reference (e.g., ASR missed a
+        held note), the 'ins' ops INSERT the missing ref char by splitting
+        the adjacent ASR char's timestamp. This ensures the output text
+        matches the reference exactly, even when ASR undercounts.
+
+        Only 'ins' ops WITHIN 1 position of the last 'sub' are inserted
+        (they represent chars ASR missed in this segment). 'ins' ops further
+        away are NOT inserted (they belong to future segments).
+
+        Returns:
+            (out_words, out_ts, consumed_ref_count)
+            - out_words: aligned char list (may be longer than asr_words)
+            - out_ts: timestamps for each output char
+            - consumed_ref_count: how many ref chars this segment consumed
+              (for advancing ref_pos)
+        """
+        M, N = len(ref_chars), len(asr_words)
+        if N == 0:
+            return [], [], 0
+        if M == 0:
+            return list(asr_words), asr_ts, 0
+
+        # ---- Standard DTW to find alignment ops ----
+        INF = float("inf")
+        dp = [[INF] * (N + 1) for _ in range(M + 1)]
+        back = [[None] * (N + 1) for _ in range(M + 1)]
+        dp[0][0] = 0
+        for i in range(M + 1):
+            for j in range(N + 1):
+                if i == 0 and j == 0:
+                    continue
+                if i > 0 and j > 0:
+                    cost = 0 if ref_chars[i - 1] == asr_words[j - 1] else 1
+                    if dp[i - 1][j - 1] + cost < dp[i][j]:
+                        dp[i][j] = dp[i - 1][j - 1] + cost
+                        back[i][j] = ("sub", i - 1, j - 1)
+                if i > 0:
+                    if dp[i - 1][j] + 1 < dp[i][j]:
+                        dp[i][j] = dp[i - 1][j] + 1
+                        back[i][j] = ("ins", i - 1, j)
+                if j > 0:
+                    if dp[i][j - 1] + 1 < dp[i][j]:
+                        dp[i][j] = dp[i][j - 1] + 1
+                        back[i][j] = ("del", i, j - 1)
+
+        ops = []
+        i, j = M, N
+        while i > 0 or j > 0:
+            op, pi, pj = back[i][j]
+            ops.append((op, pi, pj))
+            i, j = pi, pj
+        ops.reverse()
+
+        # ---- Find the last 'sub' position in ref ----
+        last_sub_ref = -1
+        for op, pi, pj in ops:
+            if op == "sub":
+                last_sub_ref = max(last_sub_ref, pi)
+
+        # ---- Build output with INSERT for nearby 'ins' ops ----
+        # Rule: INSERT 'ins' ops that are within 1 position of last_sub_ref
+        # (they represent chars ASR missed in this segment). 'ins' ops further
+        # away are skipped (belong to future segments).
+        INSERT_WINDOW = 1  # insert 'ins' within 1 position of last 'sub'
+
+        out_words: list[str] = []
+        out_ts: list[list[float]] = []
+        consumed_ref = 0
+
+        for op, pi, pj in ops:
+            if op == "sub":
+                out_words.append(ref_chars[pi])
+                out_ts.append(list(asr_ts[pj]))
+                consumed_ref = max(consumed_ref, pi + 1)
+            elif op == "ins":
+                # 'ins' = ref char with no ASR match
+                # Only insert if within INSERT_WINDOW of last_sub_ref
+                if pi <= last_sub_ref + INSERT_WINDOW:
+                    # INSERT: split previous ASR char's timestamp
+                    out_words.append(ref_chars[pi])
+                    if out_ts:
+                        prev_s, prev_e = out_ts[-1]
+                        mid = (prev_s + prev_e) / 2.0
+                        out_ts[-1] = [prev_s, mid]
+                        out_ts.append([mid, prev_e])
+                    else:
+                        out_ts.append([0.0, 0.0])
+                    consumed_ref = max(consumed_ref, pi + 1)
+                # else: skip (belongs to future segment)
+            elif op == "del":
+                # 'del' = extra ASR char with no ref match (melisma)
+                # Assign nearest ref char identity, keep ASR timestamp
+                out_words.append(ref_chars[min(pi, M - 1)])
+                out_ts.append(list(asr_ts[pj]))
+
+        return out_words, out_ts, consumed_ref
+
+
+def _merge_held_note_sps(
+    words: list[str], word_durs: list[float],
+) -> tuple[list[str], list[float]]:
+    """Merge ``<SP>`` tokens between identical words in the PRE-ROSVOT words list.
+
+    Used when the words list has ``[X, <SP>, X]`` patterns from
+    ``_build_words_with_gaps`` (ASR detected a gap inside a held note).
+    Merges the SP duration into the first X, so ROSVOT doesn't see the SP.
+
+    Note: this is applied BEFORE ROSVOT. For SPs that ROSVOT itself
+    re-introduces, see :func:`_merge_rosvot_held_note_sps`.
+    """
+    if len(words) < 3:
+        return words, word_durs
+    out_words: list[str] = []
+    out_durs: list[float] = []
+    i = 0
+    while i < len(words):
+        if (out_words and words[i] == "<SP>"
+                and i + 1 < len(words)
+                and words[i + 1] == out_words[-1]
+                and out_words[-1] != "<SP>"):
+            out_durs[-1] += word_durs[i]
+            out_words.append(words[i + 1])
+            out_durs.append(word_durs[i + 1])
+            i += 2
+        else:
+            out_words.append(words[i])
+            out_durs.append(word_durs[i])
+            i += 1
+    return out_words, out_durs
+
+
+def _merge_rosvot_held_note_sps(metadata: dict) -> None:
+    """Fix ``[X, <SP>, X]`` patterns introduced by ROSVOT's note2words.
+
+    ROSVOT sometimes assigns a note to the ``<SP>`` word index even when
+    the singer sustained the same syllable across that region (melisma).
+    This creates an ``<SP>`` token between two identical char tokens in
+    ``note_text``, which causes SoulX-Singer to insert an unnatural pause
+    during synthesis.
+
+    This function scans ``note_text`` in-place for the pattern
+    ``[X, <SP>, X]`` (where X is any non-SP token) and converts the
+    ``<SP>`` to X with:
+    - ``note_pitch``: copied from the preceding X (so synthesis produces
+      the correct pitch instead of silence)
+    - ``note_type``: set to 3 (word-internal continuation)
+    - ``phoneme``: copied from the preceding X
+
+    The ``f0`` field is NOT modified — it already contains the singer's
+    actual f0 values for that region (which are voiced, not silent).
+    """
+    nt = metadata.get("note_text", [])
+    if not nt or len(nt) < 3:
+        return
+    np_pitches = metadata.get("note_pitch", [])
+    np_types = metadata.get("note_type", [])
+    # phoneme is not in the ROSVOT output dict; it's added by convert_metadata.
+    # We only fix note_text, note_pitch, note_type here.
+    n_fixed = 0
+    for i in range(1, len(nt) - 1):
+        if (nt[i] == "<SP>"
+                and nt[i - 1] != "<SP>"
+                and nt[i + 1] == nt[i - 1]):
+            # Convert SP to continuation of the held note
+            nt[i] = nt[i - 1]
+            if i < len(np_pitches):
+                np_pitches[i] = np_pitches[i - 1]
+            if i < len(np_types):
+                np_types[i] = 3
+            n_fixed += 1
+    if n_fixed:
+        print(f"[MIDI-Edit] Fixed {n_fixed} ROSVOT-introduced <SP> in "
+              f"held notes for {metadata.get('item_name', '?')}")
+
+
+def _load_reduplication_wordlist() -> frozenset[str]:
+    """Load the valid reduplication (AA-form) word list.
+
+    Reads ``models/reduplication-verbs.txt`` — one AA-form word per line
+    (e.g., 哥哥, 滔滔, 纷纷). All entries are 2-char with identical chars.
+
+    Consecutive identical chars whose AA pair is NOT in this list are
+    "invalid reduplication" (melisma duplicates) and get merged.
+    """
+    wordlist_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "models", "reduplication-verbs.txt",
+    )
+    if not os.path.isfile(wordlist_path):
+        return frozenset()
+    with open(wordlist_path, "r", encoding="utf-8") as f:
+        return frozenset(line.strip() for line in f if line.strip())
+
+
+def _merge_invalid_repeated_chars(metadata: dict, wordlist: frozenset[str],
+                                   ref_chars: str = "") -> None:
+    """Merge consecutive identical chars (melisma duplicates).
+
+    For each run of N identical chars, determine how many to keep:
+
+    1. **With reference lyrics** (``ref_chars`` provided): the max consecutive
+       count of that char in the reference. E.g., reference "滔滔" has max
+       consecutive run of 2 for 滔 → keep 2. Reference "谁负谁" has max run
+       of 1 for 谁 → keep 1.
+
+    2. **Without reference**: if the AA pair is in ``wordlist`` (valid
+       reduplication like 哥哥) → keep 2. Otherwise → keep 1.
+
+    Extra chars are merged: their duration is added to the last kept char,
+    and the extra note entries are removed. f0 is not modified.
+    """
+    nt = list(metadata.get("note_text", []))
+    if not nt or len(nt) < 2:
+        return
+    nd = list(metadata.get("note_dur", []))
+    np_p = list(metadata.get("note_pitch", []))
+    nty = list(metadata.get("note_type", []))
+
+    # Build char→max_consecutive_run from reference (if provided)
+    ref_max_run: dict[str, int] = {}
+    if ref_chars:
+        j = 0
+        while j < len(ref_chars):
+            ch = ref_chars[j]
+            run = 1
+            while j + run < len(ref_chars) and ref_chars[j + run] == ch:
+                run += 1
+            ref_max_run[ch] = max(ref_max_run.get(ch, 0), run)
+            j += run
+
+    i = 0
+    n_fixed = 0
+    while i < len(nt):
+        if nt[i] == "<SP>":
+            i += 1
+            continue
+        # Find run of identical chars starting at i
+        run_char = nt[i]
+        run_end = i + 1
+        while run_end < len(nt) and nt[run_end] == run_char:
+            run_end += 1
+        run_len = run_end - i
+        if run_len < 2:
+            i = run_end
+            continue
+
+        # Determine how many to keep
+        if ref_max_run:
+            keep = ref_max_run.get(run_char, 1)
+        else:
+            is_valid_word = (run_char + run_char) in wordlist
+            keep = 2 if is_valid_word else 1
+
+        if run_len <= keep:
+            i = run_end
+            continue
+
+        # Merge extras: add their duration to the last kept char
+        last_kept = i + keep - 1
+        for k in range(i + keep, run_end):
+            if last_kept < len(nd) and k < len(nd):
+                nd[last_kept] += nd[k]
+        # Remove extra entries (backward to preserve indices)
+        for k in range(run_end - 1, i + keep - 1, -1):
+            for lst in (nt, nd, np_p, nty):
+                if k < len(lst):
+                    del lst[k]
+        n_fixed += (run_len - keep)
+        i += keep
+
+    if n_fixed:
+        metadata["note_text"] = nt
+        metadata["note_dur"] = nd
+        metadata["note_pitch"] = np_p
+        metadata["note_type"] = nty
+        print(f"[MIDI-Edit] Merged {n_fixed} invalid repeated char(s) in "
+              f"{metadata.get('item_name', '?')}")
+
+    if n_fixed:
+        metadata["note_text"] = nt
+        metadata["note_dur"] = nd
+        metadata["note_pitch"] = np_p
+        metadata["note_type"] = nty
+        print(f"[MIDI-Edit] Merged {n_fixed} invalid repeated char(s) in "
+              f"{metadata.get('item_name', '?')}")
+
+
+def _build_lyrics_text(captured_segment_words: list[list[str]]) -> str:
+    """Build a single lyrics-text string from captured per-segment word lists.
+
+    Concatenates every segment's pre-ROSVOT ``words`` list (the same artifact
+    that gets fed into ``note_transcriber``), then:
+
+    - Removes inter-token spaces (Chinese chars don't need them; English
+      words retain their original boundaries via the leading/trailing space
+      pattern in the source ``text`` field).
+    - Replaces ``<SP>`` tokens (single or consecutive) with a single newline.
+
+    Output example::
+
+        沧海笑
+        滔滔两岸潮
+        浮沉随浪记今朝
+
+    This is the *pre-ROSVOT* lyrics: one char per syllable, no melisma
+    duplications. Useful for reviewing what ASR / force-alignment produced
+    before ROSVOT expands it into the final note-level ``text`` field.
+    """
+    if not captured_segment_words:
+        return ""
+    # Concatenate all segments' word lists in order.
+    all_words: list[str] = []
+    for words in captured_segment_words:
+        all_words.extend(words)
+    # Join with space, then drop all spaces (Chinese chars don't need them;
+    # English words in the source ASR are already single-token).
+    text = " ".join(all_words)
+    text = text.replace(" ", "")
+    # Collapse consecutive <SP> into a single newline.
+    text = re.sub(r"(?:<SP>)+", "\n", text)
+    return text.strip()
+
+
 def _get_preprocess_pipeline(language: str = "Mandarin", save_dir: str | None = None,
                               max_merge_duration: int = 30000):
     # Must run before _load_submodule("preprocess.*"): the preprocess chain
@@ -526,38 +1132,62 @@ def midi_json_to_metadata(midi_json_str: str) -> list[dict]:
 
 def _preprocess_audio_to_metadata(audio, sample_rate: int | None = None,
                                   language: str = "Mandarin",
-                                  max_merge_duration: int = 30000) -> list[dict]:
+                                  max_merge_duration: int = 30000,
+                                  reference_lyrics: str | None = None,
+                                  merge_held_notes: bool = True,
+                                  merge_repeated_chars: bool = True,
+                                  ) -> tuple[list[dict], str]:
     """Run SoulX-Singer preprocessing on *audio* and return the raw metadata list.
 
-    This is the shared core of :func:`transcribe_audio`. It reuses the existing
-    preprocess pipeline (vocal separation, F0 extraction, VAD, lyrics ASR, note
-    transcription) without re-implementing any of it, and returns the raw
-    metadata list (one dict per segment) exactly as written by the pipeline —
-    **not** converted to MIDI JSON.
+    When ``reference_lyrics`` is provided, uses a **two-pass** approach:
 
-    The returned metadata describes the *actual acoustic content* of *audio*
-    (phoneme / duration / note_pitch / note_type / f0 aligned to the waveform),
-    which is the contract SoulX-Singer requires for prompt metadata
-    (see :func:`synthesize_audio`).
+    1. Run ASR (first + second pass with hotword) on ALL segments, collecting
+       per-segment char counts.
+    2. Distribute reference chars across segments **proportionally** using the
+       largest-remainder method, ensuring ``sum(adjusted_counts) == len(ref)``.
+       This handles cases where ASR undercounts (e.g., detects 29 chars but
+       reference has 31) — the missing chars are distributed to the segments
+       where ASR is most likely to have merged syllables.
+    3. Run DTW per segment with the adjusted ref counts. DTW's ``ins`` ops
+       **insert** missing ref chars by splitting the adjacent ASR char's
+       timestamp in half (so ROSVOT receives correct char-level timing).
+    4. Run note_transcriber (ROSVOT) per segment — unchanged.
+
+    This ensures both ``midi_json`` and ``lyrics_text`` contain ALL reference
+    chars, even when ASR undercounts.
     """
     with tempfile.TemporaryDirectory(prefix="soulsx_preprocess_") as tmpdir:
         audio_path = _ensure_wav_path(audio, sample_rate, tmpdir)
-
         save_dir = os.path.join(tmpdir, "output")
         pipeline = _get_preprocess_pipeline(
-            language=language,
-            save_dir=save_dir,
+            language=language, save_dir=save_dir,
             max_merge_duration=max_merge_duration,
         )
 
-        pipeline.run(audio_path=audio_path, language=language)
+        # Always install wrapper for lyrics capture.
+        wrapper: _ForceAlignLyricTranscriber | None = None
+        if pipeline.lyric_transcriber is not None:
+            wrapper = _ForceAlignLyricTranscriber(
+                pipeline.lyric_transcriber, reference_lyrics,
+            )
+            pipeline.lyric_transcriber = wrapper
+            if wrapper.reference_chars:
+                print(f"[MIDI-Edit] ForceAlign: enabled with "
+                      f"{len(wrapper.reference_chars)} reference chars")
 
-        meta_path = os.path.join(save_dir, "metadata.json")
-        if not os.path.isfile(meta_path):
-            raise RuntimeError("Preprocessing did not produce metadata.json")
-
-        with open(meta_path, "r", encoding="utf-8") as f:
-            metadata_list = json.load(f)
+        has_ref = (wrapper is not None and wrapper.reference_chars)
+        if has_ref:
+            metadata_list = _run_two_pass_pipeline(
+                pipeline, audio_path, save_dir, language, wrapper,
+                max_merge_duration, merge_held_notes, merge_repeated_chars,
+            )
+        else:
+            pipeline.run(audio_path=audio_path, language=language)
+            meta_path = os.path.join(save_dir, "metadata.json")
+            if not os.path.isfile(meta_path):
+                raise RuntimeError("Preprocessing did not produce metadata.json")
+            with open(meta_path, "r", encoding="utf-8") as f:
+                metadata_list = json.load(f)
 
         if not metadata_list:
             raise RuntimeError(
@@ -565,12 +1195,319 @@ def _preprocess_audio_to_metadata(audio, sample_rate: int | None = None,
                 "check that the audio actually contains vocals."
             )
 
-    return metadata_list
+    lyrics_text = (
+        _build_lyrics_text(wrapper.captured_segment_words)
+        if wrapper is not None else ""
+    )
+    return metadata_list, lyrics_text
+
+
+def _run_two_pass_pipeline(pipeline, audio_path, save_dir, language,
+                            wrapper, max_merge_duration,
+                            merge_held_notes=True,
+                            merge_repeated_chars=True) -> list[dict]:
+    """Reimplement pipeline.run() with two-pass ASR for reference alignment.
+
+    Pass 1: Run ASR on all segments, collect per-segment results.
+    Pass 2: Distribute reference proportionally, run DTW + note_transcriber.
+    """
+    import soundfile as sf
+    import librosa
+    from pathlib import Path
+
+    # Lazy-load the utilities from the SoulX-Singer submodule.
+    from preprocess.tools.lyric_transcription import (
+        _build_words_with_gaps, _word_dur_post_process,
+    )
+    from preprocess.utils import convert_metadata, merge_short_segments
+
+    output_dir = Path(save_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Step 1: vocal separation ----
+    sep = pipeline.vocal_separator.process(audio_path)
+    vocal = sep.vocals_dereverbed.T
+    acc = sep.accompaniment.T
+    sample_rate = sep.sample_rate
+    vocal_path = output_dir / "vocal.wav"
+    sf.write(vocal_path, vocal, sample_rate)
+
+    # ---- Step 2: F0 extraction ----
+    vocal_f0 = pipeline.f0_extractor.process(
+        str(vocal_path),
+        f0_path=str(vocal_path).replace(".wav", "_f0.npy"),
+    )
+
+    # ---- Step 3: vocal detection (segmentation) ----
+    segments = pipeline.vocal_detector.process(str(vocal_path), f0=vocal_f0)
+    print(f"[MIDI-Edit] Two-pass: {len(segments)} segments detected")
+
+    # ---- Pass 1: Run ASR on ALL segments, collect results ----
+    # Store per-segment: (seg_dict, asr_words, asr_ts)
+    asr_results: list[tuple[dict, list[str], list[list[float]]]] = []
+    ref_chars = wrapper.reference_chars
+    ref_pos = 0  # temporary position for hotword generation
+
+    for seg in segments:
+        wav_fn = seg["wav_fn"]
+        # Per-segment f0 (needed by word_dur_post_process)
+        pipeline.f0_extractor.process(
+            wav_fn, f0_path=wav_fn.replace(".wav", "_f0.npy"),
+        )
+
+        # First-pass ASR (no hotword) → rough char count
+        out_first = wrapper.inner.zh_model.model.generate(
+            wav_fn, output_timestamp=True,
+        )[0]
+        first_words = out_first["text"].replace("@", "").split(" ")
+        n_first = len(first_words)
+
+        # Slice ref for hotword (rough, based on first-pass count)
+        hotword_ref = ref_chars[ref_pos:ref_pos + n_first]
+        ref_pos += len(hotword_ref)  # advance temp position
+
+        # Second-pass ASR with hotword
+        hotword = " ".join(wrapper._split_phrases(hotword_ref)) if hotword_ref else ""
+        try:
+            out = wrapper.inner.zh_model.model.generate(
+                wav_fn, output_timestamp=True, hotword=hotword,
+            )[0]
+        except Exception:
+            out = out_first
+
+        asr_words = out["text"].replace("@", "").split(" ")
+        asr_ts = [[t[0] / 1000, t[1] / 1000] for t in out["timestamp"]]
+        asr_results.append((seg, asr_words, asr_ts))
+        print(f"[MIDI-Edit] Two-pass seg={os.path.basename(wav_fn)}: "
+              f"ASR ({len(asr_words)} chars): {' '.join(asr_words)}")
+
+    # ---- Distribute reference chars proportionally ----
+    asr_counts = [len(r[1]) for r in asr_results]
+    total_asr = sum(asr_counts)
+    total_ref = len(ref_chars)
+    adjusted_counts = _proportional_distribute(asr_counts, total_ref)
+    print(f"[MIDI-Edit] Two-pass: ASR counts={asr_counts} (total={total_asr}), "
+          f"ref={total_ref}, adjusted={adjusted_counts}")
+
+    # ---- Pass 2: DTW + note_transcriber per segment ----
+    ref_pos = 0  # reset for actual ref consumption
+    metadata = []
+    wrapper.captured_segment_words = []  # reset capture
+    wrapper.diagnostics = []
+
+    for (seg, asr_words, asr_ts), n_ref in zip(asr_results, adjusted_counts):
+        wav_fn = seg["wav_fn"]
+        # Slice ref by ADJUSTED count (not ASR count)
+        seg_ref = ref_chars[ref_pos:ref_pos + n_ref]
+        ref_pos += len(seg_ref)
+
+        # DTW with INSERT for 'ins' ops
+        if len(seg_ref) > len(asr_words):
+            # Ref has MORE chars than ASR — need to INSERT missing chars
+            final_words, final_ts = _dtw_align_insert(
+                list(seg_ref), asr_words, asr_ts,
+            )
+            mode = "insert"
+        elif len(seg_ref) < len(asr_words):
+            # Ref has FEWER chars than ASR — extra ASR chars get nearest ref
+            final_words = _ForceAlignLyricTranscriber._dtw_align(
+                list(seg_ref), asr_words,
+            )
+            final_ts = asr_ts
+            mode = "collapse"
+        else:
+            # Equal counts — simple 1:1 DTW
+            final_words = _ForceAlignLyricTranscriber._dtw_align(
+                list(seg_ref), asr_words,
+            )
+            final_ts = asr_ts
+            mode = "match"
+
+        diffs = [(a, b) for a, b in zip(asr_words, final_words[:len(asr_words)])
+                 if a != b]
+        print(f"[MIDI-Edit] Two-pass seg={os.path.basename(wav_fn)}: "
+              f"DTW ({mode}, {len(final_words)} chars): "
+              f"{' '.join(final_words)}"
+              + (f"  diffs={diffs}" if diffs else ""))
+
+        wrapper.diagnostics.append({
+            "wav_fn": wav_fn, "asr_words": asr_words,
+            "final_words": final_words, "diffs": diffs, "ref_slice": seg_ref,
+        })
+
+        # Build (words, word_durs)
+        words, word_durs = _build_words_with_gaps(final_words, final_ts, wav_fn)
+        f0_path = wav_fn.replace(".wav", "_f0.npy")
+        if os.path.exists(f0_path):
+            words, word_durs = _word_dur_post_process(
+                words, word_durs, np.load(f0_path),
+            )
+        wrapper.captured_segment_words.append(list(words))
+
+        seg["words"] = words
+        seg["word_durs"] = word_durs
+        seg["language"] = language
+        seg_metadata = pipeline.note_transcriber.process(seg, segment_info=seg)
+        # Post-ROSVOT fixes:
+        # 1. merge_held_notes: fix [X, <SP>, X] patterns (ROSVOT assigned a
+        #    note to the <SP> word index inside a sustained syllable)
+        if merge_held_notes:
+            _merge_rosvot_held_note_sps(seg_metadata)
+        # 2. merge_repeated_chars: merge consecutive identical chars that are
+        #    NOT valid reduplication words (e.g., 沧沧 from melisma → 沧)
+        if merge_repeated_chars:
+            wl = _load_reduplication_wordlist()
+            if wl:
+                _merge_invalid_repeated_chars(seg_metadata, wl, seg_ref)
+        metadata.append(seg_metadata)
+
+    # ---- Merge short segments ----
+    merged = merge_short_segments(
+        vocal, sample_rate, metadata,
+        output_dir / "long_cut_wavs",
+        max_duration_ms=max_merge_duration,
+    )
+
+    # ---- Final F0 + convert_metadata ----
+    final_metadata = []
+    for item in merged:
+        pipeline.f0_extractor.process(
+            item.wav_fn, f0_path=item.wav_fn.replace(".wav", "_f0.npy"),
+        )
+        final_metadata.append(convert_metadata(item))
+
+    # Write metadata.json (so downstream code can read it if needed)
+    with open(output_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(final_metadata, f, ensure_ascii=False, indent=2)
+
+    n_fixed = sum(len(d["diffs"]) for d in wrapper.diagnostics)
+    if n_fixed:
+        print(f"[MIDI-Edit] ForceAlign: corrected {n_fixed} char(s) via DTW")
+
+    return final_metadata
+
+
+def _proportional_distribute(counts: list[int], target: int) -> list[int]:
+    """Distribute ``target`` across buckets proportional to ``counts``.
+
+    Uses the largest-remainder method to ensure ``sum(result) == target``.
+    """
+    if not counts or target <= 0:
+        return [0] * len(counts)
+    total = sum(counts)
+    if total == 0:
+        # Even distribution
+        base = target // len(counts)
+        rem = target % len(counts)
+        return [base + (1 if i < rem else 0) for i in range(len(counts))]
+
+    # Exact proportions
+    exact = [c * target / total for c in counts]
+    # Floor
+    floor = [int(e) for e in exact]
+    deficit = target - sum(floor)
+    if deficit <= 0:
+        return floor
+
+    # Distribute deficit to largest remainders
+    remainders = [(exact[i] - floor[i], i) for i in range(len(counts))]
+    remainders.sort(reverse=True)
+    for k in range(deficit):
+        floor[remainders[k % len(counts)][1]] += 1
+    return floor
+
+
+def _dtw_align_insert(
+    ref_chars: list[str],
+    asr_words: list[str],
+    asr_ts: list[list[float]],
+) -> tuple[list[str], list[list[float]]]:
+    """DTW that INSERTS missing ref chars by splitting ASR timestamps.
+
+    When ``len(ref) > len(asr)`` (ASR undercounted), the missing ref chars
+    are inserted into the output by splitting the adjacent ASR char's
+    timestamp. This gives ROSVOT correct char-level timing for every
+    reference char.
+
+    Returns ``(out_words, out_ts)`` where ``len(out_words) == len(ref_chars)``.
+    """
+    M, N = len(ref_chars), len(asr_words)
+    if N == 0:
+        return [], []
+    if M == 0:
+        return list(asr_words), asr_ts
+    if M == N:
+        # Equal: simple 1:1 DTW (replace identity only)
+        words = _ForceAlignLyricTranscriber._dtw_align(ref_chars, asr_words)
+        return words, [list(ts) for ts in asr_ts]
+
+    # M > N: need to insert M-N chars. Use DTW to find where.
+    INF = float("inf")
+    dp = [[INF] * (N + 1) for _ in range(M + 1)]
+    back = [[None] * (N + 1) for _ in range(M + 1)]
+    dp[0][0] = 0
+    for i in range(M + 1):
+        for j in range(N + 1):
+            if i == 0 and j == 0:
+                continue
+            if i > 0 and j > 0:
+                cost = 0 if ref_chars[i - 1] == asr_words[j - 1] else 1
+                if dp[i - 1][j - 1] + cost < dp[i][j]:
+                    dp[i][j] = dp[i - 1][j - 1] + cost
+                    back[i][j] = ("sub", i - 1, j - 1)
+            if i > 0:
+                if dp[i - 1][j] + 1 < dp[i][j]:
+                    dp[i][j] = dp[i - 1][j] + 1
+                    back[i][j] = ("ins", i - 1, j)
+            if j > 0:
+                if dp[i][j - 1] + 1 < dp[i][j]:
+                    dp[i][j] = dp[i][j - 1] + 1
+                    back[i][j] = ("del", i, j - 1)
+
+    # Trace back
+    ops = []
+    i, j = M, N
+    while i > 0 or j > 0:
+        op, pi, pj = back[i][j]
+        ops.append((op, pi, pj))
+        i, j = pi, pj
+    ops.reverse()
+
+    # Build output: every ref char gets an output entry. 'ins' chars
+    # borrow timing from the PREVIOUS 'sub' char (split in half).
+    out_words: list[str] = []
+    out_ts: list[list[float]] = []
+
+    for op, pi, pj in ops:
+        if op == "sub":
+            out_words.append(ref_chars[pi])
+            out_ts.append(list(asr_ts[pj]))
+        elif op == "ins":
+            # Insert ref char, split previous ASR char's timestamp
+            out_words.append(ref_chars[pi])
+            if out_ts:
+                prev_s, prev_e = out_ts[-1]
+                mid = (prev_s + prev_e) / 2.0
+                out_ts[-1] = [prev_s, mid]
+                out_ts.append([mid, prev_e])
+            else:
+                # No previous — borrow from next (will be fixed by _build_words_with_gaps)
+                out_ts.append([0.0, 0.0])
+        elif op == "del":
+            # This shouldn't happen when M > N, but handle gracefully
+            out_words.append(ref_chars[min(pi, M - 1)])
+            out_ts.append(list(asr_ts[pj]))
+
+    return out_words, out_ts
 
 
 def transcribe_audio(audio, sample_rate: int | None = None,
                      language: str = "Mandarin",
-                     max_merge_duration: int = 30000) -> str:
+                     max_merge_duration: int = 30000,
+                     reference_lyrics: str | None = None,
+                     return_lyrics: bool = False,
+                     merge_held_notes: bool = True,
+                     merge_repeated_chars: bool = True):
     """Transcribe audio to MIDI JSON using SoulX-Singer preprocessing.
 
     Args:
@@ -578,15 +1515,35 @@ def transcribe_audio(audio, sample_rate: int | None = None,
         sample_rate: Required only when audio is a bare numpy array.
         language: Lyric language — "Mandarin", "English", or "Cantonese".
         max_merge_duration: Max segment merge duration in ms.
+        reference_lyrics: Optional reference lyrics to force text accuracy to
+            100%. When provided, ASR decoding is biased (via Paraformer
+            ``hotword``) and post-aligned (via char-level DTW) so the output
+            text exactly matches the reference. SPs / pitch / duration / f0 /
+            melisma structure are still driven by the audio — only the *text*
+            identity of each token is replaced. Punctuation/whitespace in the
+            reference are stripped (they only serve as semantic slicing hints
+            for the user's own reading; SP placement is audio-driven).
+        return_lyrics: When True, returns ``(midi_json, lyrics_text)`` tuple
+            where ``lyrics_text`` is the pre-ROSVOT lyrics (one char per
+            syllable, no melisma duplications) with ``<SP>`` tokens replaced by
+            newlines. Default False for backward compatibility (returns MIDI
+            JSON string only).
 
     Returns:
-        MIDI JSON string.
+        MIDI JSON string by default, or ``(midi_json, lyrics_text)`` tuple
+        when ``return_lyrics=True``.
     """
-    metadata_list = _preprocess_audio_to_metadata(
+    metadata_list, lyrics_text = _preprocess_audio_to_metadata(
         audio, sample_rate=sample_rate, language=language,
         max_merge_duration=max_merge_duration,
+        reference_lyrics=reference_lyrics,
+        merge_held_notes=merge_held_notes,
+        merge_repeated_chars=merge_repeated_chars,
     )
-    return metadata_to_midi_json(metadata_list)
+    midi_json = metadata_to_midi_json(metadata_list)
+    if return_lyrics:
+        return midi_json, lyrics_text
+    return midi_json
 
 
 def _validate_metadata_items(metadata_list) -> list[dict]:
@@ -685,11 +1642,13 @@ def _resolve_prompt_metadata(prompt_metadata, fallback_audio,
         if coerced:
             return coerced
         # Blank/empty -> treat as "not provided" and auto-preprocess.
+    # _preprocess_audio_to_metadata returns (metadata, lyrics_text); we only
+    # need the metadata for prompt purposes.
     return _preprocess_audio_to_metadata(
         fallback_audio,
         sample_rate=fallback_sample_rate,
         language=fallback_language,
-    )
+    )[0]
 
 
 def synthesize_audio(midi_json_str: str, prompt_audio,
