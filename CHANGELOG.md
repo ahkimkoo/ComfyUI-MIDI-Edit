@@ -31,6 +31,13 @@ All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
   传一个合法值）；patched infer 同时识别 `control="hybrid"`（供单测直接调用）。
   效果取决于模型对双信号同时非零的响应，视为实验性。
 
+- **Score 模式自动子音符拆分（contour preservation）**。score 模式用单个
+  `note_pitch` 合成，丢失音符内部的 f0 走向（实测 63% 的音符内部变化 > 2 半音），
+  导致合成旋律变平、听起来走调。现在 score 模式合成前会自动把 f0 走向大的音符
+  （跨度 ≥ 2 半音）拆成 2 个子音符，每个子音符的 pitch 取该段 f0 中位数，形成
+  阶梯近似。第二个子音符 `note_type=3`（续音）防止模型重新咬字。仅拆 target，
+  不拆 prompt（音色参考保持原样）。仅对 score 模式生效，melody/hybrid 不受影响。
+
 
 ## [2026-07-27] v3.4.1
 
