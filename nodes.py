@@ -289,6 +289,9 @@ class MidiLyricsAlignment:
                 "speed": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.1}),
                 "normalize_digits": ("BOOLEAN", {"default": True}),
                 "force_tone4": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "preserve_sp": ("BOOLEAN", {"default": False, "label_on": "ON", "label_off": "OFF"}),
             }
         }
 
@@ -298,7 +301,8 @@ class MidiLyricsAlignment:
     CATEGORY = "MIDI"
 
     def align_lyrics(self, midi_json, lyrics, speed=1.0,
-                     normalize_digits=True, force_tone4=False):
+                     normalize_digits=True, force_tone4=False,
+                     preserve_sp=False):
         midi_json = "" if midi_json is None else str(midi_json)
         lyrics = "" if lyrics is None else str(lyrics)
 
@@ -330,6 +334,7 @@ class MidiLyricsAlignment:
                     track, track_lyrics, weights,
                     normalize_digits, force_tone4,
                     punctuate_fn=_restore_punctuation,
+                    preserve_sp=preserve_sp,
                 )
             except ValueError as e:
                 return (f"Error: {e}", "")
@@ -402,6 +407,14 @@ class MIDITranscribeAudio:
         "note) is merged to 沧, but 哥哥 (a real word) is kept. Duration "
         "is combined; the first note's pitch is kept. Turn OFF to keep all "
         "repeated characters.\n\n"
+        "Pitch correction (always ON): after ROSVOT quantization, each "
+        "non-SP note's pitch is re-derived from the median of its voiced "
+        "f0 frames. When this differs from ROSVOT's note_pitch by ≥ 2 "
+        "semitones (a gross quantization error, common at phrase-ending "
+        "long notes and vibrato/glissando positions), the f0-derived MIDI "
+        "number replaces it. This prevents out-of-tune synthesis in "
+        "control=score mode (control=melody uses f0 directly and is "
+        "unaffected). SP notes and notes with < 3 voiced frames are skipped.\n\n"
         "lyrics_text output: the *pre-ROSVOT* lyrics (one char per syllable, "
         "no melisma duplications) with `<SP>` tokens replaced by newlines."
     )

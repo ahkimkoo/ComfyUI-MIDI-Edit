@@ -178,7 +178,8 @@ def calculate_spd(orig_sp_durations: list[float], orig_total: int,
 
 
 def align_track(track, lyrics_text: str, weights, normalize_digits_flag: bool,
-                force_tone4: bool, punctuate_fn=None) -> tuple:
+                force_tone4: bool, punctuate_fn=None,
+                preserve_sp: bool = False) -> tuple:
     """主入口：把新歌词对齐到单个 track。
 
     Args:
@@ -188,10 +189,18 @@ def align_track(track, lyrics_text: str, weights, normalize_digits_flag: bool,
         normalize_digits_flag: 是否把阿拉伯数字转中文数字字。
         force_tone4: 是否对高音中文音素强制改四声。
         punctuate_fn: 可选的 CT-Transformer 标点函数，用于智能断句。
+        preserve_sp: 当 True 时，保留原曲 SP 结构（位置/时长/f0），只替换
+            非 SP token 的 text/phoneme。新歌词按累计比例匹配分配到各
+            section。pitch/duration/f0 全部继承原 token。
 
     Returns:
         (新 Track, warnings: list[str])。
     """
+    if preserve_sp:
+        return _align_track_preserve_sp(
+            track, lyrics_text, normalize_digits_flag, force_tone4,
+            punctuate_fn,
+        )
     warnings: list[str] = []
 
     # ---- 1. 分离原 SP / 非 SP token ----
@@ -362,7 +371,282 @@ def align_track(track, lyrics_text: str, weights, normalize_digits_flag: bool,
 
 
 # ---------------------------------------------------------------------------
-# 内部工具
+# preserve_sp 模式：保留原曲 SP 结构，只替换文字
+# ---------------------------------------------------------------------------
+
+
+def _align_track_preserve_sp(
+    track, lyrics_text: str, normalize_digits_flag: bool,
+    force_tone4: bool, punctuate_fn=None,
+) -> tuple:
+    """保留原曲 SP 结构的对齐模式。
+
+    与标准 align_track 的区别：
+    - 保留原曲所有 SP token 的位置/时长/f0（不重建）
+    - 保留原曲每个非 SP token 的 pitch/duration/f0（只换 text/phoneme）
+    - 保留原曲 time 字段
+    - 新歌词按累计比例匹配分配到各 section（原 SP 之间的区域）
+
+    适用于改歌词后用 ``control="melody"`` 合成的场景：原曲旋律完全保留，
+    只换歌词文字，不会出现 SP 重建导致的异常停顿。
+    """
+    warnings: list[str] = []
+    orig_tokens = track.tokens
+
+    # ---- 1. 解析新歌词 → 扁平字符列表 ----
+    text = lyrics_text or ""
+    if normalize_digits_flag:
+        text = normalize_digits(text)
+    sentences = segment_sentences(text, punctuate_fn=punctuate_fn)
+    sentences = [s for s in sentences if s.strip()]
+    if not sentences:
+        raise ValueError("empty lyrics after normalization")
+
+    char_units: list[dict] = []
+    for sent in sentences:
+        char_units.extend(_build_units(sent))
+    C = len(char_units)
+    if C == 0:
+        raise ValueError("no chars in new lyrics")
+
+    # ---- 2. 识别原曲 sections（SP 之间的非 SP token 组）----
+    # sections[i] = list of (track_token_idx, nonsl_idx)
+    sections: list[list[tuple[int, int]]] = []
+    current: list[tuple[int, int]] = []
+    nonsl_idx = 0
+    for i, t in enumerate(orig_tokens):
+        if t.is_sp:
+            if current:
+                sections.append(current)
+                current = []
+        else:
+            current.append((i, nonsl_idx))
+            nonsl_idx += 1
+    if current:
+        sections.append(current)
+
+    if not sections:
+        # 无非 SP token，原样返回
+        return track, warnings
+
+    # ---- 3. 累计比例匹配：把新字符分配到各 section ----
+    section_sizes = [len(s) for s in sections]
+    total_tokens = sum(section_sizes)
+
+    # 按比例分配字数
+    exact = [C * sz / total_tokens for sz in section_sizes]
+    char_counts = [max(1, round(e)) for e in exact]
+    _adjust_to_sum(char_counts, C)
+
+    # ---- 4. 逐 section 映射字符 → token ----
+    # token_text_map: {track_token_idx: (text, phoneme)}
+    token_text_map: dict[int, tuple[str, str]] = {}
+    char_pos = 0
+
+    for sec_idx, section in enumerate(sections):
+        n_chars = char_counts[sec_idx]
+        sec_chars = char_units[char_pos:char_pos + n_chars]
+        char_pos += n_chars
+        if not sec_chars:
+            continue
+
+        # 该 section 的原始 token
+        sec_token_indices = [ti for ti, _ in section]
+        sec_orig_tokens = [orig_tokens[ti] for ti in sec_token_indices]
+        M = len(sec_orig_tokens)
+        N = len(sec_chars)
+
+        # 构建该 section 的 slots（连续相同字合并）
+        sec_slots = _build_section_aware_slots_for_tokens(sec_orig_tokens)
+        S = len(sec_slots)
+
+        if N <= S:
+            # Collapse 模式：左对齐，slot 内多 token 时复制
+            for slot_idx in range(S):
+                if slot_idx < N:
+                    cu = sec_chars[slot_idx]
+                    for li in sec_slots[slot_idx][2]:
+                        ti = sec_token_indices[li]
+                        token_text_map[ti] = (cu["text"], cu["phoneme"])
+                # else: no mapping (trailing extras)
+        else:
+            # 字数 > token 数：贪心压缩（按 duration 比例分配多字到一个 token）
+            pack = _compute_pack(sec_chars, sec_orig_tokens)
+            ci = 0
+            for tok_idx, cnt in enumerate(pack):
+                for _ in range(cnt):
+                    if ci < N:
+                        cu = sec_chars[ci]
+                        ti = sec_token_indices[tok_idx]
+                        token_text_map[ti] = (cu["text"], cu["phoneme"])
+                        ci += 1
+
+    # ---- 5. 构建输出 token 列表 ----
+    # 遍历原曲 token：SP 保留，非 SP 替换文字或清空
+    new_tokens: list[Token] = []
+    prev_non_sp_text = ""
+
+    for i, orig_token in enumerate(orig_tokens):
+        if orig_token.is_sp:
+            new_tokens.append(Token(
+                text="<SP>", phoneme="<SP>",
+                duration=orig_token.duration,
+                note_pitch=0, note_type=1,
+                index=len(new_tokens),
+            ))
+            prev_non_sp_text = ""
+        elif i in token_text_map:
+            text_val, pho_val = token_text_map[i]
+            # note_type: 重复非叠词=3, 其余=2
+            nt = _note_type({"text": text_val}, prev_non_sp_text)
+            new_tokens.append(Token(
+                text=text_val, phoneme=pho_val,
+                duration=orig_token.duration,
+                note_pitch=orig_token.note_pitch,
+                note_type=nt,
+                index=len(new_tokens),
+            ))
+            prev_non_sp_text = text_val
+        else:
+            # 无映射（多余原 token）：标记为空，后续重新分配 duration
+            new_tokens.append(Token(
+                text="", phoneme="",
+                duration=orig_token.duration,
+                note_pitch=orig_token.note_pitch,
+                note_type=orig_token.note_type,
+                index=len(new_tokens),
+            ))
+
+    # ---- 6. 重新分配空 token 的 duration ----
+    # 在同一 section（SP 之间）内，把空 token 的 duration 分给已填 token
+    _redistribute_empty_durations(new_tokens)
+
+    # ---- 7. force_tone4 ----
+    if force_tone4:
+        new_tokens = _apply_force_tone4(new_tokens, TONE4_THRESHOLD)
+
+    # ---- 8. 保留原曲 f0 和 time ----
+    result_track = type(track)(
+        tokens=new_tokens, meta=dict(track.meta), f0=track.f0,
+    )
+    return result_track, warnings
+
+
+def _adjust_to_sum(counts: list[int], target: int) -> None:
+    """调整 counts 的元素使其总和等于 target（就地修改）。"""
+    diff = target - sum(counts)
+    if diff == 0:
+        return
+    if diff > 0:
+        # 加到末尾的 section（通常对应歌曲末尾，多给几个字更自然）
+        counts[-1] += diff
+    else:
+        # 从末尾减（保持至少 1）
+        for i in range(len(counts) - 1, -1, -1):
+            if counts[i] > 1 and diff < 0:
+                reduce = min(counts[i] - 1, -diff)
+                counts[i] -= reduce
+                diff += reduce
+                if diff == 0:
+                    break
+
+
+def _build_section_aware_slots_for_tokens(tokens: list) -> list[tuple[str, int, list[int]]]:
+    """把一组连续非 SP token 按相同字合并成 slot。
+
+    与 _build_section_aware_slots 类似，但输入是单个 section 的 token 列表
+    （不含 SP，不需要跨 SP 边界处理）。
+    """
+    if not tokens:
+        return []
+    slots: list[tuple[str, int, list[int]]] = []
+    cur_char = tokens[0].text
+    cur_indices: list[int] = [0]
+    for i in range(1, len(tokens)):
+        if tokens[i].text == cur_char:
+            cur_indices.append(i)
+        else:
+            slots.append((cur_char, len(cur_indices), cur_indices))
+            cur_char = tokens[i].text
+            cur_indices = [i]
+    slots.append((cur_char, len(cur_indices), cur_indices))
+    return slots
+
+
+def _redistribute_empty_durations(tokens: list) -> None:
+    """在同一 section（SP 分隔）内，把空 token 的 duration 分配给已填 token。
+
+    规则：
+    - 如果 section 内有已填 token：空 token 的 duration 均分给已填 token
+    - 如果 section 内全部为空：把空 section 的 duration 合并到相邻 SP
+    - 空 token 从输出中移除
+    """
+    if not tokens:
+        return
+
+    # 找到 section 边界（SP 之间的区域）
+    sections: list[list[int]] = []  # each section = list of token indices
+    current: list[int] = []
+    for i, t in enumerate(tokens):
+        if t.text == "<SP>":
+            if current:
+                sections.append(current)
+                current = []
+        else:
+            current.append(i)
+    if current:
+        sections.append(current)
+
+    # 收集要删除的索引
+    to_remove: set[int] = set()
+
+    for sec in sections:
+        filled = [i for i in sec if tokens[i].text]
+        empty = [i for i in sec if not tokens[i].text]
+        if not filled:
+            # 全空 section：把 duration 给前一个 SP
+            empty_dur = sum(tokens[i].duration for i in empty)
+            # 找到 section 前面的 SP
+            if sec:
+                first_idx = sec[0]
+                for j in range(first_idx - 1, -1, -1):
+                    if tokens[j].text == "<SP>":
+                        tokens[j] = Token(
+                            tokens[j].text, tokens[j].phoneme,
+                            tokens[j].duration + empty_dur,
+                            tokens[j].note_pitch, tokens[j].note_type,
+                            tokens[j].index,
+                        )
+                        break
+            to_remove.update(empty)
+        elif empty:
+            # 有填充 + 有空：空 duration 均分给填充 token
+            total_empty = sum(tokens[i].duration for i in empty)
+            n = len(filled)
+            for k, fi in enumerate(filled):
+                if k < n - 1:
+                    tokens[fi] = Token(
+                        tokens[fi].text, tokens[fi].phoneme,
+                        tokens[fi].duration + total_empty / n,
+                        tokens[fi].note_pitch, tokens[fi].note_type,
+                        tokens[fi].index,
+                    )
+                else:
+                    # 最后一个取余数（避免浮点误差）
+                    tokens[fi] = Token(
+                        tokens[fi].text, tokens[fi].phoneme,
+                        tokens[fi].duration + total_empty - total_empty / n * (n - 1),
+                        tokens[fi].note_pitch, tokens[fi].note_type,
+                        tokens[fi].index,
+                    )
+            to_remove.update(empty)
+
+    # 移除空 token，重建 index
+    if to_remove:
+        tokens[:] = [t for i, t in enumerate(tokens) if i not in to_remove]
+        for i, t in enumerate(tokens):
+            tokens[i] = Token(t.text, t.phoneme, t.duration,
+                            t.note_pitch, t.note_type, i)
 # ---------------------------------------------------------------------------
 
 

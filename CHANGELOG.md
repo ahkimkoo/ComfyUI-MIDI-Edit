@@ -3,6 +3,83 @@
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
 
+## [2026-07-27] v3.4.1
+
+### Fixed
+
+- **`MIDI Transcribe Audio` 修复 ROSVOT 偶发音高量化错误（score 模式走调）**。
+  ROSVOT 在乐句末尾长音、颤音/滑音位置偶尔把 `note_pitch` 量化到错误的
+  MIDI 数（实测最大偏差 +3.86 半音）。`MIDI Synthesize Audio (control=score)`
+  直接读 `note_pitch` 合成，导致这些位置严重走调（用户报告的"的天涯" /
+  "地开花" / "的泪花" 变调全部命中偏差 ≥ 1.9 半音的位置）。`control=melody`
+  模式用 f0 真实音高合成，不受影响。
+
+  新增 `_correct_pitch_from_f0` 后处理：对每个非 SP 音符，取其时长窗口内
+  voiced f0 中位数转 MIDI 数，若与 `note_pitch` 偏差 ≥ 2 半音则替换。跳过
+  SP（`note_pitch==0`）和 voiced 帧 < 3 的不可信位置。阈值硬编码 2 半音，
+  FPS=50（与 SVS data_processor 一致）。
+
+  在 segment 1 实测数据上验证：纠正 8/69 个非 SP 音符，纠正后剩余最大
+  |Δsemi| = 1.408（< 1.5），且不引入任何新的 ≥ 2 半音偏差。该步骤在
+  `convert_metadata`（f0 已写入）和 `_merge_invalid_repeated_chars`（note
+  列表已定型）之后执行，ref / non-ref 两条流水线均覆盖。
+
+
+## [2026-07-24] v3.4.0
+
+### Added
+
+- **`MidiLyricsAlignment` 新增 `preserve_sp` 可选输入**（BOOLEAN，默认 OFF）。
+  开启时进入**保留原曲 SP 模式**：保留原曲所有 `<SP>` 的位置/时长/f0，
+  保留原曲每个非 SP token 的 pitch/duration/f0，**只替换 text/phoneme**。
+
+  解决了改词后合成的两个核心问题：
+  1. **异常停顿**：标准模式丢弃原曲 SP 并重建，SP 数量和时长变化导致
+     合成时出现莫名停顿。preserve_sp 模式保留原曲 SP，停顿与原曲一致。
+  2. **melody 变调**：`MIDIEditLyrics` 的 Collapse 右对齐导致新字继承
+     不同位置 token 的 pitch，melody 合成时变调（尤其尾音）。
+     preserve_sp 模式同位置继承 pitch，旋律完全保留。
+
+  **累计比例匹配**分配新歌词到原曲各 section（原 SP 之间的区域）：
+  按各 section 的非 SP token 数比例分配新字数，自动处理新歌词与原曲
+  字数/断句不一致的场景。section 内使用 Collapse（重复字复制）+
+  Distribute（多字分配）+ Expand（拆分长 token）三模式自动适配。
+
+  f0 和 time 字段完全保留原曲，不做任何重建。总时长守恒。
+
+### Changed
+
+- **`MIDI Transcribe Audio` 的 `merge_held_notes`**（原 `fix_held_note_sps`）
+  重命名为更直观的名称。功能不变：合并 ROSVOT 在持续音中插入的 `<SP>`。
+
+- **`MIDI Transcribe Audio` 新增 `merge_repeated_chars`**（BOOLEAN，默认 ON）。
+  合并无效重复字（melisma 导致的连续相同字），duration 累加。
+  参考歌词优先：有参考歌词时按歌词中该字的最大连续出现次数保留；
+  无参考歌词时查 `models/reduplication-verbs.txt`（619 条 AA 形式叠词），
+  在词库内保留 2 个、不在词库保留 1 个。
+
+- **全局 DTW 参考分配**：`MIDI Transcribe Audio` 的两遍管线从比例分配
+  改为全局 DTW 对齐分配参考歌词到各 segment。解决了 ASR 各段漏检率不
+  均匀时参考歌词错位的问题（原曲有 132 字，ASR 检测 97 字 → 各段参考
+  分配从 `[31,30,31,32,8]` 修正为 `[23,23,23,23,40]`）。
+
+- **`models/reduplication-verbs.txt`** 整理为 619 条纯 AA 形式叠词
+  （从原始 735 条混合格式提取，去重、合并 `_REDUP_WORDS` 硬编码表）。
+
+### Fixed
+
+- **`_merge_invalid_repeated_chars` 索引 bug**：合并函数使用相对索引
+  而非绝对索引，导致 run 起始位置 `i > 0` 时删除错误位置的 token。
+
+### Verified
+
+- 沧海笑（30s 中文歌）：preserve_sp 模式下 SP 数量/时长/总时长与原曲
+  完全一致。改词后 pitch 同位置继承，无移位。
+- 人生不过一场体验（58s 中文歌）：全局 DTW 分配 132 字参考歌词到
+  5 个 ASR segment（97 字），lyrics_text 100% 匹配参考歌词。
+- 184 个现有测试全部通过。
+
+
 ## [2026-07-20] v3.3.0
 
 ### Added

@@ -11,6 +11,7 @@ Usage from HTTP API server:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -907,6 +908,68 @@ def _merge_invalid_repeated_chars(metadata: dict, wordlist: frozenset[str],
               f"{metadata.get('item_name', '?')}")
 
 
+def _correct_pitch_from_f0(metadata: dict) -> None:
+    """修正 ROSVOT 量化到错误 MIDI 音高的明显错误。就地改 ``metadata["note_pitch"]``。
+
+    对每个非 SP 音符，取其时长窗口内 voiced f0 中位数，转 MIDI 数；
+    若与 ``note_pitch`` 偏差 ≥ ``THRESHOLD`` 半音，替换。ROSVOT 在乐句末尾长音、
+    颤音/滑音位置容易选错 pitch（实测最大偏差 +3.86 半音），score-mode
+    合成直接读 ``note_pitch`` 导致走调。melody 模式用 f0 不受影响。
+
+    Skips:
+
+    - ``note_pitch == 0`` (SP) — silence, no score impact.
+    - voiced frames < 3 — too few samples to trust the median.
+    - missing fields or ``len(note_pitch) != len(duration)`` — bail out silently
+      (must run AFTER :func:`_merge_invalid_repeated_chars`, which can trim the
+      note arrays; otherwise frame-index mapping would be off).
+
+    Threshold is hardcoded at 2 semitones (not exposed as a node parameter).
+    FPS is fixed at 50 (``core.midi_format.FPS``), matching the SVS data_processor
+    so duration→frame mapping is consistent with how f0 was sampled.
+    """
+    from core.midi_format import FPS
+
+    THRESHOLD = 2
+
+    note_pitch_raw = metadata.get("note_pitch")
+    duration_raw = metadata.get("duration")
+    f0_str = metadata.get("f0", "")
+    if note_pitch_raw is None or duration_raw is None or not f0_str:
+        return
+
+    note_pitch = [int(x) for x in (note_pitch_raw.split() if isinstance(note_pitch_raw, str) else note_pitch_raw)]
+    duration = [float(x) for x in (duration_raw.split() if isinstance(duration_raw, str) else duration_raw)]
+    f0 = [float(x) for x in f0_str.split()]
+    if len(note_pitch) != len(duration):
+        return
+
+    cum_frame = 0
+    n_corrected = 0
+    for i in range(len(note_pitch)):
+        n_frames = int(round(duration[i] * FPS))
+        start, end = cum_frame, min(cum_frame + n_frames, len(f0))
+        cum_frame += n_frames
+        if note_pitch[i] == 0:
+            continue
+        voiced = [x for x in f0[start:end] if x > 0]
+        if len(voiced) < 3:
+            continue
+        f0_median = sorted(voiced)[len(voiced) // 2]
+        f0_midi = round(69 + 12 * math.log2(f0_median / 440.0))
+        if abs(f0_midi - note_pitch[i]) >= THRESHOLD:
+            note_pitch[i] = f0_midi
+            n_corrected += 1
+
+    if n_corrected:
+        if isinstance(note_pitch_raw, str):
+            metadata["note_pitch"] = " ".join(str(x) for x in note_pitch)
+        else:
+            metadata["note_pitch"] = note_pitch
+        print(f"[MIDI-Edit] Corrected {n_corrected} gross pitch error(s) from f0 median "
+              f"(threshold={THRESHOLD} semitones) for {metadata.get('item_name', '?')}")
+
+
 def _build_lyrics_text(captured_segment_words: list[list[str]]) -> str:
     """Build a single lyrics-text string from captured per-segment word lists.
 
@@ -1195,6 +1258,13 @@ def _preprocess_audio_to_metadata(audio, sample_rate: int | None = None,
                 "check that the audio actually contains vocals."
             )
 
+    # Pitch correction: fix gross ROSVOT quantization errors using f0 median.
+    # Must run AFTER convert_metadata (so f0 is populated) and AFTER any
+    # note-merging post-processing (so frame mapping matches the final note
+    # list). Applies to both ref (two-pass) and non-ref pipeline outputs.
+    for meta in metadata_list:
+        _correct_pitch_from_f0(meta)
+
     lyrics_text = (
         _build_lyrics_text(wrapper.captured_segment_words)
         if wrapper is not None else ""
@@ -1281,25 +1351,56 @@ def _run_two_pass_pipeline(pipeline, audio_path, save_dir, language,
         print(f"[MIDI-Edit] Two-pass seg={os.path.basename(wav_fn)}: "
               f"ASR ({len(asr_words)} chars): {' '.join(asr_words)}")
 
-    # ---- Distribute reference chars proportionally ----
+    # ---- Distribute reference chars via GLOBAL DTW alignment ----
     asr_counts = [len(r[1]) for r in asr_results]
     total_asr = sum(asr_counts)
     total_ref = len(ref_chars)
-    adjusted_counts = _proportional_distribute(asr_counts, total_ref)
+
+    # Proportional distribution (by ASR char count) fails when ASR undercounts
+    # unevenly across segments. Instead, concatenate all ASR text, DTW-align
+    # it against the full reference, then use the alignment to determine
+    # per-segment reference boundaries.
+    all_asr_words: list[str] = []
+    asr_seg_boundaries: list[int] = []  # cumulative char count at end of each seg
+    for _, words, _ in asr_results:
+        all_asr_words.extend(words)
+        asr_seg_boundaries.append(len(all_asr_words))
+
+    # Global DTW: all_asr_words vs ref_chars
+    # Returns asr_to_ref[i] = reference position that ASR char i maps to
+    asr_to_ref = _global_dtw_mapping(all_asr_words, list(ref_chars))
+
+    # Determine per-segment ref boundaries from the global mapping
+    seg_ref_slices: list[str] = []
+    prev_asr = 0
+    prev_ref_end = 0
+    for b in asr_seg_boundaries:
+        # Find the max ref position reached by this segment's ASR chars
+        seg_asr_indices = range(prev_asr, b)
+        seg_max_ref = max((asr_to_ref[i] for i in seg_asr_indices
+                           if i < len(asr_to_ref) and asr_to_ref[i] >= 0),
+                          default=prev_ref_end)
+        end_ref = min(seg_max_ref + 1, total_ref)
+        end_ref = max(end_ref, prev_ref_end + 1)  # ensure forward progress
+        seg_ref_slices.append(ref_chars[prev_ref_end:end_ref])
+        prev_ref_end = end_ref
+        prev_asr = b
+
+    # Last segment gets all remaining ref chars
+    if seg_ref_slices and prev_ref_end < total_ref:
+        seg_ref_slices[-1] += ref_chars[prev_ref_end:]
+
+    adjusted_counts = [len(s) for s in seg_ref_slices]
     print(f"[MIDI-Edit] Two-pass: ASR counts={asr_counts} (total={total_asr}), "
-          f"ref={total_ref}, adjusted={adjusted_counts}")
+          f"ref={total_ref}, global-DTW adjusted={adjusted_counts}")
 
     # ---- Pass 2: DTW + note_transcriber per segment ----
-    ref_pos = 0  # reset for actual ref consumption
     metadata = []
     wrapper.captured_segment_words = []  # reset capture
     wrapper.diagnostics = []
 
-    for (seg, asr_words, asr_ts), n_ref in zip(asr_results, adjusted_counts):
+    for (seg, asr_words, asr_ts), seg_ref in zip(asr_results, seg_ref_slices):
         wav_fn = seg["wav_fn"]
-        # Slice ref by ADJUSTED count (not ASR count)
-        seg_ref = ref_chars[ref_pos:ref_pos + n_ref]
-        ref_pos += len(seg_ref)
 
         # DTW with INSERT for 'ins' ops
         if len(seg_ref) > len(asr_words):
@@ -1385,6 +1486,67 @@ def _run_two_pass_pipeline(pipeline, audio_path, save_dir, language,
         print(f"[MIDI-Edit] ForceAlign: corrected {n_fixed} char(s) via DTW")
 
     return final_metadata
+
+
+def _global_dtw_mapping(asr_words: list[str],
+                         ref_chars: list[str]) -> list[int]:
+    """Global DTW alignment: map each ASR char to its reference position.
+
+    Returns a list ``asr_to_ref`` of length ``len(asr_words)`` where
+    ``asr_to_ref[i]`` is the 0-based index in ``ref_chars`` that ASR char
+    ``i`` best aligns to. ``-1`` means the ASR char has no ref match (extra).
+
+    This is used to determine per-segment reference boundaries: for each
+    segment, the reference slice is ``ref[0:max_ref_pos_in_segment]`` minus
+    what previous segments consumed.
+    """
+    M, N = len(ref_chars), len(asr_words)
+    if N == 0 or M == 0:
+        return [-1] * N
+
+    INF = float("inf")
+    dp = [[INF] * (N + 1) for _ in range(M + 1)]
+    back = [[None] * (N + 1) for _ in range(M + 1)]
+    dp[0][0] = 0
+    for i in range(M + 1):
+        for j in range(N + 1):
+            if i == 0 and j == 0:
+                continue
+            if i > 0 and j > 0:
+                cost = 0 if ref_chars[i - 1] == asr_words[j - 1] else 1
+                if dp[i - 1][j - 1] + cost < dp[i][j]:
+                    dp[i][j] = dp[i - 1][j - 1] + cost
+                    back[i][j] = ("sub", i - 1, j - 1)
+            if i > 0:
+                if dp[i - 1][j] + 1 < dp[i][j]:
+                    dp[i][j] = dp[i - 1][j] + 1
+                    back[i][j] = ("ins", i - 1, j)
+            if j > 0:
+                if dp[i][j - 1] + 1 < dp[i][j]:
+                    dp[i][j] = dp[i][j - 1] + 1
+                    back[i][j] = ("del", i, j - 1)
+
+    # Trace back and build asr_to_ref mapping
+    asr_to_ref = [-1] * N
+    i, j = M, N
+    while i > 0 or j > 0:
+        op, pi, pj = back[i][j]
+        if op == "sub":
+            asr_to_ref[pj] = pi
+        elif op == "del":
+            # ASR char with no ref match — assign nearest ref
+            asr_to_ref[pj] = min(pi, M - 1) if M > 0 else -1
+        i, j = pi, pj
+
+    # Fill gaps: for any remaining -1, use the previous known ref position
+    last_ref = 0
+    for k in range(N):
+        if asr_to_ref[k] >= 0:
+            last_ref = asr_to_ref[k]
+        else:
+            asr_to_ref[k] = last_ref
+
+    return asr_to_ref
 
 
 def _proportional_distribute(counts: list[int], target: int) -> list[int]:
