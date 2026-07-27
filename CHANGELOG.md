@@ -3,6 +3,35 @@
 All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
 
+## [2026-07-27] v3.4.2
+
+### Added
+
+- **`MIDI Synthesize Audio` 新增 `hybrid` 控制模式（实验性）**。SoulX-Singer 的
+  `control` 原本二选一：`score` 用离散 `note_pitch`（吐字清楚但音符内部 f0 走向
+  丢失 → 可能变调）；`melody` 用连续 `f0` 曲线（音高走向正确但吐字易糊）。模型
+  架构上 `note_pitch_encoder` 与 `f0_encoder` 的输出是**相加**的
+  （`soulxsinger/models/soulxsinger.py:179-183`），同时给两个非零信号是被架构
+  允许的，只是上游 `cli/inference.py` 强制把其中一个置零。
+
+  `hybrid` 模式**同时**把 `note_pitch` 和 `f0` 喂给模型，兼得两者优点：note_pitch
+  保留吐字清晰度，f0 曲线保留音符内部音高走向。最适合"从人声源改歌词"的场景
+  （两个信号都有意义）。
+
+  实现上**不修改 `SoulX-Singer/` 子模块**：在 `core/soulsx_singer.py` 通过
+  `_enable_hybrid_mode(model)` 幂等地 monkey-patch `model.infer`，配对
+  `_disable_hybrid_mode(model)` 在 `synthesize_audio` 的 `finally` 块中恢复原始
+  infer（即使异常也不会污染单例 model 状态）。hybrid 分支与上游 `infer` 逐行一致
+  （仅 control 分支改为同时提取两信号）；`score`/`melody` 原样委托给原始 infer，
+  行为零变化。auto_shift 在 hybrid 下用 note_pitch 中位数（与 score 一致）；缺失
+  信号时用 zeros 优雅降级，不报错。
+
+  注意：上游 `cli.inference.process` 校验 `args.control ∈ {melody, score}`，会
+  拒绝 `hybrid`，因此实际通过 `model._hybrid_requested` 标志激活（`args.control`
+  传一个合法值）；patched infer 同时识别 `control="hybrid"`（供单测直接调用）。
+  效果取决于模型对双信号同时非零的响应，视为实验性。
+
+
 ## [2026-07-27] v3.4.1
 
 ### Fixed

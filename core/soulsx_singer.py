@@ -1813,6 +1813,209 @@ def _resolve_prompt_metadata(prompt_metadata, fallback_audio,
     )[0]
 
 
+# ---------------------------------------------------------------------------
+# Hybrid control mode (note_pitch + f0 fed to the model simultaneously)
+# ---------------------------------------------------------------------------
+#
+# SoulX-Singer's ``SoulXSinger.infer`` (submodule, must NOT be modified) forces
+# a binary choice: ``control="score"`` keeps ``note_pitch`` (clear diction, but
+# intra-note f0 trajectory is lost → pitch drift) while ``control="melody"``
+# keeps ``f0`` (correct pitch trajectory, but diction can blur). The model
+# architecture *adds* the ``note_pitch_encoder`` and ``f0_encoder`` outputs
+# (``soulxsinger/models/soulxsinger.py:179-183``), so feeding BOTH signals at
+# once is architecturally supported — upstream merely zeroes one of them.
+#
+# Hybrid mode keeps both non-zero. We don't touch the submodule; instead we
+# monkey-patch ``model.infer`` here to recognise ``control="hybrid"``.
+
+
+def _extract_hybrid_signals(meta: dict):
+    """Pull BOTH note_pitch and f0 from meta for hybrid mode.
+
+    Returns ``(gt_note_pitch, pt_note_pitch, gt_f0, pt_f0)`` — each may be
+    ``None`` if the corresponding key is absent in meta. The hybrid infer body
+    then substitutes zeros for any ``None`` entry (graceful degradation), so
+    hybrid mode degrades cleanly to score-only / melody-only when one signal
+    is unavailable rather than raising ``KeyError``.
+
+    Upstream uses direct indexing (``meta['target']['note_pitch']``); we use
+    ``.get()`` deliberately so a missing signal becomes ``None`` (handled
+    below) instead of crashing mid-inference.
+    """
+    tgt = meta.get("target", {}) or {}
+    pt = meta.get("prompt", {}) or {}
+    return (
+        tgt.get("note_pitch"),
+        pt.get("note_pitch"),
+        tgt.get("f0"),
+        pt.get("f0"),
+    )
+
+
+def _hybrid_autocast_if(enabled: bool):
+    """Local copy of upstream ``_autocast_if`` (do not import the submodule private).
+
+    Kept verbatim (5 lines) so the hybrid body mirrors upstream line-by-line.
+    """
+    from contextlib import nullcontext
+    import torch
+    return torch.amp.autocast(device_type="cuda", enabled=True) if enabled else nullcontext()
+
+
+def _hybrid_infer_impl(model, meta, auto_shift=False, pitch_shift=0,
+                       n_steps=32, cfg=3, use_fp16=False):
+    """Hybrid infer body — a line-by-line copy of upstream ``SoulXSinger.infer``
+    (``soulxsinger/models/soulxsinger.py:110-197``) with the ONLY change being
+    the control branch: hybrid keeps BOTH ``note_pitch`` and ``f0``.
+
+    ``model`` is the real ``SoulXSinger`` instance; we access its sub-modules
+    and ``f0_to_coarse`` exactly as upstream does via ``self``.
+    """
+    import torch
+
+    gt_note_text = meta['target']['phoneme']
+    gt_mel2note = meta['target']['mel2note']
+    gt_note_type = meta['target']['note_type']
+
+    pt_wav = meta['prompt']['waveform']
+    pt_note_text = meta['prompt']['phoneme']
+    pt_mel2note = meta['prompt']['mel2note']
+    pt_note_type = meta['prompt']['note_type']
+
+    # HYBRID: keep BOTH note_pitch and f0 (None if absent → zero-filled below).
+    gt_note_pitch, pt_note_pitch, gt_f0, pt_f0 = _extract_hybrid_signals(meta)
+
+    # calculate auto pitch shift — hybrid uses note_pitch median (same as score).
+    if auto_shift and pitch_shift == 0:
+        if gt_note_pitch != None and pt_note_pitch != None:
+            gt_median = torch.median(gt_note_pitch[gt_note_pitch >= 1])
+            pt_median = torch.median(pt_note_pitch[pt_note_pitch >= 1])
+            f0_shift = torch.round(pt_median - gt_median).int().item()
+        elif gt_f0 != None and pt_f0 != None:
+            gt_f0_median = torch.median(gt_f0[gt_f0 > 0])
+            pt_f0_median = torch.median(pt_f0[pt_f0 > 0])
+            f0_shift = torch.round(torch.log2(pt_f0_median / gt_f0_median) * 1200 / 100).int().item()
+        else:
+            print("Warning: pitch_shift is True but note_pitch or f0 is None. Set f0_shift to 0.")
+            f0_shift = 0
+    else:
+        f0_shift = pitch_shift
+
+    # Graceful fill: zeros for whichever signal is missing (mirrors upstream
+    # lines 150-153, but reached for both signals in hybrid mode).
+    if gt_f0 is None or pt_f0 is None:
+        gt_f0, pt_f0 = torch.zeros_like(gt_mel2note).float().to(gt_mel2note.device), torch.zeros_like(pt_mel2note).float().to(pt_mel2note.device)
+    if gt_note_pitch is None or pt_note_pitch is None:
+        gt_note_pitch, pt_note_pitch = torch.zeros_like(gt_note_type).int().to(gt_note_type.device), torch.zeros_like(pt_note_type).int().to(pt_note_type.device)
+
+    use_fp16 = use_fp16 and pt_wav.is_cuda
+    # mel is kept in fp32 (see build_model: model.mel.float() after model.half())
+    pt_mel = model.mel(pt_wav.float() if pt_wav.dtype != torch.float32 else pt_wav)
+    if use_fp16:
+        pt_mel = pt_mel.half()
+        pt_f0 = pt_f0.half()
+        gt_f0 = gt_f0.half()
+
+    len_prompt = pt_note_pitch.shape[1]
+    len_prompt_mel = pt_f0.shape[1]
+
+    note_pitch = torch.cat([pt_note_pitch, gt_note_pitch], 1)
+    note_text = torch.cat([pt_note_text, gt_note_text], 1)
+    note_type = torch.cat([pt_note_type, gt_note_type], 1)
+    mel2note = torch.cat([pt_mel2note, gt_mel2note + len_prompt], 1)
+
+    f0_course_pt = model.f0_to_coarse(pt_f0)
+    f0_course_gt = model.f0_to_coarse(gt_f0, f0_shift=f0_shift * 5)
+    f0_course = torch.cat([f0_course_pt, f0_course_gt], 1)
+
+    note_pitch[note_pitch > 0] = note_pitch[note_pitch > 0] + f0_shift
+    note_pitch = torch.clamp(note_pitch, 0, 255)
+
+    with _hybrid_autocast_if(use_fp16):
+        features = model.note_pitch_encoder(note_pitch) + model.note_type_encoder(note_type) + model.note_text_encoder(note_text)
+
+        features = model.preflow(features)
+        features = model.expand_states(features, mel2note)
+        features = features + model.f0_encoder(f0_course)
+
+        gt_decoder_inp = features[:, len_prompt_mel:, :]
+        pt_decoder_inp = features[:, :len_prompt_mel, :]
+
+        generated_mel = model.cfm_decoder.reverse_diffusion(
+            pt_mel,
+            pt_decoder_inp,
+            gt_decoder_inp,
+            n_timesteps=n_steps,
+            cfg=cfg
+        )
+        generated_audio = model.vocoder(generated_mel.transpose(1, 2)[0:1, ...]).float()
+
+    return generated_audio
+
+
+def _enable_hybrid_mode(model) -> None:
+    """Idempotently monkey-patch ``model.infer`` to support ``control="hybrid"``.
+
+    When ``control="hybrid"`` (or ``model._hybrid_requested`` is set — see note),
+    the patched infer runs :func:`_hybrid_infer_impl`, which mirrors upstream
+    ``SoulXSinger.infer`` line-by-line but keeps BOTH ``note_pitch`` and ``f0``.
+    For ``control="score"`` / ``control="melody"`` the original infer is invoked
+    verbatim, so existing behaviour is unchanged.
+
+    Re-installs are a no-op (guarded by ``model._hybrid_patched``); the original
+    infer is captured only once, so there is no double-wrapping. Companion
+    :func:`_disable_hybrid_mode` restores the original infer and clears the
+    activation flag. Enable/disable is safe to call repeatedly.
+
+    Activation note
+    ---------------
+    Upstream ``cli.inference.process`` validates ``args.control in
+    ('melody','score')`` and would raise ``ValueError`` for ``'hybrid'`` BEFORE
+    reaching ``model.infer``. Callers therefore cannot pass ``'hybrid'`` through
+    ``process``; instead they set ``model._hybrid_requested = True`` (and pass a
+    valid ``args.control``). Both triggers are honoured so that:
+      * unit tests calling ``model.infer(..., control="hybrid")`` directly work,
+      * the real pipeline (going through ``process``) also activates hybrid.
+    """
+    if getattr(model, "_hybrid_patched", False):
+        return
+    original_infer = model.infer
+    model._hybrid_patched = True
+    model._orig_infer = original_infer
+
+    def patched_infer(meta, auto_shift=False, pitch_shift=0, n_steps=32, cfg=3, control="melody", use_fp16=False):
+        if control == "hybrid" or getattr(model, "_hybrid_requested", False):
+            return _hybrid_infer_impl(
+                model, meta,
+                auto_shift=auto_shift, pitch_shift=pitch_shift,
+                n_steps=n_steps, cfg=cfg, use_fp16=use_fp16,
+            )
+        return original_infer(
+            meta, auto_shift=auto_shift, pitch_shift=pitch_shift,
+            n_steps=n_steps, cfg=cfg, control=control, use_fp16=use_fp16,
+        )
+
+    model.infer = patched_infer
+
+
+def _disable_hybrid_mode(model) -> None:
+    """Restore the original ``model.infer`` (inverse of :func:`_enable_hybrid_mode`).
+
+    Clears ``_hybrid_patched``, ``_hybrid_requested`` and ``_orig_infer`` so the
+    model is returned to its pre-patch state. Safe to call on a model that was
+    never patched (no-op). ``synthesize_audio`` calls this in a ``finally`` block
+    so the patch is always removed — even when inference raises — preventing
+    singleton-model state from leaking across calls with different ``control``
+    values.
+    """
+    if not getattr(model, "_hybrid_patched", False):
+        return
+    model.infer = model._orig_infer
+    model._hybrid_patched = False
+    model._hybrid_requested = False
+    del model._orig_infer
+
+
 def synthesize_audio(midi_json_str: str, prompt_audio,
                      prompt_sample_rate: int | None = None,
                      prompt_metadata=None,
@@ -1838,7 +2041,9 @@ def synthesize_audio(midi_json_str: str, prompt_audio,
             prompt audio here, to avoid re-running preprocessing each call. If
             omitted/empty, the prompt audio is preprocessed internally.
         prompt_language: Language used when auto-preprocessing the prompt audio.
-        control: "melody" (F0 contour) or "score" (MIDI note pitches).
+        control: "melody" (F0 contour), "score" (MIDI note pitches), or "hybrid"
+            (BOTH note_pitch and f0 — clear diction plus correct pitch
+            trajectory; experimental, see :func:`_enable_hybrid_mode`).
         seed: Random seed for reproducibility.
         auto_shift: Auto pitch shift to match reference voice range.
         pitch_shift: Manual pitch shift in semitones (-36 to 36).
@@ -1911,7 +2116,25 @@ def synthesize_audio(midi_json_str: str, prompt_audio,
         args.save_dir = os.path.join(tmpdir, "generated")
         args.auto_shift = auto_shift
         args.pitch_shift = pitch_shift
-        args.control = control
+        # Hybrid control mode: feed BOTH note_pitch and f0 to the model at once
+        # (clear diction + correct pitch trajectory). Upstream
+        # ``cli.inference.process`` validates ``args.control ∈ {melody, score}``,
+        # so "hybrid" cannot flow through it; instead we monkey-patch
+        # ``model.infer`` via ``_enable_hybrid_mode`` and signal hybrid intent
+        # via ``model._hybrid_requested``. The patched infer also recognises
+        # ``control="hybrid"`` directly (how the unit tests exercise it).
+        #
+        # We pass ``args.control = "score"`` so ``process``'s validation passes;
+        # the patched infer ignores that value when ``_hybrid_requested`` is set.
+        # ``_disable_hybrid_mode`` in the ``finally`` block below restores the
+        # original infer even on exception, so the singleton model never leaks
+        # hybrid state into a subsequent ``control="score"`` / ``"melody"`` call.
+        if control == "hybrid":
+            _enable_hybrid_mode(model)
+            model._hybrid_requested = True
+            args.control = "score"  # any value process() accepts; patched infer ignores it
+        else:
+            args.control = control
         args.use_fp16 = use_fp16
 
         prompt_meta_path = os.path.join(tmpdir, "prompt_meta.json")
@@ -1940,7 +2163,13 @@ def synthesize_audio(midi_json_str: str, prompt_audio,
         if n_steps is not None:
             eff_config.infer.n_steps = n_steps
 
-        svs_process(args, eff_config, model)
+        try:
+            svs_process(args, eff_config, model)
+        finally:
+            # Always restore the original infer so a hybrid call cannot leak
+            # patched state into a later score/melody call on the singleton.
+            if control == "hybrid":
+                _disable_hybrid_mode(model)
 
         generated_path = os.path.join(args.save_dir, "generated.wav")
         if not os.path.isfile(generated_path):
