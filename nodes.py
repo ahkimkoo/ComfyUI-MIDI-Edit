@@ -453,7 +453,7 @@ class MIDISynthesizeAudio:
             },
             "optional": {
                 "prompt_metadata": ("STRING", {"multiline": True, "dynamicPrompts": False}),
-                "control": (["melody", "score", "hybrid"], {"default": "melody"}),
+                "control": (["melody", "score"], {"default": "melody"}),
                 "seed": ("INT", {"default": 12306, "min": 0, "max": 2147483647, "step": 1}),
                 "auto_shift": ("BOOLEAN", {"default": True, "label_on": "ON", "label_off": "OFF"}),
                 "pitch_shift": ("INT", {"default": 0, "min": -36, "max": 36, "step": 1}),
@@ -485,13 +485,6 @@ class MIDISynthesizeAudio:
         "(f0 spread >= 2 semitones) into sub-notes, so the model sees a staircase "
         "pitch approximation instead of a single flat value — this preserves the "
         "original pitch contour while keeping score mode's clear diction.\n"
-        "Hybrid mode ('hybrid', experimental): feeds BOTH note_pitch and f0 to the "
-        "model at once — note_pitch keeps diction clear while the f0 contour keeps "
-        "the pitch trajectory accurate. Best suited to the 'lyrics edited from a "
-        "vocal source' workflow where both signals are meaningful. Effect depends on "
-        "how the model responds to the two signals being non-zero simultaneously; "
-        "treat results as experimental. For non-hybrid calls the original infer path "
-        "is used unchanged.\n"
         "FP16: OFF/FP32 (default) matches the reference implementation and is safest for "
         "quality; ON/FP16 enables autocast mixed precision on GPU for speed.\n"
         "cfg (default 3): classifier-free guidance scale. Raise toward 4-5 in melody "
