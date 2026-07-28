@@ -316,57 +316,7 @@ class TestGracefulDegradation:
 # ---------------------------------------------------------------------------
 
 
-class TestNodeSurface:
-    """The ComfyUI node must expose 'hybrid' in its control input options."""
-
-    def test_node_accepts_hybrid_control(self):
-        """MIDISynthesizeAudio exposes 'hybrid' alongside 'melody' and 'score'.
-
-        Falls back to a static source-text check when the full ``nodes`` module
-        can't be imported (minimal test envs may lack comfy/transformers deps).
-        """
-        try:
-            sys.path.insert(0, _WORKSPACE)
-            try:
-                import importlib
-                import nodes as nodes_mod
-                importlib.reload(nodes_mod)
-                input_types = nodes_mod.MIDISynthesizeAudio.INPUT_TYPES()
-                control_options = input_types["optional"]["control"][0]
-                assert "hybrid" in control_options
-                assert "melody" in control_options
-                assert "score" in control_options
-                return
-            finally:
-                sys.path.remove(_WORKSPACE)
-        except ModuleNotFoundError:
-            pass
-
-        # Static fallback: parse the control line from nodes.py source.
-        src = Path(__WORKSPACE) / "nodes.py"
-        text = src.read_text(encoding="utf-8")
-        m = re.search(r'"control":\s*\(\s*\[([^\]]+)\]', text)
-        assert m, "could not locate the control INPUT_TYPES entry in nodes.py"
-        assert "hybrid" in m.group(1), f"hybrid not in control options: {m.group(1)!r}"
-
-    def test_node_description_documents_hybrid(self):
-        """The DESCRIPTION must mention 'hybrid' so users discover the mode."""
-        try:
-            sys.path.insert(0, _WORKSPACE)
-            try:
-                import importlib
-                import nodes as nodes_mod
-                importlib.reload(nodes_mod)
-                desc = nodes_mod.MIDISynthesizeAudio.DESCRIPTION
-                assert "hybrid" in desc.lower()
-                return
-            finally:
-                sys.path.remove(_WORKSPACE)
-        except ModuleNotFoundError:
-            pass
-
-        # Static fallback.
-        src = Path(_WORKSPACE) / "nodes.py"
-        text = src.read_text(encoding="utf-8")
-        # Hybrid description lives in the MIDISynthesizeAudio DESCRIPTION block.
-        assert "hybrid" in text.lower(), "nodes.py must mention 'hybrid' in DESCRIPTION"
+# TestNodeSurface removed: hybrid mode is no longer exposed in the node UI
+# (user feedback: sounds identical to melody). Implementation code is kept
+# in core/soulsx_singer.py for potential future use; the tests above still
+# cover the monkey-patch logic.

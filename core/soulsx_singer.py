@@ -970,8 +970,68 @@ def _correct_pitch_from_f0(metadata: dict) -> None:
               f"(threshold={THRESHOLD} semitones) for {metadata.get('item_name', '?')}")
 
 
+def _fix_zero_pitch_notes(metadata: dict) -> None:
+    """修复 pitch=0 但 phoneme 非 SP 的"破损"音符。
+
+    ROSVOT 偶尔在歌手实际在唱的位置检测到静音（pitch=0）。preserve_sp
+    替换文字后，这些位置变成"有真实 phoneme 但 pitch=0"的破损 token。
+    score 模式下模型看到 phoneme 却没有音高，可能产生异常输出（如音色
+    突变/男声）。本函数用该音符时间窗内的 f0 中位数填补 pitch。
+
+    就地修改 ``metadata["note_pitch"]``。
+    """
+    FPS = 50
+
+    def hz_to_midi(h: float) -> float:
+        return 69 + 12 * math.log2(h / 440.0)
+
+    def _parse(field: str, cast):
+        raw = metadata.get(field)
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            return [cast(x) for x in raw.split()]
+        return [cast(x) for x in raw]
+
+    note_pitch = _parse("note_pitch", int)
+    duration = _parse("duration", float)
+    phoneme = _parse("phoneme", str)
+    f0_raw = metadata.get("f0", "")
+    f0 = [float(x) for x in f0_raw.split()] if isinstance(f0_raw, str) else list(f0_raw or [])
+
+    if not all([note_pitch, duration, phoneme]) or not f0:
+        return
+    if len(note_pitch) != len(duration):
+        return
+
+    n_fixed = 0
+    cum_frame = 0
+    for i in range(len(note_pitch)):
+        n_frames = int(round(duration[i] * FPS))
+        start, end = cum_frame, min(cum_frame + n_frames, len(f0))
+        cum_frame += n_frames
+
+        if note_pitch[i] != 0:
+            continue
+        if i < len(phoneme) and phoneme[i] == "<SP>":
+            continue  # real SP, leave as-is
+
+        voiced = [x for x in f0[start:end] if x > 0]
+        if len(voiced) >= 3:
+            note_pitch[i] = round(hz_to_midi(sorted(voiced)[len(voiced) // 2]))
+            n_fixed += 1
+
+    if n_fixed > 0:
+        if isinstance(metadata.get("note_pitch", ""), str):
+            metadata["note_pitch"] = " ".join(str(x) for x in note_pitch)
+        else:
+            metadata["note_pitch"] = note_pitch
+        print(f"[MIDI-Edit] Fixed {n_fixed} zero-pitch note(s) from f0 median")
+
+
 def _split_notes_by_contour(metadata: dict, threshold: float = 2.0,
-                            min_half_diff: float = 1.0) -> None:
+                            min_half_diff: float = 1.0,
+                            max_splits_per_phrase: int = 8) -> None:
     """把 f0 走向大的音符拆成 2 个子音符，让 score 模式看到音高变化。
 
     score 模式用单个 ``note_pitch`` 合成，丢失音符内部的 f0 走向（实测
@@ -979,17 +1039,21 @@ def _split_notes_by_contour(metadata: dict, threshold: float = 2.0,
     每个子音符的 pitch 取该段 f0 的中位数，形成阶梯近似。第二个子音符
     ``note_type=3``（续音），提示模型不要重新咬字。
 
+    两遍扫描：第一遍找出所有拆分候选及其 f0 跨度；第二遍按乐句（SP
+    之间的区域）分组，每句只保留跨度最大的 ``max_splits_per_phrase`` 个
+    拆分，防止长句 token 数暴增导致模型音色迁移失败。
+
     就地修改 metadata 的 ``note_pitch`` / ``duration`` / ``text`` /
     ``note_type`` / ``phoneme`` 字段（token 数增加）。``f0`` 字段不变
     （frame-level，score 模式不使用）。
 
-    仅在 ``control="score"`` 合成前调用；melody / hybrid 直接用 f0，
-    不需要拆分。
+    仅在 ``control="score"`` 合成前调用；melody 直接用 f0，不需要拆分。
 
     Args:
         metadata: 单段 metadata dict（post-convert_metadata 格式）。
         threshold: 触发拆分的音符内部 f0 跨度阈值（半音）。
         min_half_diff: 两半 f0 中位数的最小差异（半音），低于此不拆。
+        max_splits_per_phrase: 每个乐句（SP 之间）的最大拆分数。
 
     Skips:
         - ``note_pitch == 0`` (SP)
@@ -1024,40 +1088,73 @@ def _split_notes_by_contour(metadata: dict, threshold: float = 2.0,
     if len(note_pitch) != len(duration):
         return
 
-    new_pitch: list[int] = []
-    new_dur: list[float] = []
-    new_text: list[str] = []
-    new_type: list[int] = []
-    new_phon: list[str] = []
-    n_split = 0
+    # ---- Pass 1: identify split candidates ----
+    # candidate = (note_index, spread, p1, p2, phrase_id)
+    candidates: list[tuple[int, float, int, int, int]] = []
     cum_frame = 0
+    phrase_id = 0
 
     for i in range(len(note_pitch)):
         n_frames = int(round(duration[i] * FPS))
         start, end = cum_frame, min(cum_frame + n_frames, len(f0))
         cum_frame += n_frames
 
-        keep = True
-        if note_pitch[i] != 0 and duration[i] >= 0.2:
-            voiced = [x for x in f0[start:end] if x > 0]
-            if len(voiced) >= 6:
-                spread = hz_to_midi(max(voiced)) - hz_to_midi(min(voiced))
-                if spread >= threshold:
-                    mid = len(voiced) // 2
-                    h1, h2 = voiced[:mid], voiced[mid:]
-                    p1 = round(hz_to_midi(sorted(h1)[len(h1) // 2]))
-                    p2 = round(hz_to_midi(sorted(h2)[len(h2) // 2]))
-                    if abs(p2 - p1) >= min_half_diff:
-                        keep = False
-                        half_dur = duration[i] / 2
-                        new_pitch.extend([p1, p2])
-                        new_dur.extend([half_dur, duration[i] - half_dur])
-                        new_text.extend([note_text[i], note_text[i]])
-                        new_type.extend([note_type[i], 3])
-                        new_phon.extend([phoneme[i], phoneme[i]])
-                        n_split += 1
+        if note_pitch[i] == 0:
+            phrase_id += 1
+            continue
+        if duration[i] < 0.2:
+            continue
 
-        if keep:
+        voiced = [x for x in f0[start:end] if x > 0]
+        if len(voiced) < 6:
+            continue
+
+        spread = hz_to_midi(max(voiced)) - hz_to_midi(min(voiced))
+        if spread < threshold:
+            continue
+
+        mid = len(voiced) // 2
+        h1, h2 = voiced[:mid], voiced[mid:]
+        p1 = round(hz_to_midi(sorted(h1)[len(h1) // 2]))
+        p2 = round(hz_to_midi(sorted(h2)[len(h2) // 2]))
+        if abs(p2 - p1) < min_half_diff:
+            continue
+
+        candidates.append((i, spread, p1, p2, phrase_id))
+
+    if not candidates:
+        return
+
+    # ---- Pass 2: limit splits per phrase (keep largest spreads) ----
+    phrase_cands: dict[int, list[tuple[int, float, int, int, int]]] = {}
+    for c in candidates:
+        phrase_cands.setdefault(c[4], []).append(c)
+
+    split_map: dict[int, tuple[int, int]] = {}  # note_index -> (p1, p2)
+    for _pid, cands in phrase_cands.items():
+        cands.sort(key=lambda c: c[1], reverse=True)
+        for c in cands[:max_splits_per_phrase]:
+            split_map[c[0]] = (c[2], c[3])
+
+    # ---- Pass 3: build output ----
+    new_pitch: list[int] = []
+    new_dur: list[float] = []
+    new_text: list[str] = []
+    new_type: list[int] = []
+    new_phon: list[str] = []
+    n_split = 0
+
+    for i in range(len(note_pitch)):
+        if i in split_map:
+            p1, p2 = split_map[i]
+            half_dur = duration[i] / 2
+            new_pitch.extend([p1, p2])
+            new_dur.extend([half_dur, duration[i] - half_dur])
+            new_text.extend([note_text[i], note_text[i]])
+            new_type.extend([note_type[i], 3])
+            new_phon.extend([phoneme[i], phoneme[i]])
+            n_split += 1
+        else:
             new_pitch.append(note_pitch[i])
             new_dur.append(duration[i])
             new_text.append(note_text[i])
@@ -1081,7 +1178,8 @@ def _split_notes_by_contour(metadata: dict, threshold: float = 2.0,
         metadata["phoneme"] = new_phon
 
     print(f"[MIDI-Edit] Split {n_split} note(s) into sub-notes for score-mode "
-          f"contour preservation (threshold={threshold} semi)")
+          f"contour preservation (threshold={threshold} semi, "
+          f"max {max_splits_per_phrase}/phrase)")
 
 
 def _build_lyrics_text(captured_segment_words: list[list[str]]) -> str:
@@ -2254,12 +2352,14 @@ def synthesize_audio(midi_json_str: str, prompt_audio,
         prompt_meta_path = os.path.join(tmpdir, "prompt_meta.json")
         target_meta_path = os.path.join(tmpdir, "target_meta.json")
 
-        # Score-mode contour preservation: split notes with large intra-note
-        # f0 movement into sub-notes so the model sees pitch changes (staircase
-        # approximation). Only for score mode — melody/hybrid use f0 directly.
-        # Only the TARGET is split; the prompt (timbre reference) stays intact.
+        # Score-mode contour preservation: fix broken tokens (pitch=0 with
+        # real phoneme) then split notes with large intra-note f0 movement
+        # into sub-notes so the model sees pitch changes (staircase approx).
+        # Only for score mode — melody uses f0 directly.
+        # Only the TARGET is modified; the prompt (timbre reference) stays intact.
         if control == "score":
             for meta in metadata_list:
+                _fix_zero_pitch_notes(meta)
                 _split_notes_by_contour(meta)
 
         with open(prompt_meta_path, "w", encoding="utf-8") as f:

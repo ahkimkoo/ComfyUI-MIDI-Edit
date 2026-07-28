@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from core.soulsx_singer import _split_notes_by_contour
+from core.soulsx_singer import _split_notes_by_contour, _fix_zero_pitch_notes
 
 
 FIXTURE_PATH = os.path.join(
@@ -42,8 +42,8 @@ class TestOracleFixture:
         orig_len = len(meta["note_pitch"].split())
         _split_notes_by_contour(meta)
         new_len = len(meta["note_pitch"].split())
-        # 30 notes split → 30 extra tokens (voiced >= 6 frames required per note)
-        assert new_len == orig_len + 30, f"expected {orig_len + 30} tokens, got {new_len}"
+        # 28 notes split (per-phrase limit of 8 trims 2 low-priority splits)
+        assert new_len == orig_len + 28, f"expected {orig_len + 28} tokens, got {new_len}"
 
     def test_ya_pos25_split_62_64(self):
         """User-reported '涯' (pos 25): single pitch 62 → [62, 64]."""
@@ -207,3 +207,83 @@ class TestEdgeCases:
         }
         _split_notes_by_contour(meta)
         assert meta["note_pitch"] == "60 62 64"  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# _fix_zero_pitch_notes tests
+# ---------------------------------------------------------------------------
+
+
+class TestFixZeroPitchNotes:
+    def test_fixes_broken_token(self):
+        """Non-SP token with pitch=0 gets f0 median as pitch."""
+        # 1 note, dur=1.0s, f0 ~261 Hz (MIDI 60), but pitch=0 (broken)
+        f0 = [261.0] * 50
+        meta = _make_meta([0], [1.0], f0, texts=["那"], types=[2], phons=["zh_na4"])
+        _fix_zero_pitch_notes(meta)
+        pitch = int(meta["note_pitch"].split()[0])
+        assert pitch == 60, f"expected 60, got {pitch}"
+
+    def test_sp_not_fixed(self):
+        """SP token (phoneme=<SP>) with pitch=0 is left as-is."""
+        f0 = [261.0] * 50
+        meta = _make_meta([0], [1.0], f0, texts=["<SP>"], types=[1], phons=["<SP>"])
+        _fix_zero_pitch_notes(meta)
+        assert meta["note_pitch"] == "0"
+
+    def test_nonzero_pitch_untouched(self):
+        """Tokens with pitch > 0 are not modified."""
+        f0 = [261.0] * 50
+        meta = _make_meta([65], [1.0], f0)
+        _fix_zero_pitch_notes(meta)
+        assert meta["note_pitch"] == "65"
+
+    def test_insufficient_voiced_frames(self):
+        """If < 3 voiced frames, don't fix (not enough data)."""
+        f0 = [0.0] * 48 + [261.0, 262.0]  # only 2 voiced frames
+        meta = _make_meta([0], [1.0], f0, texts=["那"], types=[2], phons=["zh_na4"])
+        _fix_zero_pitch_notes(meta)
+        assert meta["note_pitch"] == "0"  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# Per-phrase split limit tests
+# ---------------------------------------------------------------------------
+
+
+class TestPerPhraseLimit:
+    def test_limit_respected(self):
+        """No phrase should have more than max_splits_per_phrase splits."""
+        # Build a phrase with 12 notes, all with large f0 spread
+        # (each note: first half 220 Hz, second half 440 Hz → ~12 semi spread)
+        n_notes = 12
+        f0_per_note = [220.0] * 25 + [440.0] * 25  # 50 frames per note
+        f0 = []
+        for _ in range(n_notes):
+            f0.extend(f0_per_note)
+        pitches = [60] * n_notes
+        durations = [1.0] * n_notes
+        meta = _make_meta(pitches, durations, f0)
+
+        _split_notes_by_contour(meta, max_splits_per_phrase=5)
+        new_len = len(meta["note_pitch"].split())
+        # 5 splits → 5 extra tokens → 12 + 5 = 17
+        assert new_len == n_notes + 5, f"expected {n_notes + 5}, got {new_len}"
+
+    def test_prioritizes_largest_spread(self):
+        """When limiting, the notes with the largest f0 spread are kept."""
+        # 3 notes: spreads of ~2, ~6, ~12 semitones
+        # With max_splits_per_phrase=1, only the ~12 semi note should be split
+        f0_small = [260.0] * 25 + [280.0] * 25   # ~1.3 semi spread (won't qualify)
+        f0_med = [220.0] * 25 + [330.0] * 25      # ~7 semi spread
+        f0_large = [220.0] * 25 + [440.0] * 25    # ~12 semi spread
+        f0 = f0_small + f0_med + f0_large
+        meta = _make_meta([60, 60, 60], [1.0, 1.0, 1.0], f0)
+
+        _split_notes_by_contour(meta, max_splits_per_phrase=1)
+        pitches = [int(x) for x in meta["note_pitch"].split()]
+        # Only 1 split (the largest spread note)
+        assert len(pitches) == 4, f"expected 4 tokens (3 + 1 split), got {len(pitches)}"
+        # The split note should be the last one (largest spread)
+        # Its sub-pitches should be ~57 and ~69
+        assert pitches[2] < pitches[3], "split note should have rising sub-pitches"
