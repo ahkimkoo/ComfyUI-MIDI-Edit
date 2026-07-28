@@ -291,7 +291,7 @@ class MidiLyricsAlignment:
                 "force_tone4": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                "preserve_sp": ("BOOLEAN", {"default": False, "label_on": "ON", "label_off": "OFF"}),
+                "preserve_sp": ("BOOLEAN", {"default": True, "label_on": "ON", "label_off": "OFF"}),
             }
         }
 
@@ -302,7 +302,7 @@ class MidiLyricsAlignment:
 
     def align_lyrics(self, midi_json, lyrics, speed=1.0,
                      normalize_digits=True, force_tone4=False,
-                     preserve_sp=False):
+                     preserve_sp=True):
         midi_json = "" if midi_json is None else str(midi_json)
         lyrics = "" if lyrics is None else str(lyrics)
 

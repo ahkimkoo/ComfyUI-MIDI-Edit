@@ -7,36 +7,36 @@ All notable changes to ComfyUI-MIDI-Edit will be documented in this file.
 
 ### Added
 
-- **`MIDI Synthesize Audio` 新增 `hybrid` 控制模式（实验性）**。SoulX-Singer 的
-  `control` 原本二选一：`score` 用离散 `note_pitch`（吐字清楚但音符内部 f0 走向
-  丢失 → 可能变调）；`melody` 用连续 `f0` 曲线（音高走向正确但吐字易糊）。模型
-  架构上 `note_pitch_encoder` 与 `f0_encoder` 的输出是**相加**的
-  （`soulxsinger/models/soulxsinger.py:179-183`），同时给两个非零信号是被架构
-  允许的，只是上游 `cli/inference.py` 强制把其中一个置零。
-
-  `hybrid` 模式**同时**把 `note_pitch` 和 `f0` 喂给模型，兼得两者优点：note_pitch
-  保留吐字清晰度，f0 曲线保留音符内部音高走向。最适合"从人声源改歌词"的场景
-  （两个信号都有意义）。
-
-  实现上**不修改 `SoulX-Singer/` 子模块**：在 `core/soulsx_singer.py` 通过
-  `_enable_hybrid_mode(model)` 幂等地 monkey-patch `model.infer`，配对
-  `_disable_hybrid_mode(model)` 在 `synthesize_audio` 的 `finally` 块中恢复原始
-  infer（即使异常也不会污染单例 model 状态）。hybrid 分支与上游 `infer` 逐行一致
-  （仅 control 分支改为同时提取两信号）；`score`/`melody` 原样委托给原始 infer，
-  行为零变化。auto_shift 在 hybrid 下用 note_pitch 中位数（与 score 一致）；缺失
-  信号时用 zeros 优雅降级，不报错。
-
-  注意：上游 `cli.inference.process` 校验 `args.control ∈ {melody, score}`，会
-  拒绝 `hybrid`，因此实际通过 `model._hybrid_requested` 标志激活（`args.control`
-  传一个合法值）；patched infer 同时识别 `control="hybrid"`（供单测直接调用）。
-  效果取决于模型对双信号同时非零的响应，视为实验性。
-
 - **Score 模式自动子音符拆分（contour preservation）**。score 模式用单个
   `note_pitch` 合成，丢失音符内部的 f0 走向（实测 63% 的音符内部变化 > 2 半音），
   导致合成旋律变平、听起来走调。现在 score 模式合成前会自动把 f0 走向大的音符
   （跨度 ≥ 2 半音）拆成 2 个子音符，每个子音符的 pitch 取该段 f0 中位数，形成
   阶梯近似。第二个子音符 `note_type=3`（续音）防止模型重新咬字。仅拆 target，
-  不拆 prompt（音色参考保持原样）。仅对 score 模式生效，melody/hybrid 不受影响。
+  不拆 prompt（音色参考保持原样）。仅对 score 模式生效，melody 不受影响。
+
+  采用两遍扫描：第一遍找出所有拆分候选及 f0 跨度；第二遍按乐句（SP 之间的区域）
+  分组，每句只保留跨度最大的 `max_splits_per_phrase=8` 个拆分，防止长句 token
+  数暴增导致模型音色迁移失败（变男声）。
+
+### Fixed
+
+- **Score 模式"变男声"bug**。两个独立原因：
+  1. **Broken token**：ROSVOT 偶尔在歌手实际在唱的位置检测到静音（pitch=0），
+     preserve_sp 替换文字后变成"有真实 phoneme 但 pitch=0"的破损 token，
+     模型看到音素却没有音高，导致音色异常。新增 `_fix_zero_pitch_notes`
+     在合成前自动用 f0 中位数填补这些位置的 pitch。
+  2. **Token 膨胀**：长句（如 23 字）拆分后 token 数暴增，稀释模型在
+     prompt↔target 之间的 cross-attention，导致音色迁移失败。通过每句
+     拆分数上限（`max_splits_per_phrase=8`，按 f0 跨度优先）解决。
+
+### Changed
+
+- **`MIDI Lyrics Alignment` 的 `preserve_sp` 默认改为 ON**。保留原曲 SP 结构
+  （位置/时长/f0）是改歌词合成的推荐模式，改为默认勾选。
+
+- **`hybrid` 控制模式从节点 UI 移除**。实测 hybrid 效果与 melody 几乎无区别
+  （模型在 f0 存在时忽略 note_pitch），无实用价值。实现代码保留在
+  `core/soulsx_singer.py` 供未来使用，但不再暴露为用户选项。
 
 
 ## [2026-07-27] v3.4.1
