@@ -592,13 +592,13 @@ MIDI 中连续重复字表示长音（占多个音节）。用户输入不需要
 - **control 选择**：从人声改歌词得到的 target 选 `melody`（默认）；从纯乐谱/无 F0 数据生成的 target 选 `score`
 - **吞字调优**：`melody` 模式下若出现吞字，把 `cfg` 从 3 提到 4–5
 
+> 完整工作流文件：[下载 workflow.json](docs/workflow.json)（拖入 ComfyUI 界面即可使用，含转写 / 编辑 / 对齐 / 合成 / 提取全链路，以及参考音色旁路与试听节点）
+
 ### 仅歌词编辑工作流（无需 SoulX-Singer 模型）
 
 如果只做 MIDI JSON 的歌词替换/提取，不需要安装 SoulX-Singer 模型，可只用前 4 个节点：
 
 - [下载工作流 JSON](docs/midi-edit-lyrics.json)（拖入 ComfyUI 界面即可使用）
-
-![MIDI 歌词编辑工作流](docs/midi-edit-lyrics.json.png)
 
 ---
 
@@ -724,7 +724,8 @@ ComfyUI-MIDI-Edit/
 │   ├── REQUIREMENT.md   # 原始需求文档
 │   ├── alignment-algorithm.md      # MidiLyricsAlignment 算法说明
 │   ├── midi-json-format.md         # MIDI JSON 字段说明
-│   ├── midi-edit-lyrics.json       # ComfyUI 工作流文件
+│   ├── workflow.json               # 端到端"魔改歌词"工作流（转写→编辑→合成）
+│   ├── midi-edit-lyrics.json       # 仅歌词编辑工作流文件
 │   └── midi-edit-lyrics.json.png   # 工作流截图
 ├── tests/
 │   ├── test_alignment.py            # 统一对齐算法测试套件
