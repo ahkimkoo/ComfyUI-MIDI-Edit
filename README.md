@@ -13,13 +13,82 @@
 | `MIDI-SoulX` | MIDI Transcribe Audio | 用 SoulX-Singer 把音频转写成 MIDI JSON |
 | `MIDI-SoulX` | MIDI Synthesize Audio | 用 SoulX-Singer 把 MIDI JSON + 参考音色合成歌声 |
 
-> 最新版本：**v3.3.0**（2026-07-20）— `MIDI Transcribe Audio` 新增 `reference_lyrics` 可选输入（强制对齐到 100% 文字准确率）+ `lyrics_text` 输出（ROSVOT 之前的歌词文本，`<SP>` 转换行）；pitch/duration/f0/SP/melisma 完全保留音频驱动。详见 [CHANGELOG.md](CHANGELOG.md)。
+> 最新版本：**v3.4.2**（2026-07-27）— 7 月版本重点完成了 **reference-lyrics 强制对齐**、**`preserve_sp` 改词对齐**、**score 模式音高校正**、**子音符 contour preservation** 与 **音色稳定性修复**。详见 [CHANGELOG.md](CHANGELOG.md) 与 [July 2026 Release Notes](docs/2026-07-release-note.md)。
 
 ---
 
 ## 功能特性
 
 本插件提供 **六个节点**，覆盖从音频转写、歌词编辑到歌声合成的完整工作流。支持中文（`zh_` 前缀拼音）、英文（`en_` 前缀 ARPAbet 音素）、粤语及中英混合歌词。
+
+## 基于 SoulX-Singer 的增强
+
+本插件不是简单把 SoulX-Singer 节点“搬进 ComfyUI”，而是围绕 **真实歌曲改词与重合成** 这个场景，在 SoulX-Singer 外层补了一整套增强层。目标是：
+
+- **文本更可信**：减少 ASR 误识别和歌词错位
+- **改词更稳**：尽量保留原曲的停顿、时值、旋律与 f0
+- **合成更自然**：减少 score 模式跑调、音色漂移、长句异常
+
+当前主要增强包括：
+
+### 1. reference_lyrics 强制对齐
+
+针对“我已经知道原歌词，只想把转写文本校正到标准歌词”的场景，增加了 **reference_lyrics** 入口。它不是简单热词偏置，而是把 **ASR + DTW** 组合起来：先识别，再把识别到的字序列和参考歌词做对齐，因此能显著减少同音字、漏字、段落错位。
+
+后续又升级成了 **全局 DTW 参考歌词分配**，不再按段落字数简单比例切分参考歌词，而是先看全局识别结果，再决定每个 segment 应该吃多少参考文本。这样在某些段识别偏少、某些段识别偏多时，会稳定得多。
+
+### 2. `preserve_sp` 改词对齐模式
+
+针对“从真实演唱音频出发改歌词”的场景，新增并默认启用了 **`preserve_sp`**。这个模式的核心思想是：
+
+- 不重建原曲停顿
+- 不重建原曲 f0
+- 不打散原曲音符结构
+- 只替换歌词内容本身
+
+也就是说，原曲的 `<SP>` 位置、停顿时长、音符 pitch / duration / f0 都尽量保留，新歌词只是按 section（SP 之间的区域）映射进去。这比“重新生成一套停顿和断句”更适合真实歌曲改词。
+
+### 3. ROSVOT 音高校正
+
+在真实测试中发现，ROSVOT 偶尔会把某些音高量化错，导致 score 模式严重跑调。为此增加了 **`_correct_pitch_from_f0`** 后处理：
+
+- 对每个非 SP 音符，取其时间窗内的 voiced `f0` 中位数
+- 若与 ROSVOT 给出的 `note_pitch` 偏差过大（≥ 2 半音），就用 `f0` 回推的 MIDI 音高替换
+
+这一步不是重建旋律，而是修掉“明显错了”的量化结果。它主要解决的是 long note / vibrato / glide 场景下的 gross pitch error。
+
+### 4. score 模式 contour preservation
+
+score 模式的一个结构性问题是：它只看一个离散 `note_pitch`，看不到音符内部的连续 f0 走向。真实人声里，一个字在一个音符内部上行/下行 2~6 半音并不少见。如果压成一个平值，合成就容易“变平”“变调”。
+
+为了解决这个问题，现在在 **score 模式合成前**，会把 f0 走向大的音符拆成 **两个子音符**：
+
+- 每个子音符的 pitch 取对应半段 f0 的中位数
+- 第二个子音符 `note_type=3`，告诉模型这是同一个字的续音，不要重新咬字
+
+本质上，这是把连续曲线做成一个简单的“阶梯近似”，让 score 模式既尽量保留吐字清晰度，又不至于把整条旋律压平。
+
+### 5. 音色稳定性修复
+
+在做完子音符拆分后，又暴露出两个真实场景里的稳定性问题：
+
+1. **broken token**：某些位置有真实 phoneme，但 pitch 被转写成了 0，模型看到“有字无音高”会产生异常输出
+2. **token 膨胀**：长句如果拆分过多子音符，会让 token 数暴增，稀释模型在 prompt 与 target 之间的音色迁移能力，出现整句音色漂移（例如“变男声”）
+
+因此又补了两层保护：
+
+- `_fix_zero_pitch_notes`：对非 SP 且 `pitch=0` 的破损 token，用该位置 f0 中位数填回 pitch
+- `max_splits_per_phrase`：每句只保留最重要的若干拆分（当前默认 8 个），优先保留跨度最大的音高变化，避免长句 token 爆炸
+
+### 6. 为什么这些改动都放在外层，而不是改 SoulX-Singer 源码
+
+设计原则一直是：**尽量不改 `SoulX-Singer/` 子模块本体**。这样做的好处是：
+
+- 更容易跟进上游更新
+- 更容易定位问题属于“上游模型”还是“本插件增强层”
+- 更适合在 ComfyUI 节点层面做可组合、可回退的工作流增强
+
+所以当前这些能力（强制对齐、pitch correction、子音符拆分、音色稳定性修复）都实现于 `core/soulsx_singer.py` 这一层，对上游保持零侵入。
 
 ### MIDI Transcribe Audio
 
